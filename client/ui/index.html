@@ -1,6 +1,79 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; base-uri 'none'; form-action 'none'"><title>ChatApp · 加密通讯</title><link rel="stylesheet" href="style.css"><script defer src="app.js"></script></head><body><main>
-<header><span class="eyebrow">CHATAPP / PRIVATE MESSAGING</span><h1>只让彼此读到。</h1><p>独立 Windows 客户端 · Signal 协议端到端加密</p></header>
-<aside><strong>消息在客户端加密，服务器保存密文。</strong><br>单账号单设备开发验证版，尚未经过独立安全审计。首次通信请通过可信渠道核对双方安全码。</aside>
-<section id="auth"><h2>连接你的服务器</h2><form id="authForm"><label>服务器地址<input id="server" value="http://localhost:8082" autocomplete="url" required></label><label>用户名<input id="username" autocomplete="username" pattern="[a-z0-9_]{3,32}" maxlength="32" required placeholder="例如 alice"></label><label>密码<input id="password" autocomplete="current-password" type="password" minlength="8" required placeholder="至少 8 字符"></label><div class="actions"><button type="submit">登录</button><button id="register" type="button" class="secondary">注册并初始化密钥</button></div></form><p class="muted">远程连接须使用 HTTPS。私钥仅保存在本机，并由 Windows 安全存储保护；丢失本地密钥后，无法仅用账号密码恢复历史正文。</p></section>
-<section id="chat" hidden><div class="topline"><h2 id="identity"></h2><span id="connection"></span><button id="logout" class="secondary">退出</button></div><div class="recipient"><label>对方用户名<input id="peer" placeholder="例如 bob"></label><button id="history" class="secondary">同步回执</button><button id="safety" class="secondary">核对安全码</button></div><div id="verification">尚未核对当前联系人的安全码</div><div id="safetyPanel" hidden><p>请通过见面或已信任的通话渠道比较两边的完整数字：</p><code id="safetyCode"></code><button id="confirmSafety" class="secondary">已通过可信渠道核对一致</button></div><div id="messages" role="log" aria-live="polite"></div><form id="sendForm"><label>消息<textarea id="body" maxlength="4000" rows="3" required placeholder="在这里写下消息"></textarea></label><button id="send" type="submit">加密并发送</button></form><p class="muted">“服务器已保存密文”不等于送达。“对方客户端已接收”表示已解密并保存，不代表已读。</p></section><p id="notice" role="status"></p><footer>服务端存账号与密文 · 本机存私钥与受保护的历史缓存</footer>
-</main></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>Chat</title>
+  <link rel="stylesheet" href="style.css"><script defer src="app.js"></script>
+</head>
+<body>
+<main>
+  <section id="serverSetup" class="entry" hidden>
+    <div class="brand">C <span>Chat</span></div>
+    <h1>连接你的服务器</h1>
+    <p class="muted">首次使用，请输入服务器地址。之后可在设置中添加或切换服务器。</p>
+    <form id="setupForm"><label>服务器地址<input id="server" type="url" value="http://localhost:8082" autocomplete="url" required placeholder="https://chat.example.com"></label><button type="submit">继续</button></form>
+    <p class="fineprint">远程连接须使用 HTTPS；HTTP 仅供本机测试。</p>
+  </section>
+  <section id="auth" class="entry" hidden>
+    <div class="brand">C <span>Chat</span></div>
+    <div class="entryHeading"><div><h1>欢迎回来</h1><p class="muted">当前服务器 <strong id="authServer"></strong></p></div><button id="authSettings" class="textButton" type="button">设置</button></div>
+    <div id="accountPicker" hidden><p class="eyebrow">选择已保存的账号</p><ul id="accountList"></ul></div>
+    <button id="otherAccount" type="button" class="textButton" hidden>使用其他账号</button>
+    <form id="authForm"><label id="usernameLabel">用户名<input id="username" autocomplete="username" minlength="2" maxlength="32" required placeholder="例如 小明 或 alice"></label><label>密码<input id="password" autocomplete="current-password" type="password" minlength="8" required placeholder="至少 8 字符"></label>
+    <section id="registrationWarning" class="registrationNotice" aria-labelledby="registrationNoticeTitle">
+      <h2 id="registrationNoticeTitle">注册前请务必了解</h2>
+      <ul>
+        <li><strong>账号和密码不可修改。</strong>目前不支持修改用户名或密码，请妥善保管。</li>
+        <li><strong>本机数据清理后无法恢复。</strong>账号的加密身份与本机应用数据绑定；清除 Chat 应用数据或本机用户资料后，本机账号、私钥和聊天记录将丢失。密码和服务器无法找回私钥，请勿清理应用数据。</li>
+        <li><strong>请至少每周连接一次。</strong>连续 7 天未成功认证并连接服务器，账号及服务器保存的相关数据会被清理。登录后请确认显示“在线”；仅打开软件但连接失败不算成功连接。</li>
+        <li><strong>首次聊天需要对方同意。</strong>接受前只能发送一条消息，接受后才能继续聊天。</li>
+      </ul>
+    </section>
+    <div class="actions"><button id="login" type="submit">登录</button><button id="register" type="button" class="secondary">注册并初始化密钥</button></div></form>
+    <p class="fineprint">密码不会保存在此设备。私钥与聊天记录由 Windows 安全存储保护；丢失本机密钥后，无法仅用密码恢复历史正文。</p>
+  </section>
+  <section id="chat" class="chatShell" hidden>
+    <aside class="sidebar"><div class="sidebarTop"><div class="brand">C <span>Chat</span></div><button id="chatSettings" class="iconButton" type="button" title="设置" aria-label="设置">⚙</button></div>
+      <div class="profile"><strong id="identity"></strong><span id="connection"></span></div>
+      <nav class="tabs" aria-label="列表类型"><button id="sessionsTab" type="button" class="active">会话</button><button id="contactsTab" type="button">联系人</button></nav>
+      <div class="listSearch"><label for="peerSearch" class="srOnly">搜索会话或联系人</label><input id="peerSearch" type="search" placeholder="搜索会话" autocomplete="off"></div>
+      <ul id="peerList" class="peerList" aria-label="联系人列表"></ul>
+      <form id="contactForm" class="contactForm"><label for="peer">发起聊天</label><div><input id="peer" minlength="2" maxlength="32" required placeholder="输入用户名"><button type="submit" aria-label="发起聊天">＋</button></div></form>
+    </aside>
+    <div class="conversation">
+      <div id="emptyConversation" class="emptyConversation"><div class="emptySymbol">✦</div><h2>选择一位联系人</h2><p>开始一段端到端加密对话</p></div>
+      <div id="conversationContent" class="conversationContent" hidden>
+        <div class="conversationHeader"><div><h2 id="conversationName"></h2><span id="conversationStatus"></span><span id="verification">尚未核对安全码</span></div><div class="headerActions"><button id="acceptContact" type="button" class="secondary" hidden>接受聊天</button><button id="clearConversation" type="button" class="textButton">清除会话</button><button id="removeContact" type="button" class="textButton" hidden>删除联系人</button><button id="history" type="button" class="textButton">同步回执</button><button id="safety" type="button" class="textButton">核对安全码</button></div></div>
+        <div id="safetyPanel" hidden><p>请通过见面或已信任的通话渠道比较双方的完整数字：</p><code id="safetyCode"></code><button id="confirmSafety" type="button" class="secondary">已通过可信渠道核对一致</button></div>
+        <div id="messages" role="log" aria-live="polite"></div>
+        <form id="sendForm" class="composer"><label for="body" class="srOnly">消息</label><textarea id="body" maxlength="4000" rows="2" required placeholder="发送消息…"></textarea><button id="send" type="submit">发送</button></form>
+        <p class="deliveryNote">“服务器已保存密文”不等于送达；“对方客户端已接收”不代表已读。</p>
+      </div>
+    </div>
+  </section>
+  <section id="settings" class="settings" hidden>
+    <div class="settingsHeading"><button id="closeSettings" type="button" class="textButton">← 返回</button><h1>设置</h1></div>
+    <h2>服务器</h2><p class="muted">选择服务器后，只显示这台服务器上的账号和联系人。</p><ul id="serverList" class="serverList"></ul>
+    <form id="addServerForm"><label>添加服务器<input id="newServer" type="url" autocomplete="url" required placeholder="https://chat.example.com"></label><button type="submit">添加并切换</button></form>
+    <div id="accountSettings" hidden><h2>当前账号</h2><p id="settingsAccount"></p><button id="logout" type="button" class="secondary">切换账号或退出</button></div>
+    <p class="fineprint">此设备一次只有一个账号在线。切换服务器或账号会退出当前会话。</p>
+    <section class="usageGuide" aria-labelledby="usageGuideTitle">
+      <h2 id="usageGuideTitle">使用说明</h2>
+      <ul>
+        <li>首次使用先填写服务器地址；之后可在这里添加、切换多台服务器。每台服务器的账号和联系人分别显示。</li>
+        <li>在所选服务器上注册账号并设置密码，以后用该账号和密码登录。请妥善保管密码。</li>
+        <li>私钥和解密后的聊天记录保存在当前 Windows 用户的应用数据中（默认位于 %APPDATA%\Chat\default），由 Windows 安全存储加密保护。账号的加密聊天身份与这份本机私钥绑定，请在原 Windows 用户下使用。</li>
+        <li>只删除 Chat.exe 或下载的 ZIP 文件，不一定会删除上述本机数据；删除本机用户资料或应用数据、重装系统，或改用另一 Windows 用户后，若原私钥已丢失或无法读取，现有账号便无法继续用于加密聊天。密码和服务器都无法恢复私钥或旧聊天记录。</li>
+        <li>首次向某人发起聊天时，只能先发一条消息；等对方接受后，才能继续发送。</li>
+        <li>删除联系人会撤销对方继续向你发消息的权限，已有聊天记录仍保留；“清除会话”只把它从会话列表隐藏。</li>
+        <li>“在线”表示你已成功连上服务器。对方不在线时，服务器暂存加密消息，等对方连接后再送达。“服务器已保存密文”不代表对方收到；“对方客户端已接收”也不代表已读。</li>
+        <li>聊天前可通过见面或可信通话，和对方比较完整的安全码；一致后点击“已通过可信渠道核对一致”。</li>
+        <li>账号连续 7 天未成功连接服务器，服务器会删除该账号及服务器上的密钥、加密消息，无法从服务器恢复。打开应用或输入密码但连接失败不算成功；请至少每周登录，并确认客户端显示“在线”。本机历史记录可能仍在。</li>
+      </ul>
+    </section>
+  </section>
+  <p id="notice" role="status"></p>
+</main>
+</body></html>

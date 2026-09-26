@@ -5,8 +5,13 @@ import java.sql.SQLException;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 @Repository
 public class MessageStore {
@@ -14,6 +19,11 @@ public class MessageStore {
     public MessageStore(JdbcTemplate db) { this.db = db; }
     public record Message(String id, String clientId, String sender, String recipient, String ciphertext,
                           String createdAt, boolean acknowledged) {}
+    public record SaveResult(Message message, boolean newContact) {}
+    public record Contact(String username, String status, boolean online) {}
+    public record DeletedAccount(String accountId, List<String> peers) {}
+    public record AccountDeletionEvent(String id, String username, String accountId, String identityKey, String deletedAt) {}
+    private record EventRecipient(String username, String accountId) {}
     private Message map(ResultSet r, int row) throws SQLException {
         return new Message(r.getString("id"), r.getString("client_id"), r.getString("sender"),
             r.getString("recipient"), r.getString("ciphertext"), r.getObject("created_at", OffsetDateTime.class).toString(), r.getBoolean("acknowledged"));
@@ -21,26 +31,118 @@ public class MessageStore {
     public boolean keysExist(String user) {
         return Boolean.TRUE.equals(db.queryForObject("SELECT COUNT(*) > 0 FROM device_keys WHERE username=?", Boolean.class, user));
     }
-    public boolean userExists(String name) {
-        return Boolean.TRUE.equals(db.queryForObject("SELECT COUNT(*) > 0 FROM app_users WHERE username=?", Boolean.class, name));
+    public boolean recordConnection(String user, String accountId) {
+        return db.update("UPDATE app_users SET last_connected_at=CURRENT_TIMESTAMP WHERE username=? AND account_id=?",
+            user, accountId) == 1;
     }
-    // Called under ChatSocket's single-node lock: commit precedes network delivery.
-    public Message save(String sender, String recipient, String clientId, String ciphertext) {
+    public List<String> expiredAccounts() {
+        return db.queryForList("SELECT username FROM app_users WHERE last_connected_at <= CURRENT_TIMESTAMP - INTERVAL '7' DAY ORDER BY username",
+            String.class);
+    }
+    @Transactional
+    public Optional<DeletedAccount> deleteIfInactive(String user) {
+        var locked = db.queryForList("SELECT account_id FROM app_users WHERE username=? AND last_connected_at <= CURRENT_TIMESTAMP - INTERVAL '7' DAY FOR UPDATE",
+            String.class, user);
+        if (locked.isEmpty()) return Optional.empty();
+        String accountId = locked.get(0);
+        var identities = db.queryForList("SELECT identity_key FROM device_keys WHERE username=?", String.class, user);
+        String identityKey = identities.isEmpty() ? "" : identities.get(0);
+        var recipients = db.query("SELECT username,account_id FROM app_users WHERE username<>? AND username IN ("
+            + "SELECT CASE WHEN user_a=? THEN user_b ELSE user_a END FROM contacts WHERE user_a=? OR user_b=? "
+            + "UNION SELECT CASE WHEN sender=? THEN recipient ELSE sender END FROM messages WHERE sender=? OR recipient=?) ORDER BY username",
+            (r, i) -> new EventRecipient(r.getString("username"), r.getString("account_id")), user, user, user, user, user, user, user);
+        OffsetDateTime deletedAt = OffsetDateTime.now(ZoneOffset.UTC);
+        for (var peer : recipients) {
+            db.update("INSERT INTO account_deletion_events(id,recipient,recipient_account_id,username,account_id,identity_key,deleted_at) "
+                + "SELECT ?,username,account_id,?,?,?,? FROM app_users WHERE username=? AND account_id=?",
+                UUID.randomUUID().toString(), user, accountId, identityKey, deletedAt, peer.username(), peer.accountId());
+        }
+        db.update("DELETE FROM messages WHERE sender=? OR recipient=?", user, user);
+        db.update("DELETE FROM contacts WHERE user_a=? OR user_b=?", user, user);
+        db.update("DELETE FROM one_time_keys WHERE username=?", user);
+        db.update("DELETE FROM device_keys WHERE username=?", user);
+        db.update("DELETE FROM app_users WHERE username=?", user);
+        return Optional.of(new DeletedAccount(accountId, recipients.stream().map(EventRecipient::username).toList()));
+    }
+    public List<AccountDeletionEvent> accountEvents(String user, String accountId) {
+        return db.query("SELECT e.* FROM account_deletion_events e JOIN app_users u ON u.username=e.recipient AND u.account_id=e.recipient_account_id "
+            + "WHERE e.recipient=? AND e.recipient_account_id=? ORDER BY e.deleted_at,e.id",
+            (r, i) -> new AccountDeletionEvent(r.getString("id"), r.getString("username"), r.getString("account_id"),
+                r.getString("identity_key"), r.getObject("deleted_at", OffsetDateTime.class).toString()), user, accountId);
+    }
+    @Transactional
+    public void acknowledgeAccountEvents(String user, String accountId, List<String> ids) {
+        for (String id : ids) db.update("DELETE FROM account_deletion_events WHERE id=? AND recipient=? AND recipient_account_id=?",
+            id, user, accountId);
+    }
+    // Lock both user rows in a stable order so concurrent server instances cannot create
+    // two pending messages or opposite-direction requests for the same pair.
+    private boolean lockPair(String a, String b) {
+        String first = a.compareTo(b) < 0 ? a : b, second = first.equals(a) ? b : a;
+        if (db.queryForList("SELECT username FROM app_users WHERE username=? FOR UPDATE", String.class, first).isEmpty()) return false;
+        return !db.queryForList("SELECT username FROM app_users WHERE username=? FOR UPDATE", String.class, second).isEmpty();
+    }
+    private String[] pair(String a, String b) {
+        return a.compareTo(b) < 0 ? new String[]{a, b} : new String[]{b, a};
+    }
+    @Transactional
+    public SaveResult save(String sender, String recipient, String clientId, String ciphertext) {
+        if (!lockPair(sender, recipient)) throw new IllegalArgumentException("用户不存在，请重新登录");
         var existing = db.query("SELECT * FROM messages WHERE sender=? AND client_id=?", this::map, sender, clientId);
         if (!existing.isEmpty()) {
             Message old = existing.get(0);
             if (!old.recipient().equals(recipient) || !old.ciphertext().equals(ciphertext)) throw new IllegalArgumentException("clientId 已用于另一条消息");
-            return old;
+            return new SaveResult(old, false);
         }
-        if (!userExists(recipient)) throw new IllegalArgumentException("接收用户不存在");
+        String[] pair = pair(sender, recipient);
+        var relations = db.queryForList("SELECT accepted FROM contacts WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
+            Boolean.class, sender, recipient, recipient, sender);
+        boolean newContact = relations.isEmpty();
+        if (newContact) db.update("INSERT INTO contacts(user_a,user_b,initiator) VALUES (?,?,?)", pair[0], pair[1], sender);
+        else if (!relations.get(0)) throw new IllegalArgumentException("等待对方接受聊天请求");
         db.update("INSERT INTO messages(client_id,sender,recipient,ciphertext,created_at) VALUES (?,?,?,?,?)",
             clientId, sender, recipient, ciphertext, OffsetDateTime.now(ZoneOffset.UTC));
-        return db.query("SELECT * FROM messages WHERE sender=? AND client_id=?", this::map, sender, clientId).get(0);
+        return new SaveResult(db.query("SELECT * FROM messages WHERE sender=? AND client_id=?", this::map, sender, clientId).get(0), newContact);
+    }
+    public List<Contact> contacts(String user) {
+        return db.query("SELECT user_a,user_b,initiator,accepted FROM contacts WHERE user_a=? OR user_b=? ORDER BY user_a,user_b",
+            (r, i) -> {
+                String peer = user.equals(r.getString("user_a")) ? r.getString("user_b") : r.getString("user_a");
+                String status = r.getBoolean("accepted") ? "accepted" : user.equals(r.getString("initiator")) ? "pending_outgoing" : "pending_incoming";
+                return new Contact(peer, status, false);
+            }, user, user);
+    }
+    public Contact contact(String user, String peer) {
+        return contacts(user).stream().filter(c -> c.username().equals(peer)).findFirst().orElse(null);
+    }
+    @Transactional
+    public void accept(String user, String peer) {
+        if (user.equals(peer) || !lockPair(user, peer)) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "聊天请求不存在");
+        int changed = db.update("UPDATE contacts SET accepted=TRUE WHERE ((user_a=? AND user_b=?) OR (user_a=? AND user_b=?)) AND initiator=? AND accepted=FALSE",
+            user, peer, peer, user, peer);
+        if (changed == 0) {
+            var state = contact(user, peer);
+            if (state == null || !state.status().equals("accepted")) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "聊天请求不存在");
+        }
+    }
+    @Transactional
+    public boolean remove(String user, String peer) {
+        if (user.equals(peer)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "不能移除自己");
+        if (!lockPair(user, peer)) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "用户不存在");
+        String[] pair = pair(user, peer);
+        var relation = db.queryForList("SELECT accepted FROM contacts WHERE user_a=? AND user_b=?",
+            Boolean.class, pair[0], pair[1]);
+        if (!relation.isEmpty() && !relation.get(0))
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "聊天请求尚未同意");
+        return db.update("DELETE FROM contacts WHERE user_a=? AND user_b=?", pair[0], pair[1]) > 0;
     }
     public List<Message> pending(String user, long afterId, int limit) {
         return db.query("SELECT * FROM messages WHERE recipient=? AND acknowledged=FALSE AND id>? ORDER BY id LIMIT ?", this::map, user, afterId, limit);
     }
+    @Transactional
     public Message acknowledge(String user, long id) {
+        if (db.queryForList("SELECT username FROM app_users WHERE username=? FOR UPDATE", String.class, user).isEmpty())
+            throw new IllegalArgumentException("用户不存在，请重新登录");
         var found = db.query("SELECT * FROM messages WHERE id=? AND recipient=?", this::map, id, user);
         if (found.isEmpty()) throw new IllegalArgumentException("消息不存在或无权确认");
         db.update("UPDATE messages SET acknowledged=TRUE WHERE id=? AND recipient=?", id, user);

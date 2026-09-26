@@ -123,5 +123,18 @@ class SignalEngine {
     const code=s.Fingerprint.new(5200,2,Buffer.from(this.state.username),identity.getPublicKey(),Buffer.from(peer),s.PublicKey.deserialize(bytes(remotePublic))).displayableFingerprint().toString();
     return {code,verified:this.state.verified[peer]===remotePublic,publicKey:remotePublic};
   }
+  async retirePeer(peer) {
+    const s=await lib,key=s.ProtocolAddress.new(peer,1).toString();
+    delete this.state.sessions[key];delete this.state.trusted[key];delete this.state.verified[peer];
+    for(const [id,request] of Object.entries(this.state.outbox)) {
+      if(request.to!==peer)continue;
+      delete this.state.outbox[id];
+      const message=this.state.messages[this.state.username+':'+id];
+      if(message)message.status='该用户已销户，旧消息未发送';
+    }
+    for(const message of Object.values(this.state.messages))if(message.sender===peer||message.recipient===peer) {
+      if(message.id){message.archivedServerId=message.id;delete message.id;}
+    }
+  }
 }
 module.exports={SignalEngine};

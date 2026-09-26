@@ -1,14 +1,15 @@
 {
-  "name": "chatapp-secure-client",
-  "version": "0.2.0",
-  "description": "Single-device Signal-protocol desktop chat prototype",
+  "name": "chat-client",
+  "productName": "Chat",
+  "version": "0.3.0",
+  "description": "Chat desktop client",
   "main": "main.cjs",
   "private": true,
   "license": "AGPL-3.0-only",
   "scripts": {
     "start": "electron .",
     "test": "node --test test/*.test.cjs",
-    "package": "electron-packager . ChatApp --platform=win32 --arch=x64 --out=../release --overwrite --ignore=^/test --ignore=^/qa"
+    "package": "electron-packager . Chat --platform=win32 --arch=x64 --out=../release --overwrite --icon=assets/icon.ico --ignore=^/test --ignore=^/qa"
   },
   "dependencies": { "@signalapp/libsignal-client": "0.103.0", "ws": "8.20.0" },
   "devDependencies": { "electron": "44.4.5", "@electron/packager": "20.3.0" }

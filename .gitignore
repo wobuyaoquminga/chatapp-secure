@@ -15,6 +15,14 @@ release/
 **/*.pfx
 **/*.jks
 **/*.key
+**/*.pem
 **/state.json
 .idea/
 .vscode/
+android/.gradle/
+android/local.properties
+android/**/build/
+**/*.keystore
+android/TEST-*.xml
+android/phone-login.png
+deploy/ubuntu/chat-server.jar

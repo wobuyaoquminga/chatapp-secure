@@ -23,6 +23,7 @@ public class ChatSocket extends TextWebSocketHandler {
         final WebSocketSession socket;
         final Instant opened = Instant.now();
         String user;
+        String accountId;
         Instant expires;
         long cursor;
         final Set<String> inFlight = new HashSet<>();
@@ -45,11 +46,14 @@ public class ChatSocket extends TextWebSocketHandler {
             if (c.user == null) {
                 if (!type.equals("auth")) { close(c, "authentication required"); return; }
                 var token = jwt.decode(field(request, "token"));
-                if (token.getExpiresAt() == null || !Instant.now().isBefore(token.getExpiresAt()) || !store.userExists(token.getSubject())) {
+                if (token.getExpiresAt() == null || !Instant.now().isBefore(token.getExpiresAt()) ||
+                    !store.recordConnection(token.getSubject(), token.getClaimAsString("account_id"))) {
                     close(c, "invalid token"); return;
                 }
-                c.user = token.getSubject(); c.expires = token.getExpiresAt();
-                emit(c, Map.of("type", "ready", "username", c.user));
+                boolean becameOnline = !isOnline(token.getSubject());
+                c.user = token.getSubject(); c.accountId = token.getClaimAsString("account_id"); c.expires = token.getExpiresAt();
+                if (!emit(c, Map.of("type", "ready", "username", c.user))) return;
+                if (becameOnline) notifyPresence(c.user, true);
                 pump(c);
                 return;
             }
@@ -59,11 +63,12 @@ public class ChatSocket extends TextWebSocketHandler {
                     clientId = field(request, "clientId");
                     if (!clientId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) throw new IllegalArgumentException("clientId 必须为 UUID");
                     String peer = field(request, "to"), ciphertext = field(request, "ciphertext");
-                    if (!peer.matches("[a-z0-9_]{3,32}") || peer.equals(c.user)) throw new IllegalArgumentException("请选择另一位有效用户");
+                    if (!Username.valid(peer) || peer.equals(c.user)) throw new IllegalArgumentException("请选择另一位有效用户");
                     validateCiphertext(ciphertext);
                     if (!store.keysExist(c.user) || !store.keysExist(peer)) throw new IllegalArgumentException("双方必须先初始化加密设备");
-                    var message = store.save(c.user, peer, clientId, ciphertext);
-                    emit(c, Map.of("type", "accepted", "message", message));
+                    var saved = store.save(c.user, peer, clientId, ciphertext);
+                    emit(c, Map.of("type", "accepted", "message", saved.message()));
+                    if (saved.newContact()) notifyContactChanged(c.user, peer);
                     for (Connection target : List.copyOf(connections.values())) if (peer.equals(target.user)) pump(target);
                 }
                 case "ack" -> {
@@ -115,9 +120,46 @@ public class ChatSocket extends TextWebSocketHandler {
             c.socket.sendMessage(new TextMessage(json.writeValueAsString(event))); return true;
         } catch (Exception e) { close(c, "connection unavailable"); return false; }
     }
+    public synchronized boolean isOnline(String user) {
+        Instant now = Instant.now();
+        return connections.values().stream().anyMatch(c -> user.equals(c.user) && c.socket.isOpen() && c.expires != null && now.isBefore(c.expires));
+    }
+    public synchronized void notifyContactChanged(String a, String b) {
+        for (Connection c : List.copyOf(connections.values())) {
+            if (!a.equals(c.user) && !b.equals(c.user)) continue;
+            String peer = a.equals(c.user) ? b : a;
+            var contact = store.contact(c.user, peer);
+            emit(c, Map.of("type", "contact", "contact", contact == null
+                ? new MessageStore.Contact(peer, "removed", false)
+                : new MessageStore.Contact(peer, contact.status(), isOnline(peer))));
+        }
+    }
+    public synchronized void notifyAccountDeleted(String user, String accountId, List<String> peers) {
+        for (Connection c : List.copyOf(connections.values())) {
+            if (c.user == null || !peers.contains(c.user)) continue;
+            for (var event : store.accountEvents(c.user, c.accountId)) {
+                if (user.equals(event.username()) && accountId.equals(event.accountId()))
+                    emit(c, Map.of("type", "account_deleted", "event", event));
+            }
+        }
+    }
+    private void notifyPresence(String user, boolean online) {
+        for (var contact : store.contacts(user)) {
+            for (Connection c : List.copyOf(connections.values()))
+                if (contact.username().equals(c.user)) emit(c, Map.of("type", "presence", "username", user, "online", online));
+        }
+    }
+    private void remove(Connection c) {
+        if (connections.remove(c.socket.getId()) != null && c.user != null && !isOnline(c.user))
+            notifyPresence(c.user, false);
+    }
     private void close(Connection c, String reason) {
-        connections.remove(c.socket.getId());
+        remove(c);
         try { c.socket.close(new CloseStatus(1008, reason)); } catch (IOException ignored) { }
+    }
+    public synchronized void disconnectDeletedAccount(String user, String accountId) {
+        for (Connection c : List.copyOf(connections.values()))
+            if (user.equals(c.user) && accountId.equals(c.accountId)) close(c, "account deleted");
     }
     @Scheduled(fixedDelay=1000)
     public synchronized void expireConnections() {
@@ -127,7 +169,9 @@ public class ChatSocket extends TextWebSocketHandler {
             else if (c.expires != null && !now.isBefore(c.expires)) close(c, "token expired");
         }
     }
-    @Override public synchronized void afterConnectionClosed(WebSocketSession socket, CloseStatus status) { connections.remove(socket.getId()); }
+    @Override public synchronized void afterConnectionClosed(WebSocketSession socket, CloseStatus status) {
+        Connection c = connections.get(socket.getId()); if (c != null) remove(c);
+    }
     @Override public synchronized void handleTransportError(WebSocketSession socket, Throwable error) {
         Connection c = connections.get(socket.getId()); if (c != null) close(c, "transport error");
     }

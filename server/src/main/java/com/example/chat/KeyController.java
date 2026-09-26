@@ -67,14 +67,16 @@ public class KeyController {
     }
     @GetMapping("/{user}")
     public Map<String,Object> identity(@PathVariable String user) throws Exception {
-        var rows=db.queryForList("SELECT * FROM device_keys WHERE username=?",user);
+        if (!Username.valid(user)) throw bad("用户名无效");
+        var rows=db.queryForList("SELECT k.*,u.account_id FROM device_keys k JOIN app_users u ON u.username=k.username WHERE k.username=?",user);
         if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND,"对方尚未初始化加密客户端");
         var row=rows.get(0);
-        return Map.of("username",user,"identityKey",row.get("identity_key"),"registrationId",row.get("registration_id"),"signedPreKey",json.readTree((String)row.get("signed_pre_key")));
+        return Map.of("username",user,"accountId",row.get("account_id"),"identityKey",row.get("identity_key"),"registrationId",row.get("registration_id"),"signedPreKey",json.readTree((String)row.get("signed_pre_key")));
     }
     @PostMapping("/{user}/claim")
     @Transactional
     public Map<String,Object> claim(@AuthenticationPrincipal Jwt jwt,@PathVariable String user) throws Exception {
+        if (!Username.valid(user)) throw bad("用户名无效");
         if (user.equals(jwt.getSubject())) throw bad("不能请求自己的会话预密钥");
         if (db.queryForList("SELECT username FROM app_users WHERE username=? FOR UPDATE",String.class,user).isEmpty())
             throw new ResponseStatusException(HttpStatus.NOT_FOUND,"用户不存在");

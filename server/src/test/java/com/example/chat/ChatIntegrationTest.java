@@ -28,9 +28,13 @@ class ChatIntegrationTest {
     @Autowired ObjectMapper json;
     @Autowired JdbcTemplate db;
     @Autowired JwtEncoder encoder;
+    @Autowired AccountCleanup cleanup;
+    @Autowired MessageStore store;
     record Account(String name, String token) {}
     Account account() {
-        String name = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 15);
+        return account("u" + UUID.randomUUID().toString().replace("-", "").substring(0, 15));
+    }
+    Account account(String name) {
         var response = rest.postForEntity("/api/auth/register", Map.of("username", name, "password", "password123"), JsonNode.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         Account a = new Account(name, response.getBody().path("token").asText());
@@ -46,12 +50,113 @@ class ChatIntegrationTest {
     JsonNode history(Account a, String peer) {
         return rest.exchange("/api/messages?peer=" + peer, HttpMethod.GET, auth(a), JsonNode.class).getBody();
     }
+    JsonNode contacts(Account a) {
+        return rest.exchange("/api/contacts", HttpMethod.GET, auth(a), JsonNode.class).getBody();
+    }
+    void accept(Account receiver, Account sender) {
+        assertThat(rest.exchange("/api/contacts/accept", HttpMethod.POST,
+            new HttpEntity<>(Map.of("peer", sender.name()), bearer(receiver)), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+    HttpStatusCode remove(Account user, Account peer) {
+        return rest.exchange("/api/contacts/remove", HttpMethod.POST,
+            new HttpEntity<>(Map.of("peer", peer.name()), bearer(user)), Void.class).getStatusCode();
+    }
+    HttpHeaders bearer(Account a) { var h = new HttpHeaders(); h.setBearerAuth(a.token()); return h; }
     String wire(String body) throws Exception {
         return json.writeValueAsString(Map.of("v", 1, "type", 2, "data", Base64.getEncoder().encodeToString(("opaque-test-payload-padding-" + body).getBytes(java.nio.charset.StandardCharsets.UTF_8))));
     }
     String send(Client c, Account recipient, String body, String clientId) throws Exception {
         c.send(Map.of("type", "send", "to", recipient.name(), "ciphertext", wire(body), "clientId", clientId));
         return c.await("accepted").path("message").path("id").asText();
+    }
+    @Test void chineseUsernamesCanRegisterLoginAndSend() throws Exception {
+        var a = account("小明");
+        var b = account("小红");
+        assertThat(rest.postForEntity("/api/auth/register", Map.of("username", "ab", "password", "password123"), String.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(rest.postForEntity("/api/auth/login", Map.of("username", a.name(), "password", "password123"), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(rest.exchange("/api/keys/" + b.name(), HttpMethod.GET, auth(a), JsonNode.class).getBody().path("username").asText()).isEqualTo(b.name());
+        try (var alice = new Client(a); var bob = new Client(b)) {
+            String id = send(alice, b, "hello", UUID.randomUUID().toString());
+            assertThat(bob.await("message").path("message").path("id").asText()).isEqualTo(id);
+        }
+        assertThat(contacts(b).get(0).path("status").asText()).isEqualTo("pending_incoming");
+    }
+    @Test void pendingRequestAllowsOneMessageAndRequiresReceiverAcceptance() throws Exception {
+        var a = account(); var b = account();
+        String id = UUID.randomUUID().toString();
+        try (var alice = new Client(a); var bob = new Client(b)) {
+            String first = send(alice, b, "invitation", id);
+            assertThat(send(alice, b, "invitation", id)).isEqualTo(first);
+            alice.send(Map.of("type", "send", "to", b.name(), "ciphertext", wire("second"), "clientId", UUID.randomUUID().toString()));
+            assertThat(alice.await("error").path("error").asText()).contains("接受");
+            bob.send(Map.of("type", "send", "to", a.name(), "ciphertext", wire("reverse"), "clientId", UUID.randomUUID().toString()));
+            assertThat(bob.await("error").path("error").asText()).contains("接受");
+            assertThat(contacts(a).get(0).path("status").asText()).isEqualTo("pending_outgoing");
+            assertThat(contacts(b).get(0).path("status").asText()).isEqualTo("pending_incoming");
+            assertThat(rest.exchange("/api/contacts/remove", HttpMethod.POST,
+                new HttpEntity<>(Map.of("peer", b.name()), bearer(a)), String.class).getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+            assertThat(rest.exchange("/api/contacts/accept", HttpMethod.POST,
+                new HttpEntity<>(Map.of("peer", b.name()), bearer(a)), String.class).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+            accept(b, a);
+            assertThat(contacts(a).get(0).path("status").asText()).isEqualTo("accepted");
+            send(alice, b, "second", UUID.randomUUID().toString());
+            send(bob, a, "reverse", UUID.randomUUID().toString());
+            assertThat(history(a, b.name()).size()).isEqualTo(3);
+        }
+    }
+    @Test void removedContactRequiresFreshConsentAndPreservesHistory() throws Exception {
+        var alice = account(); var bob = account();
+        assertThat(rest.postForEntity("/api/contacts/remove", Map.of("peer", bob.name()), String.class).getStatusCode())
+            .isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(remove(alice, bob)).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(remove(alice, alice)).isEqualTo(HttpStatus.BAD_REQUEST);
+        try (var a = new Client(alice); var b = new Client(bob)) {
+            String initial = send(a, bob, "initial request", UUID.randomUUID().toString());
+            assertThat(b.await("message").path("message").path("id").asText()).isEqualTo(initial);
+            accept(bob, alice);
+            String reply = send(b, alice, "accepted reply", UUID.randomUUID().toString());
+            assertThat(a.await("message").path("message").path("id").asText()).isEqualTo(reply);
+            assertThat(remove(alice, bob)).isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(a.awaitContactStatus(bob.name(), "removed").path("username").asText()).isEqualTo(bob.name());
+            assertThat(b.awaitContactStatus(alice.name(), "removed").path("username").asText()).isEqualTo(alice.name());
+            assertThat(contacts(alice)).isEmpty();
+            assertThat(contacts(bob)).isEmpty();
+            assertThat(history(alice, bob.name()).size()).isEqualTo(2);
+            assertThat(history(bob, alice.name()).size()).isEqualTo(2);
+            assertThat(history(alice, bob.name()).get(0).path("id").asText()).isEqualTo(reply);
+            assertThat(history(alice, bob.name()).get(1).path("id").asText()).isEqualTo(initial);
+            assertThat(remove(bob, alice)).isEqualTo(HttpStatus.NO_CONTENT);
+
+            String fresh = send(b, alice, "new request", UUID.randomUUID().toString());
+            assertThat(a.await("message").path("message").path("id").asText()).isEqualTo(fresh);
+            assertThat(contacts(bob).get(0).path("status").asText()).isEqualTo("pending_outgoing");
+            assertThat(contacts(alice).get(0).path("status").asText()).isEqualTo("pending_incoming");
+            b.send(Map.of("type", "send", "to", alice.name(), "ciphertext", wire("blocked sender"), "clientId", UUID.randomUUID().toString()));
+            assertThat(b.await("error").path("error").asText()).contains("接受");
+            a.send(Map.of("type", "send", "to", bob.name(), "ciphertext", wire("blocked receiver"), "clientId", UUID.randomUUID().toString()));
+            assertThat(a.await("error").path("error").asText()).contains("接受");
+            assertThat(rest.exchange("/api/contacts/accept", HttpMethod.POST,
+                new HttpEntity<>(Map.of("peer", alice.name()), bearer(bob)), String.class).getStatusCode())
+                .isEqualTo(HttpStatus.NOT_FOUND);
+            accept(alice, bob);
+            String afterAcceptance = send(b, alice, "after acceptance", UUID.randomUUID().toString());
+            assertThat(a.await("message").path("message").path("id").asText()).isEqualTo(afterAcceptance);
+            assertThat(history(alice, bob.name()).size()).isEqualTo(4);
+            assertThat(history(bob, alice.name()).size()).isEqualTo(4);
+        }
+    }
+    @Test void contactsReportAndPushPresence() throws Exception {
+        var a = account(); var b = account();
+        try (var alice = new Client(a)) {
+            send(alice, b, "invite", UUID.randomUUID().toString());
+            assertThat(contacts(a).get(0).path("online").asBoolean()).isFalse();
+            try (var bob = new Client(b)) {
+                assertThat(alice.await("presence").path("online").asBoolean()).isTrue();
+                assertThat(contacts(a).get(0).path("online").asBoolean()).isTrue();
+            }
+            assertThat(alice.await("presence").path("online").asBoolean()).isFalse();
+            assertThat(contacts(a).get(0).path("online").asBoolean()).isFalse();
+        }
     }
     @Test void registrationLoginAndPasswordHash() {
         var a = account();
@@ -72,6 +177,7 @@ class ChatIntegrationTest {
             assertThat(received.path("ciphertext").asText()).isEqualTo(wire("你好 Bob 👋"));
             bob.send(Map.of("type", "ack", "id", id)); bob.await("ack_ok");
             assertThat(alice.await("delivered").path("id").asText()).isEqualTo(id);
+            accept(b, a);
             send(bob, a, "回复 Alice", UUID.randomUUID().toString());
             assertThat(alice.await("message").path("message").path("ciphertext").asText()).isEqualTo(wire("回复 Alice"));
             assertThat(history(a, b.name()).get(1).path("acknowledged").asBoolean()).isTrue();
@@ -152,7 +258,9 @@ class ChatIntegrationTest {
     @Test void replaysMoreThanOneHundredOfflineMessagesAndPaginatesHistory() throws Exception {
         var a = account(); var b = account();
         try (var alice = new Client(a)) {
-            for (int i = 0; i < 105; i++) send(alice, b, "message " + i, UUID.randomUUID().toString());
+            send(alice, b, "message 0", UUID.randomUUID().toString());
+            accept(b, a);
+            for (int i = 1; i < 105; i++) send(alice, b, "message " + i, UUID.randomUUID().toString());
         }
         Set<String> ids = new HashSet<>();
         try (var bob = new Client(b)) {
@@ -177,7 +285,9 @@ class ChatIntegrationTest {
         var body=new HashMap<String,Object>();body.put("identityKey",ec);body.put("registrationId",10);
         body.put("signedPreKey",Map.of("id",1,"publicKey",ec,"signature",sig));body.put("preKeys",batch);
         assertThat(rest.exchange("/api/keys",HttpMethod.PUT,new HttpEntity<>(body,headers),String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(rest.exchange("/api/keys/"+b.name()+"/claim",HttpMethod.POST,auth(a),String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        var claimed=rest.exchange("/api/keys/"+b.name()+"/claim",HttpMethod.POST,auth(a),JsonNode.class);
+        assertThat(claimed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(claimed.getBody().path("accountId").asText()).isEqualTo(accountId(b));
         // Retrying publication must not make an already claimed key available again.
         assertThat(rest.exchange("/api/keys",HttpMethod.PUT,new HttpEntity<>(body,headers),String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(rest.exchange("/api/keys/"+b.name()+"/claim",HttpMethod.POST,auth(a),String.class).getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
@@ -193,8 +303,131 @@ class ChatIntegrationTest {
         }
         assertThat(history(a,b.name()).size()).isZero();
     }
+    JsonNode accountEvents(Account account) {
+        var response = rest.exchange("/api/account-events", HttpMethod.GET, auth(account), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return response.getBody();
+    }
+    HttpStatusCode ackAccountEvents(Account account, List<String> ids) {
+        return rest.exchange("/api/account-events/ack", HttpMethod.POST,
+            new HttpEntity<>(Map.of("ids", ids), bearer(account)), Void.class).getStatusCode();
+    }
+    void expire(Account account) {
+        db.update("UPDATE app_users SET last_connected_at=CURRENT_TIMESTAMP - INTERVAL '8' DAY WHERE username=?", account.name());
+    }
+    String accountId(Account account) {
+        return db.queryForObject("SELECT account_id FROM app_users WHERE username=?", String.class, account.name());
+    }
+    @Test void accountCleanupPushesFullDeletionEventAndRemovesAccountData() throws Exception {
+        var deleted = account(); var peer = account();
+        String generation = accountId(deleted);
+        String identity = db.queryForObject("SELECT identity_key FROM device_keys WHERE username=?", String.class, deleted.name());
+        try (var old = new Client(deleted); var receiver = new Client(peer)) {
+            send(old, peer, "old account", UUID.randomUUID().toString());
+            receiver.await("message");
+            expire(deleted);
+            cleanup.removeInactiveAccounts();
+            var event = receiver.await("account_deleted").path("event");
+            assertThat(UUID.fromString(event.path("id").asText())).isNotNull();
+            assertThat(event.path("username").asText()).isEqualTo(deleted.name());
+            assertThat(event.path("accountId").asText()).isEqualTo(generation);
+            assertThat(event.path("identityKey").asText()).isEqualTo(identity);
+            assertThat(Instant.parse(event.path("deletedAt").asText())).isBeforeOrEqualTo(Instant.now());
+            receiver.awaitContactStatus(deleted.name(), "removed");
+            assertThat(old.closed.get(5, TimeUnit.SECONDS)).isEqualTo(1008);
+            assertThat(accountEvents(peer).get(0)).isEqualTo(event);
+        }
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM app_users WHERE username=?", Integer.class, deleted.name())).isZero();
+        assertThat(store.keysExist(deleted.name())).isFalse();
+        assertThat(contacts(peer)).isEmpty();
+        assertThat(history(peer, deleted.name())).isEmpty();
+    }
+    @Test void offlineDeletionPersistsAcrossReconnectUntilAuthorizedIdempotentAck() throws Exception {
+        var deleted = account(); var peer = account(); var stranger = account();
+        try (var sender = new Client(deleted)) { send(sender, peer, "offline", UUID.randomUUID().toString()); }
+        expire(deleted);
+        cleanup.removeInactiveAccounts();
+        String id = accountEvents(peer).get(0).path("id").asText();
+        assertThat(rest.getForEntity("/api/account-events", String.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(accountEvents(stranger)).isEmpty();
+        assertThat(ackAccountEvents(stranger, List.of(id))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(accountEvents(peer)).hasSize(1);
+        for (int i = 0; i < 2; i++) {
+            try (var receiver = new Client(peer)) {
+                assertThat(accountEvents(peer).get(0).path("id").asText()).isEqualTo(id);
+            }
+        }
+        assertThat(ackAccountEvents(peer, List.of(id))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(ackAccountEvents(peer, List.of(id))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(accountEvents(peer)).isEmpty();
+        assertThat(ackAccountEvents(peer, List.of("malformed"))).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+    @Test void cleanupNotifiesRemovedContactsWithHistoricalMessagesAndCapturesDeletedGeneration() throws Exception {
+        var deleted = account(); var formerPeer = account();
+        String oldGeneration = accountId(deleted);
+        try (var sender = new Client(deleted)) { send(sender, formerPeer, "history", UUID.randomUUID().toString()); }
+        accept(formerPeer, deleted);
+        assertThat(remove(formerPeer, deleted)).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(contacts(formerPeer)).isEmpty();
+        expire(deleted);
+        cleanup.removeInactiveAccounts();
+        var replacement = account(deleted.name());
+        var event = accountEvents(formerPeer).get(0);
+        assertThat(event.path("accountId").asText()).isEqualTo(oldGeneration).isNotEqualTo(accountId(replacement));
+        var bundle = rest.exchange("/api/keys/" + replacement.name(), HttpMethod.GET, auth(formerPeer), JsonNode.class).getBody();
+        assertThat(bundle.path("accountId").asText()).isEqualTo(accountId(replacement));
+        assertThat(rest.exchange("/api/account-events", HttpMethod.GET, auth(deleted), String.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(accountEvents(formerPeer)).hasSize(1);
+    }
+    @Test void recipientReRegistrationCannotInheritEventsOrUseItsOldToken() throws Exception {
+        var deleted = account(); var receiver = account(); var laterDeleted = account();
+        store.save(deleted.name(), receiver.name(), UUID.randomUUID().toString(), wire("old event"));
+        expire(deleted); cleanup.removeInactiveAccounts();
+        String oldEventId = accountEvents(receiver).get(0).path("id").asText();
+        String oldRecipientGeneration = accountId(receiver);
+        expire(receiver); cleanup.removeInactiveAccounts();
+        var replacement = account(receiver.name());
+        assertThat(accountId(replacement)).isNotEqualTo(oldRecipientGeneration);
+        assertThat(accountEvents(replacement)).isEmpty();
+        store.save(laterDeleted.name(), replacement.name(), UUID.randomUUID().toString(), wire("new event"));
+        expire(laterDeleted); cleanup.removeInactiveAccounts();
+        String newEventId = accountEvents(replacement).get(0).path("id").asText();
+        assertThat(newEventId).isNotEqualTo(oldEventId);
+        assertThat(rest.exchange("/api/account-events", HttpMethod.GET, auth(receiver), String.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(ackAccountEvents(receiver, List.of(newEventId))).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(store.accountEvents(receiver.name(), oldRecipientGeneration)).isEmpty();
+        store.acknowledgeAccountEvents(receiver.name(), oldRecipientGeneration, List.of(newEventId));
+        assertThat(accountEvents(replacement)).hasSize(1);
+    }
+    @Test void cleanupHonorsSevenDaysAndOnlyWebSocketConnectionRenewsActivity() throws Exception {
+        var expired = account(); var recent = account(); var reconnected = account();
+        expire(expired); expire(reconnected);
+        db.update("UPDATE app_users SET last_connected_at=CURRENT_TIMESTAMP - INTERVAL '6' DAY WHERE username=?", recent.name());
+        assertThat(rest.postForEntity("/api/auth/login", Map.of("username", expired.name(), "password", "password123"), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(contacts(expired)).isEmpty();
+        try (var active = new Client(reconnected)) {
+            cleanup.removeInactiveAccounts();
+            assertThat(db.queryForObject("SELECT COUNT(*) FROM app_users WHERE username=?", Integer.class, expired.name())).isZero();
+            assertThat(accountId(recent)).isNotBlank();
+            assertThat(accountId(reconnected)).isNotBlank();
+            assertThat(store.deleteIfInactive(recent.name())).isEmpty();
+            assertThat(store.deleteIfInactive(reconnected.name())).isEmpty();
+            active.send(Map.of("type", "ping")); active.await("pong");
+        }
+        var uninitialized = rest.postForEntity("/api/auth/register", Map.of("username", "n" + UUID.randomUUID().toString().replace("-", "").substring(0, 15), "password", "password123"), JsonNode.class).getBody();
+        String name = uninitialized.path("username").asText();
+        store.save(name, recent.name(), UUID.randomUUID().toString(), wire("no identity published"));
+        db.update("UPDATE app_users SET last_connected_at=CURRENT_TIMESTAMP - INTERVAL '8' DAY WHERE username=?", name);
+        assertThat(store.deleteIfInactive(name)).isPresent();
+        assertThat(accountEvents(recent).get(0).path("identityKey").asText()).isEmpty();
+        var boundary = account();
+        db.update("UPDATE app_users SET last_connected_at=CURRENT_TIMESTAMP - INTERVAL '7' DAY WHERE username=?", boundary.name());
+        assertThat(store.deleteIfInactive(boundary.name())).isPresent();
+    }
     private String token(String username, Instant expiry) {
-        var claims = JwtClaimsSet.builder().issuer("chatapp-secure").subject(username).issuedAt(Instant.now().minusSeconds(300)).expiresAt(expiry).build();
+        var claims = JwtClaimsSet.builder().issuer("chat").subject(username)
+            .claim("account_id", db.queryForObject("SELECT account_id FROM app_users WHERE username=?", String.class, username))
+            .issuedAt(Instant.now().minusSeconds(300)).expiresAt(expiry).build();
         return encoder.encode(JwtEncoderParameters.from(JwsHeader.with(MacAlgorithm.HS256).build(), claims)).getTokenValue();
     }
     class Client implements WebSocket.Listener, AutoCloseable {
@@ -213,6 +446,17 @@ class ChatIntegrationTest {
                 if (e != null && e.path("type").asText().equals("error")) throw new AssertionError(e.toString());
             }
             throw new AssertionError("Timed out awaiting " + type);
+        }
+        JsonNode awaitContactStatus(String peer, String status) throws Exception {
+            long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(6);
+            while (System.nanoTime() < end) {
+                var e = events.poll(Math.max(1, end - System.nanoTime()), TimeUnit.NANOSECONDS);
+                if (e != null && e.path("type").asText().equals("contact")
+                    && e.path("contact").path("username").asText().equals(peer)
+                    && e.path("contact").path("status").asText().equals(status)) return e.path("contact");
+                if (e != null && e.path("type").asText().equals("error")) throw new AssertionError(e.toString());
+            }
+            throw new AssertionError("Timed out awaiting contact status " + status);
         }
         @Override public void onOpen(WebSocket socket) { socket.request(1); }
         @Override public CompletionStage<?> onText(WebSocket socket, CharSequence data, boolean last) {

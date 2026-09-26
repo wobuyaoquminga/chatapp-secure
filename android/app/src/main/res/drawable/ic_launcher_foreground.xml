@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon foreground: speech bubble inside the 108dp safe zone, same geometry as
+     client/assets/icon.ico and the mipmap-*dpi PNGs (see work/make_icons.py). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M37,32 H71 A9,9 0 0 1 80,41 V63 A9,9 0 0 1 71,72 H54 L36,87 L40,72 H37 A9,9 0 0 1 28,63 V41 A9,9 0 0 1 37,32 Z"/>
+    <path android:fillColor="#087D55" android:pathData="M38,44 h30 v5.5 h-30 z"/>
+    <path android:fillColor="#087D55" android:pathData="M38,55 h20 v5.5 h-20 z"/>
+</vector>
