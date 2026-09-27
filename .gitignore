@@ -6,6 +6,8 @@ release/
 *.log
 **/*.vault
 **/*.vault.tmp
+**/*.vault.compact
+**/accounts.journal.compact
 **/*.mv.db
 **/*.trace.db
 **/.env

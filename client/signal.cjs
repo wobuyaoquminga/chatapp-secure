@@ -82,6 +82,7 @@ class SignalEngine {
     await s.processPreKeyBundle(key,s.ProtocolAddress.new(peer,1),s.ProtocolAddress.new(this.state.username,1),stores.session,stores.identity);
   }
   async encrypt(to,body) {
+    if(this.state.identityChanges?.[to])throw new Error('设备身份已更新，请先核对新的安全码');
     const s=await lib, stores=await this.stores(), clientId=randomUUID();
     const content={v:1,clientId,sender:this.state.username,recipient:to,body,createdAt:new Date().toISOString()};
     const message=await s.signalEncrypt(Buffer.from(JSON.stringify(content)),s.ProtocolAddress.new(to,1),s.ProtocolAddress.new(this.state.username,1),stores.session,stores.identity);
@@ -123,14 +124,14 @@ class SignalEngine {
     const code=s.Fingerprint.new(5200,2,Buffer.from(this.state.username),identity.getPublicKey(),Buffer.from(peer),s.PublicKey.deserialize(bytes(remotePublic))).displayableFingerprint().toString();
     return {code,verified:this.state.verified[peer]===remotePublic,publicKey:remotePublic};
   }
-  async retirePeer(peer) {
+  async retirePeer(peer,status='该用户已销户，旧消息未发送') {
     const s=await lib,key=s.ProtocolAddress.new(peer,1).toString();
     delete this.state.sessions[key];delete this.state.trusted[key];delete this.state.verified[peer];
     for(const [id,request] of Object.entries(this.state.outbox)) {
       if(request.to!==peer)continue;
       delete this.state.outbox[id];
       const message=this.state.messages[this.state.username+':'+id];
-      if(message)message.status='该用户已销户，旧消息未发送';
+      if(message)message.status=status;
     }
     for(const message of Object.values(this.state.messages))if(message.sender===peer||message.recipient===peer) {
       if(message.id){message.archivedServerId=message.id;delete message.id;}

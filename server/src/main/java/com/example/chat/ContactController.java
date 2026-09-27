@@ -24,8 +24,8 @@ public class ContactController {
 
     @PostMapping("/accept")
     public MessageStore.Contact accept(@AuthenticationPrincipal Jwt jwt, @RequestBody AcceptRequest request) {
-        if (request == null || request.peer() == null || request.peer().isBlank())
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "缺少 peer");
+        if (request == null || !Username.valid(request.peer()))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "peer 必须为 2–32 位有效用户名");
         String user = jwt.getSubject();
         store.accept(user, request.peer());
         socket.notifyContactChanged(user, request.peer());
@@ -35,8 +35,8 @@ public class ContactController {
     @PostMapping("/remove")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void remove(@AuthenticationPrincipal Jwt jwt, @RequestBody AcceptRequest request) {
-        if (request == null || request.peer() == null || request.peer().isBlank())
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "缺少 peer");
+        if (request == null || !Username.valid(request.peer()))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "peer 必须为 2–32 位有效用户名");
         String user = jwt.getSubject();
         if (store.remove(user, request.peer())) socket.notifyContactChanged(user, request.peer());
     }

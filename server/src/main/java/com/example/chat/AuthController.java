@@ -29,7 +29,7 @@ public class AuthController {
     private void validate(Credentials c) {
         if (!Username.valid(c.username()) || c.password() == null
             || c.password().length() < 8 || c.password().getBytes(StandardCharsets.UTF_8).length > 72)
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "用户名可用 2–32 位汉字/小写字母/数字/下划线（纯 ASCII 至少 3 位）；密码至少 8 字符、最多 72 UTF-8 字节");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "用户名可用 2–32 位汉字/小写字母/数字/下划线；密码至少 8 字符、最多 72 UTF-8 字节");
     }
     @PostMapping("/register")
     @ResponseStatus(HttpStatus.CREATED)
@@ -51,11 +51,11 @@ public class AuthController {
         if (!valid || accounts.isEmpty()) throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "用户名或密码错误");
         return token(c.username(), accounts.get(0).accountId());
     }
-    private Map<String, String> token(String user, String accountId) {
+    public Map<String, String> token(String user, String accountId) {
         Instant now = Instant.now();
         var claims = JwtClaimsSet.builder().issuer("chat").subject(user).claim("account_id", accountId)
             .issuedAt(now).expiresAt(now.plusSeconds(3600)).build();
         String token = encoder.encode(JwtEncoderParameters.from(JwsHeader.with(MacAlgorithm.HS256).build(), claims)).getTokenValue();
-        return Map.of("token", token, "username", user);
+        return Map.of("token", token, "username", user, "accountId", accountId);
     }
 }

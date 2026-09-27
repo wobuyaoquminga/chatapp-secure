@@ -9,7 +9,7 @@ final class Usernames {
     static boolean valid(String value) {
         if (value == null || value.length() < 2 || value.length() > 32
                 || !value.matches("[\\p{IsHan}a-z0-9_]+")) return false;
-        return value.length() >= 3 || value.matches(".*\\p{IsHan}.*");
+        return true;
     }
 
     static String path(String value) {

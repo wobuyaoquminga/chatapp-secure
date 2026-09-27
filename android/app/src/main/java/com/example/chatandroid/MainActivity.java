@@ -1,6 +1,11 @@
 package com.example.chatandroid;
 
 import android.app.Activity;
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.widget.Toast;
 import android.app.AlertDialog;
 import android.graphics.Color;
 import android.graphics.Insets;
@@ -8,6 +13,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.text.Editable;
@@ -28,10 +35,12 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /** Native account and conversation screens driven by ChatController snapshots. */
 public final class MainActivity extends Activity implements ChatController.Listener {
@@ -41,6 +50,17 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private static final int BG = Color.rgb(246, 248, 247);
     private static final int BORDER = Color.rgb(228, 233, 230);
     private ChatController controller;
+    private LocationSharing locationSharing;
+    private String pendingLocationPeer = "", pendingLocationAction = "";
+    private static final int LOCATION_PERMISSION = 501;
+    private AlertDialog historyDialog;
+    private long historySearchGeneration;
+    private final Runnable expiryRefresh = new Runnable() {
+        @Override public void run() {
+            if (!destroyed && conversationStream != null) refreshLocationCards();
+            if (!destroyed) main.postDelayed(this, 15000);
+        }
+    };
     private JSONObject state = new JSONObject();
     private LinearLayout header, tabs;
     private FrameLayout content;
@@ -51,6 +71,21 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private String page = "messages", detailPeer = "", loginUser = "", draft = "";
     private String messageQuery = "", contactQuery = "";
     private boolean lanTest;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final ExecutorService uiPreparation = Executors.newSingleThreadExecutor();
+    private MessageIndex messageIndex = new MessageIndex();
+    private volatile long snapshotGeneration;
+    private volatile boolean destroyed;
+    private static final int HISTORY_PAGE = 80;
+    private int historyLimit = HISTORY_PAGE;
+    private int revealedHistoryIndex = -1;
+    private LinearLayout conversationStream, messageResults, contactResults;
+    private TextView conversationStatus;
+    private final Map<String, View> messageViews = new HashMap<>();
+    private final Map<String, String> drafts = new HashMap<>();
+    private String composerDraftKey = "";
+    private String renderedScreen = "";
+    private LinearLayout shell;
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -59,13 +94,19 @@ public final class MainActivity extends Activity implements ChatController.Liste
         getWindow().setNavigationBarColor(Color.WHITE);
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        LinearLayout shell = column();
+        shell = column();
         shell.setBackgroundColor(BG);
         if (Build.VERSION.SDK_INT >= 30) {
+            // Own all insets: edge-to-edge avoids adjustResize plus IME padding twice.
+            getWindow().setDecorFitsSystemWindows(false);
             shell.setOnApplyWindowInsetsListener((view, insets) -> {
                 Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
-                shell.setPadding(bars.left, bars.top, bars.right, bars.bottom);
-                return insets;
+                Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                shell.setPadding(Math.max(bars.left, ime.left), bars.top,
+                        Math.max(bars.right, ime.right), Math.max(bars.bottom, ime.bottom));
+                tabs.setVisibility(ime.bottom > bars.bottom ? View.GONE : View.VISIBLE);
+                if (composer != null) composer.setMaxLines(ime.bottom > bars.bottom ? 2 : 5);
+                return WindowInsets.CONSUMED;
             });
         } else shell.setFitsSystemWindows(true);
         header = column();
@@ -76,11 +117,36 @@ public final class MainActivity extends Activity implements ChatController.Liste
         shell.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
         shell.addView(tabs);
         setContentView(shell);
+        shell.requestApplyInsets();
         render();
         controller = new ChatController(this, this);
+        locationSharing = new LocationSharing(this, controller, (live, peer, notice) -> main.post(() -> {
+            if (!destroyed && notice != null && !notice.isEmpty() && !notice.startsWith("正在分享实时位置")) Toast.makeText(this, notice, Toast.LENGTH_LONG).show();
+            if (!destroyed) { header.removeAllViews(); renderHeader(signedIn()); }
+        }));
+        main.postDelayed(expiryRefresh, 15000);
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        main.removeCallbacks(expiryRefresh);
+        main.post(expiryRefresh);
+    }
+
+    @Override protected void onStop() {
+        main.removeCallbacks(expiryRefresh);
+        if (locationSharing != null) locationSharing.stopLive();
+        pendingLocationPeer = pendingLocationAction = "";
+        super.onStop();
     }
 
     @Override protected void onDestroy() {
+        destroyed = true;
+        snapshotGeneration++;
+        uiPreparation.shutdownNow();
+        main.removeCallbacksAndMessages(null);
+        if (locationSharing != null) locationSharing.close();
+        if (historyDialog != null) historyDialog.dismiss();
         if (controller != null) controller.close();
         super.onDestroy();
     }
@@ -103,6 +169,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private void render() {
         if (content == null) return;
+        String nextScreen = screenKey();
+        Map<String, String> fieldValues = new HashMap<>();
+        View focused = getCurrentFocus();
+        String focusTag = focused != null && focused.getTag() instanceof String ? (String) focused.getTag() : "";
+        int fieldCursor = focused instanceof EditText ? ((EditText) focused).getSelectionStart() : 0;
+        boolean sameScreen = nextScreen.equals(renderedScreen);
+        if (sameScreen) rememberFields(content, fieldValues);
+        ScrollView oldPageScroll = findScroll(content);
+        int pageScrollY = sameScreen && oldPageScroll != null ? oldPageScroll.getScrollY() : 0;
         boolean restoreFocus = composer != null && composer.hasFocus() && !detailPeer.isEmpty();
         int cursor = composer == null ? 0 : composer.getSelectionStart();
         if (conversationScroll != null && !detailPeer.isEmpty()) {
@@ -113,6 +188,11 @@ public final class MainActivity extends Activity implements ChatController.Liste
         }
         saveDraft();
         conversationScroll = null;
+        conversationStream = null;
+        conversationStatus = null;
+        messageResults = null;
+        contactResults = null;
+        messageViews.clear();
         header.removeAllViews();
         content.removeAllViews();
         tabs.removeAllViews();
@@ -128,10 +208,58 @@ public final class MainActivity extends Activity implements ChatController.Liste
         else if (server().isEmpty()) renderFirstUse();
         else if (!loginUser.isEmpty()) renderAuth();
         else renderAccounts();
+        renderedScreen = nextScreen;
+        if (sameScreen) {
+            restoreFields(content, fieldValues, focusTag, fieldCursor);
+            ScrollView newScroll = findScroll(content);
+            if (newScroll != null && detailPeer.isEmpty()) newScroll.post(() -> newScroll.scrollTo(0, pageScrollY));
+        }
         if (restoreFocus && composer != null) {
             composer.requestFocus();
             composer.setSelection(Math.min(Math.max(cursor, 0), composer.length()));
         }
+        shell.requestApplyInsets();
+    }
+
+    private String screenKey() {
+        return server() + ":" + state.optString("username") + ":" + page + ":" + detailPeer + ":" + loginUser;
+    }
+
+    private void rememberFields(View view, Map<String, String> values) {
+        if (view instanceof EditText && view.getTag() instanceof String)
+            values.put((String) view.getTag(), ((EditText) view).getText().toString());
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) rememberFields(group.getChildAt(i), values);
+        }
+    }
+
+    private void restoreFields(View view, Map<String, String> values, String focusTag, int cursor) {
+        if (view instanceof EditText && view.getTag() instanceof String) {
+            EditText field = (EditText) view;
+            String tag = (String) view.getTag();
+            if (values.containsKey(tag)) field.setText(values.get(tag));
+            if (tag.equals(focusTag)) {
+                field.requestFocus();
+                field.setSelection(Math.min(Math.max(0, cursor), field.length()));
+            }
+        }
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) restoreFields(group.getChildAt(i), values, focusTag, cursor);
+        }
+    }
+
+    private ScrollView findScroll(View view) {
+        if (view instanceof ScrollView) return (ScrollView) view;
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                ScrollView result = findScroll(group.getChildAt(i));
+                if (result != null) return result;
+            }
+        }
+        return null;
     }
 
     private void renderHeader(boolean signed) {
@@ -152,6 +280,14 @@ public final class MainActivity extends Activity implements ChatController.Liste
                         server().replaceFirst("^https?://", "");
         if (!subtitle.isEmpty()) labels.addView(text(subtitle, 12, false, MUTED));
         bar.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
+        if (signed && !detailPeer.isEmpty()) {
+            TextView more = button("⋮", 27, INK, v -> showChatMenu());
+            more.setContentDescription("聊天菜单");
+            bar.addView(more, new LinearLayout.LayoutParams(dp(44), dp(44)));
+            JSONObject sharing = state.optJSONObject("locationSharing");
+            if (sharing != null && sharing.optBoolean("active"))
+                bar.addView(button("停止共享", 13, GREEN, v -> locationSharing.stopLive()));
+        }
         if (signed && detailPeer.isEmpty() && !page.equals("settings"))
             bar.addView(button("＋", 27, INK, v -> promptPeer()), new LinearLayout.LayoutParams(dp(44), dp(44)));
         if (!signed && page.equals("messages") && !server().isEmpty() && loginUser.isEmpty())
@@ -237,7 +373,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             notice.addView(text("注册前请务必阅读", 16, true, Color.rgb(130, 83, 20)));
             String[] rules = {
                     "1. 用户名和密码目前不支持修改，请妥善保管。",
-                    "2. 账号身份绑定本机应用数据。清除应用数据或卸载软件后，本机账号和聊天历史无法恢复；密码和服务器均无法找回本机密钥。",
+                    "2. 清除应用数据或卸载后，本机密钥和聊天历史会丢失。账号未被清理时，可凭原用户名和密码重新登录，重建加密身份；旧设备会退出，联系人需重新核对安全码。旧历史无法恢复。",
                     "3. 连续 7 天未成功认证连接服务器，服务器会清理账号和服务器数据。请每周登录，并确认显示在线。",
                     "4. 首次联系只能发送一条消息；对方接受后，才能继续发送。"
             };
@@ -261,7 +397,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             showError("正在" + (register ? "注册" : "登录") + "…");
             controller.login(server(), user, secret, register, lanTest);
         }), new LinearLayout.LayoutParams(-1, dp(50)));
-        TextView security = hint("本地密钥只保存在本设备。已有账号若绑定其他设备，请注册新账号。");
+        TextView security = hint("重新登录已有账号可重建加密身份；旧设备会退出，联系人需重新核对安全码。本机丢失的历史无法找回。");
         security.setPadding(0, dp(18), 0, 0);
         body.addView(security);
         content.addView(scroll);
@@ -272,6 +408,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         LinearLayout body = column();
         scroll.addView(body);
         LinearLayout results = column();
+        messageResults = results;
         addSearch(body, "搜索会话", messageQuery, query -> {
             messageQuery = query;
             populateMessages(results);
@@ -283,9 +420,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private void populateMessages(LinearLayout results) {
         results.removeAllViews();
-        List<String> peers = conversationNames();
-        Map<String, JSONObject> last = latestMessages();
-        Collections.sort(peers, (a, b) -> time(last.get(b)).compareTo(time(last.get(a))));
+        List<String> peers = messageIndex.conversations;
+        Map<String, JSONObject> last = messageIndex.latest;
         int shown = 0;
         for (String peer : peers) {
             if (!matches(peer, messageQuery)) continue;
@@ -308,6 +444,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         LinearLayout body = column();
         scroll.addView(body);
         LinearLayout results = column();
+        contactResults = results;
         addSearch(body, "搜索联系人", contactQuery, query -> {
             contactQuery = query;
             populateContacts(results);
@@ -319,7 +456,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private void populateContacts(LinearLayout results) {
         results.removeAllViews();
-        List<String> contacts = contactNames();
+        List<String> contacts = messageIndex.contacts;
         int shown = 0;
         for (String peer : contacts) {
             if (!matches(peer, contactQuery)) continue;
@@ -352,6 +489,12 @@ public final class MainActivity extends Activity implements ChatController.Liste
         String relation = relation(detailPeer);
         boolean deleted = isDeleted(detailPeer);
         if (deleted) body.addView(hint("该用户已销户，无法向不存在的账号发送消息。历史记录仍保留。"));
+        if (identityChanged(detailPeer)) {
+            TextView notice = hint("对方的加密身份已更新。请打开安全码，通过其他可信渠道重新核对并确认后再发送消息。");
+            notice.setPadding(dp(16), dp(10), dp(16), dp(10));
+            notice.setBackgroundColor(Color.rgb(255, 248, 230));
+            body.addView(notice);
+        }
         if (relation.equals("pending_incoming")) {
             LinearLayout request = row();
             request.setPadding(dp(16), dp(10), dp(16), dp(10));
@@ -371,50 +514,25 @@ public final class MainActivity extends Activity implements ChatController.Liste
         stream.setPadding(dp(14), dp(10), dp(14), dp(14));
         scroll.addView(stream);
         body.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        JSONArray messages = state.optJSONArray("messages");
-        int count = 0;
-        if (messages != null) for (int i = 0; i < messages.length(); i++) {
-            JSONObject item = messages.optJSONObject(i);
-            if (item == null || !detailPeer.equals(item.optString("sender")) &&
-                    !detailPeer.equals(item.optString("recipient"))) continue;
-            boolean outgoing = state.optString("username").equals(item.optString("sender"));
-            LinearLayout bubble = column();
-            bubble.setPadding(dp(13), dp(9), dp(13), dp(9));
-            bubble.setBackground(rounded(outgoing ? Color.rgb(214, 246, 220) : Color.WHITE, 14, BORDER));
-            bubble.addView(text(item.optString("body"), 16, false, INK));
-            TextView sentTime = text(MessageTime.format(item.optString("createdAt", "")), 11, false, MUTED);
-            sentTime.setPadding(0, dp(5), 0, 0);
-            bubble.addView(sentTime);
-            String status = item.optString("status");
-            if (outgoing && !status.isEmpty()) {
-                TextView delivery = text(status, 11, false, MUTED);
-                delivery.setPadding(0, dp(5), 0, 0);
-                bubble.addView(delivery);
-            }
-            LinearLayout line = row();
-            line.setGravity(outgoing ? Gravity.RIGHT : Gravity.LEFT);
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
-            params.setMargins(0, dp(5), 0, dp(5));
-            line.addView(bubble, params);
-            stream.addView(line);
-            count++;
-        }
-        if (count == 0) stream.addView(empty("暂无消息", "发送第一条端到端加密消息。"));
+        conversationStream = stream;
+        updateConversationStream(false);
         LinearLayout tools = row();
         tools.setPadding(dp(16), dp(5), dp(16), dp(5));
-        tools.addView(text(state.optString("status"), 12, false, MUTED), new LinearLayout.LayoutParams(0, -2, 1));
+        conversationStatus = text(state.optString("status"), 12, false, MUTED);
+        tools.addView(conversationStatus, new LinearLayout.LayoutParams(0, -2, 1));
         if (!deleted) tools.addView(button("安全码  ›", 13, GREEN, v -> controller.safety(detailPeer, false, null)));
         body.addView(tools);
         LinearLayout bar = row();
         bar.setPadding(dp(10), dp(8), dp(10), dp(8));
         bar.setBackgroundColor(Color.WHITE);
         composer = field("发送消息", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        composerDraftKey = draftKey(detailPeer);
         composer.setText(draft);
         composer.setMaxLines(5);
         composer.setMinHeight(dp(44));
-        boolean canSend = !deleted && !relation.startsWith("pending_");
+        boolean canSend = !deleted && !identityChanged(detailPeer) && !relation.startsWith("pending_");
         composer.setEnabled(canSend);
-        if (!canSend) composer.setHint(deleted ? "该用户已销户，不能发送" : relation.equals("pending_incoming") ? "同意后可以回复" : "等待对方同意");
+        if (!canSend) composer.setHint(deleted ? "该用户已销户，不能发送" : identityChanged(detailPeer) ? "重新核对安全码后可发送" : relation.equals("pending_incoming") ? "同意后可以回复" : "等待对方同意");
         bar.addView(composer, new LinearLayout.LayoutParams(0, -2, 1));
         TextView sendButton = button("发送", 16, canSend ? GREEN : MUTED, v -> {
             String message = composer.getText().toString();
@@ -431,6 +549,314 @@ public final class MainActivity extends Activity implements ChatController.Liste
         scroll.post(() -> {
             if (atBottom) scroll.fullScroll(View.FOCUS_DOWN);
             else scroll.scrollTo(0, previousY);
+        });
+    }
+
+    private String visibleHistoryKey() {
+        List<JSONObject> history = messageIndex.messages(detailPeer);
+        StringBuilder key = new StringBuilder().append(history.size()).append(':');
+        for (int i = Math.max(0, history.size() - historyLimit); i < history.size(); i++) key.append(history.get(i));
+        return key.toString();
+    }
+
+    private void updateConversationStream(boolean preservePosition) {
+        if (conversationStream == null || conversationScroll == null) return;
+        LinearLayout stream = conversationStream;
+        ScrollView scroll = conversationScroll;
+        int oldY = scroll.getScrollY();
+        boolean atBottom = oldY + scroll.getHeight() >= stream.getHeight() - dp(48);
+        View anchor = null;
+        int anchorTop = 0;
+        if (preservePosition && !atBottom) for (int i = 0; i < stream.getChildCount(); i++) {
+            View child = stream.getChildAt(i);
+            if (child.getBottom() > oldY) { anchor = child; anchorTop = child.getTop(); break; }
+        }
+        List<JSONObject> history = messageIndex.messages(detailPeer);
+        int start = Math.max(0, history.size() - historyLimit);
+        List<View> desired = new ArrayList<>();
+        Map<String, View> retained = new HashMap<>();
+        if (start > 0) {
+            String key = "older:" + start;
+            View older = messageViews.get(key);
+            if (older == null) older = button("加载更早的消息（还有 " + start + " 条）", 14, GREEN, v -> {
+                // Loading is explicit; no record is removed from local storage.
+                historyLimit += HISTORY_PAGE;
+                updateConversationStream(true);
+            });
+            retained.put(key, older);
+            desired.add(older);
+        }
+        for (int i = start; i < history.size(); i++) {
+            JSONObject item = history.get(i);
+            if (messageIndex.hidden(detailPeer, i) && i != revealedHistoryIndex) continue;
+            String key = messageViewKey(i, item);
+            View line = messageViews.get(key);
+            if (line == null) {
+                MessageIndex.LocationCard card = messageIndex.card(detailPeer, i);
+                if (card == null && messageIndex.hidden(detailPeer, i) && i == revealedHistoryIndex) {
+                    LocationPayload payload = LocationPayload.parse(item.optString("body"), System.currentTimeMillis());
+                    if (payload != null) {
+                        card = new MessageIndex.LocationCard(); card.latest = payload;
+                        card.coordinate = payload.kind.equals("stop") ? null : payload;
+                        card.stopped = payload.kind.equals("stop"); card.sessionExpires = payload.expiresMillis;
+                    }
+                }
+                line = messageBubble(item, card);
+            }
+            retained.put(key, line);
+            desired.add(line);
+        }
+        if (history.isEmpty()) {
+            View empty = messageViews.get("empty");
+            if (empty == null) empty = empty("暂无消息", "发送第一条端到端加密消息。");
+            retained.put("empty", empty);
+            desired.add(empty);
+        }
+        java.util.HashSet<View> wanted = new java.util.HashSet<>(desired);
+        for (int i = stream.getChildCount() - 1; i >= 0; i--)
+            if (!wanted.contains(stream.getChildAt(i))) stream.removeViewAt(i);
+        for (int i = 0; i < desired.size(); i++) {
+            View child = desired.get(i);
+            if (i < stream.getChildCount() && stream.getChildAt(i) == child) continue;
+            if (child.getParent() == stream) stream.removeView(child);
+            stream.addView(child, i);
+        }
+        messageViews.clear();
+        messageViews.putAll(retained);
+        if (preservePosition) {
+            final View savedAnchor = anchor;
+            final int savedTop = anchorTop;
+            scroll.post(() -> {
+                if (scroll != conversationScroll) return;
+                if (savedAnchor != null && savedAnchor.getParent() == stream)
+                    scroll.scrollTo(0, oldY + savedAnchor.getTop() - savedTop);
+                else if (atBottom) scroll.fullScroll(View.FOCUS_DOWN);
+                else scroll.scrollTo(0, oldY);
+            });
+        }
+    }
+
+    private String messageViewKey(int index, JSONObject item) {
+        MessageIndex.LocationCard card = messageIndex.card(detailPeer, index);
+        return index + ":" + item.toString() + (card == null ? "" : ":" + card.key());
+    }
+
+    private View messageBubble(JSONObject item, MessageIndex.LocationCard location) {
+        boolean outgoing = state.optString("username").equals(item.optString("sender"));
+        LinearLayout bubble = column();
+        bubble.setPadding(dp(13), dp(9), dp(13), dp(9));
+        bubble.setBackground(rounded(outgoing ? Color.rgb(214, 246, 220) : Color.WHITE, 14, BORDER));
+        if (location == null) bubble.addView(text(item.optString("body"), 16, false, INK));
+        else addLocationCard(bubble, location);
+        TextView sentTime = text(MessageTime.format(item.optString("createdAt", "")), 11, false, MUTED);
+        sentTime.setPadding(0, dp(5), 0, 0);
+        bubble.addView(sentTime);
+        String status = item.optString("status");
+        if (outgoing && !status.isEmpty()) {
+            TextView delivery = text(status, 11, false, MUTED);
+            delivery.setPadding(0, dp(5), 0, 0);
+            bubble.addView(delivery);
+        }
+        LinearLayout line = row();
+        line.setGravity(outgoing ? Gravity.RIGHT : Gravity.LEFT);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+        params.setMargins(0, dp(5), 0, dp(5));
+        line.addView(bubble, params);
+        return line;
+    }
+
+    private void refreshLocationCards() {
+        if (conversationStream == null) return;
+        refreshLocationLabels(conversationStream);
+    }
+
+    private void refreshLocationLabels(View view) {
+        Object tag = view.getTag();
+        if (view instanceof TextView && tag instanceof MessageIndex.LocationCard)
+            ((TextView) view).setText(locationStatus((MessageIndex.LocationCard) tag));
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) refreshLocationLabels(group.getChildAt(i));
+        }
+    }
+
+    private String locationStatus(MessageIndex.LocationCard card) {
+        if (card.latest.kind.equals("pin")) return "当前位置";
+        if (card.stopped) return "实时位置 · 已停止";
+        if (System.currentTimeMillis() >= card.sessionExpires) return "实时位置 · 已过期";
+        return "实时位置 · 共享中，截止 " + MessageTime.format(java.time.Instant.ofEpochMilli(card.sessionExpires).toString());
+    }
+
+    private void addLocationCard(LinearLayout bubble, MessageIndex.LocationCard card) {
+        TextView status = text(locationStatus(card), 16, true, INK);
+        status.setTag(card); bubble.addView(status);
+        LocationPayload point = card.coordinate;
+        if (point != null) {
+            // Offline drawn preview: no external tiles, geocoding or automatic coordinate requests.
+            LocationPreview preview = new LocationPreview(this, point.latitude, point.longitude);
+            bubble.addView(preview, new LinearLayout.LayoutParams(dp(235), dp(116)));
+            bubble.addView(text(String.format(java.util.Locale.ROOT, "纬度 %.6f · 经度 %.6f", point.latitude, point.longitude), 12, false, INK));
+            bubble.addView(text((point.accuracy > 0 ? "精度约 " + Math.round(point.accuracy) + " 米" : "精度未提供") + " · " + MessageTime.format(point.recordedAt), 12, false, MUTED));
+            TextView open = button("点击在地图中查看", 13, GREEN, v -> {
+                new AlertDialog.Builder(this).setTitle("打开外部地图")
+                        .setMessage("将向 OpenStreetMap 打开此坐标。只有此次点击才会把坐标提供给地图网站。")
+                        .setNegativeButton("取消", null).setPositiveButton("打开地图", (d, w) -> {
+                            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(point.mapsUrl()))); }
+                            catch (Exception unavailable) { Toast.makeText(this, "没有可打开地图的浏览器", Toast.LENGTH_LONG).show(); }
+                        }).show();
+            }); bubble.addView(open);
+        } else bubble.addView(text("位置共享已结束", 13, false, MUTED));
+    }
+
+    private void showChatMenu() {
+        new AlertDialog.Builder(this).setTitle("聊天菜单")
+                .setItems(new String[]{"位置", "查找聊天记录"}, (d, which) -> {
+                    if (which == 0) showLocationMenu(); else showHistorySearch();
+                }).show();
+    }
+
+    private boolean canSendLocation(String peer) {
+        return signedIn() && state.optBoolean("online") && !isDeleted(peer)
+                && !identityChanged(peer) && "accepted".equals(relation(peer));
+    }
+
+    private void showLocationMenu() {
+        if (!canSendLocation(detailPeer) && !locationSharing.isLive()) {
+            Toast.makeText(this, "位置需要在线且双方已同意聊天；历史记录仍可查找", Toast.LENGTH_LONG).show();
+            return;
+        }
+        String peer = detailPeer;
+        new AlertDialog.Builder(this).setTitle(locationSharing.isLive() ? "位置 · 正在与 " + locationSharing.peer() + " 共享" : "位置")
+                .setItems(new String[]{"发送当前位置", "共享实时位置（最多 1 小时）", "停止共享"}, (d, which) -> {
+                    if (which == 2) locationSharing.stopLive();
+                    else if (which == 1) new AlertDialog.Builder(this).setTitle("共享实时位置")
+                            .setMessage("仅在应用前台、在线时发送位置，最多 1 小时。离开应用或断线会停止，可随时点“停止共享”。")
+                            .setNegativeButton("取消", null).setPositiveButton("开始共享", (a, b) -> requestLocation(peer, "live")).show();
+                    else requestLocation(peer, "pin");
+                }).show();
+    }
+
+    private void requestLocation(String peer, String action) {
+        if (!canSendLocation(peer)) return;
+        if (locationSharing.hasPermission()) { performLocation(peer, action); return; }
+        pendingLocationPeer = peer;
+        pendingLocationAction = action;
+        requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.ACCESS_FINE_LOCATION}, LOCATION_PERMISSION);
+    }
+
+    @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
+        super.onRequestPermissionsResult(code, permissions, grants);
+        if (code != LOCATION_PERMISSION) return;
+        String peer = pendingLocationPeer, action = pendingLocationAction;
+        pendingLocationPeer = pendingLocationAction = "";
+        if (peer.isEmpty()) return;
+        if (locationSharing.hasPermission() && canSendLocation(peer)) performLocation(peer, action);
+        else Toast.makeText(this, "未授予位置权限，无法发送位置；聊天和历史查找仍可使用", Toast.LENGTH_LONG).show();
+    }
+
+    private void performLocation(String peer, String action) {
+        if ("live".equals(action)) locationSharing.startLive(peer);
+        else locationSharing.requestPin(peer);
+    }
+
+    private void showHistorySearch() {
+        final String peer = detailPeer, scope = draftKey(peer);
+        LinearLayout fields = column();
+        fields.setPadding(dp(16), dp(8), dp(16), dp(8));
+        fields.addView(hint("仅查找本设备已解密缓存；日期按本机时区，包含首尾日期"));
+        EditText query = field("搜索消息正文", InputType.TYPE_CLASS_TEXT);
+        EditText from = field("开始日期 YYYY-MM-DD（可选）", InputType.TYPE_CLASS_TEXT);
+        EditText to = field("结束日期 YYYY-MM-DD（可选）", InputType.TYPE_CLASS_TEXT);
+        query.setSingleLine(true); from.setSingleLine(true); to.setSingleLine(true);
+        fields.addView(query); fields.addView(from); fields.addView(to);
+        TextView status = hint("输入关键词或日期，也可浏览全部本地记录");
+        fields.addView(status);
+        ScrollView resultScroll = scroll();
+        LinearLayout results = column();
+        resultScroll.addView(results);
+        fields.addView(resultScroll, new LinearLayout.LayoutParams(-1, dp(280)));
+        final List<JSONObject> records = new ArrayList<>(messageIndex.messages(peer));
+        final List<Integer> found = new ArrayList<>();
+        final int[] shown = {0};
+        Runnable[] display = new Runnable[1];
+        display[0] = () -> {
+            results.removeAllViews();
+            int limit = Math.min(found.size(), shown[0]);
+            for (int n = 0; n < limit; n++) {
+                int index = found.get(n);
+                JSONObject item = records.get(index);
+                results.addView(rowItem(item.optString("sender"),
+                        MessageTime.format(item.optString("createdAt")) + " · " + historyPreview(item), () -> {
+                            if (!scope.equals(draftKey(detailPeer))) return;
+                            if (historyDialog != null) historyDialog.dismiss();
+                            jumpToMessage(item);
+                        }));
+            }
+            if (limit < found.size()) results.addView(button("加载更多结果", 14, GREEN, v -> {
+                shown[0] += HistorySearch.PAGE_SIZE; display[0].run();
+            }));
+        };
+        Runnable[] pending = new Runnable[1];
+        Runnable search = () -> {
+            if (pending[0] != null) main.removeCallbacks(pending[0]);
+            long token = ++historySearchGeneration;
+            String q = query.getText().toString(), start = from.getText().toString(), end = to.getText().toString();
+            pending[0] = () -> {
+                try { uiPreparation.execute(() -> {
+                    List<Integer> matches;
+                    String failure = "";
+                    try { matches = HistorySearch.find(records, q, start, end, java.time.ZoneId.systemDefault()); }
+                    catch (IllegalArgumentException invalid) { matches = new ArrayList<>(); failure = invalid.getMessage(); }
+                    List<Integer> completed = matches; String error = failure;
+                    main.post(() -> {
+                        if (destroyed || token != historySearchGeneration || historyDialog == null || !historyDialog.isShowing()
+                                || !scope.equals(draftKey(detailPeer))) return;
+                        found.clear(); found.addAll(completed); shown[0] = HistorySearch.PAGE_SIZE;
+                        status.setText(error.isEmpty() ? "找到 " + found.size() + " 条本地记录" : error);
+                        display[0].run(); resultScroll.scrollTo(0, 0);
+                    });
+                }); } catch (RejectedExecutionException ignored) { }
+            };
+            main.postDelayed(pending[0], 180);
+        };
+        TextWatcher watcher = new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            public void onTextChanged(CharSequence s, int start, int before, int count) { search.run(); }
+            public void afterTextChanged(Editable s) { }
+        };
+        query.addTextChangedListener(watcher); from.addTextChangedListener(watcher); to.addTextChangedListener(watcher);
+        historyDialog = new AlertDialog.Builder(this).setTitle("查找聊天记录 · " + peer)
+                .setView(fields).setNegativeButton("关闭", null).create();
+        historyDialog.setOnDismissListener(d -> { historySearchGeneration++; });
+        showInputDialog(historyDialog);
+        search.run();
+    }
+
+    private String historyPreview(JSONObject item) { return HistorySearch.preview(item); }
+
+    private void jumpToMessage(JSONObject target) {
+        List<JSONObject> history = messageIndex.messages(detailPeer);
+        int index = -1;
+        for (int i = 0; i < history.size(); i++) {
+            JSONObject item = history.get(i);
+            if (item.toString().equals(target.toString()) || (!target.optString("clientId").isEmpty()
+                    && target.optString("clientId").equals(item.optString("clientId"))
+                    && target.optString("sender").equals(item.optString("sender")))) { index = i; break; }
+        }
+        if (index < 0 || conversationScroll == null) return;
+        revealedHistoryIndex = index;
+        historyLimit = Math.max(historyLimit, history.size() - index);
+        updateConversationStream(false);
+        final String key = messageViewKey(index, history.get(index));
+        conversationAtBottom = false;
+        conversationScroll.post(() -> {
+            View view = messageViews.get(key);
+            if (view != null) {
+                conversationScroll.scrollTo(0, Math.max(0, view.getTop() - dp(20)));
+                view.setBackgroundColor(Color.rgb(255, 243, 190));
+                main.postDelayed(() -> view.setBackgroundColor(Color.TRANSPARENT), 1800);
+            }
         });
     }
 
@@ -462,18 +888,19 @@ public final class MainActivity extends Activity implements ChatController.Liste
                 loginUser = "";
                 draft = "";
                 page = "messages";
+                if (locationSharing != null) locationSharing.stopLive();
                 controller.logout();
             }), new LinearLayout.LayoutParams(-1, dp(48)));
         }
         body.addView(space(24));
         body.addView(section("使用说明"));
         addGuideItem(body, "开始使用", "首次打开先添加服务器地址，再注册账号或输入密码登录。可在这里保存、切换多个服务器；切换后需登录该服务器的账号。");
-        addGuideItem(body, "密码与本机密钥", "密码用于登录。此账号的加密聊天身份绑定当前安装；私钥和已解密的聊天记录保存在应用本地数据中。卸载应用或清除应用数据会删除本地私钥和记录，原账号之后无法继续用于加密聊天。密码和服务器都无法找回私钥或已解密的历史；目前不支持账号找回或换设备迁移。");
+        addGuideItem(body, "密码、本机密钥与重新登录", "密码用于登录。私钥和已解密的历史保存在本机，卸载或清除应用数据后无法恢复。只要服务器账号尚未被清理，仍可凭原用户名和密码登录；本机密钥丢失或换设备时会重建加密身份，旧设备会退出。联系人会收到身份更新提示，重新核对并确认安全码后才能继续发送；新身份无法解密旧身份的历史密文。");
         addGuideItem(body, "服务器保存的内容", "服务器仍保存用户名、密码验证信息、公钥和密文消息，直到相应数据按保留规则被清理。服务器不保存本机私钥，也无法解密聊天记录。");
         addGuideItem(body, "开始聊天", "在“消息”页点＋输入对方用户名。首次只能先发一条消息，等对方在“联系人”页同意后才能继续聊天。");
         addGuideItem(body, "联系人与会话", "删除联系人会撤销双方聊天许可，原聊天记录仍保留；再次发消息需要重新同意。“清除”只把会话从列表隐藏，新消息到来或重新打开时会显示。");
         addGuideItem(body, "在线、接收与离线", "显示“在线”表示已连上服务器。消息标为“对方客户端已接收”表示收到接收确认，不代表对方已阅读。离线时会自动尝试重连；重新连上后领取离线消息。");
-        addGuideItem(body, "核对安全码", "打开聊天中的“安全码”，通过其他可信渠道与对方逐位核对；一致后再确认身份。");
+        addGuideItem(body, "核对安全码", "打开聊天中的“安全码”，通过其他可信渠道与对方逐位核对；一致后再确认身份。对方重建身份后旧确认失效，需要重新核对；确认前会暂停向对方发送消息。");
         addGuideItem(body, "7 天未连接清理", "连续 7 天没有成功认证并连上服务器，服务器会删除该账号、服务器保存的公钥和密文消息。登录后显示“在线”才算成功连接；仅打开应用但连接失败不算。本机历史和私钥可能仍在，但无法从服务器恢复已删除的数据。");
         content.addView(scroll);
     }
@@ -513,8 +940,11 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private void openPeer(String peer) { openPeer(peer, false); }
 
     private void openPeer(String peer, boolean reopen) {
+        saveDraft();
         detailPeer = peer;
-        draft = "";
+        draft = drafts.getOrDefault(draftKey(peer), "");
+        historyLimit = HISTORY_PAGE;
+        revealedHistoryIndex = -1;
         conversationAtBottom = true;
         conversationScrollY = 0;
         render();
@@ -524,7 +954,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private void promptPeer() {
         EditText name = field("联系人用户名", InputType.TYPE_CLASS_TEXT);
         name.setSingleLine(true);
-        new AlertDialog.Builder(this).setTitle("打开会话").setView(dialogWrap(name))
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("打开会话").setView(scrollDialog(dialogWrap(name)))
                 .setNegativeButton("取消", null).setPositiveButton("打开", (d, w) -> {
                     String peer = name.getText().toString().trim();
                     if (!Usernames.valid(peer) || peer.equals(state.optString("username"))) {
@@ -532,7 +962,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
                         return;
                     }
                     openPeer(peer, true);
-                }).show();
+                }).create();
+        showInputDialog(dialog);
     }
 
     private void promptServer() {
@@ -544,15 +975,17 @@ public final class MainActivity extends Activity implements ChatController.Liste
         test.setChecked(lanTest);
         LinearLayout fields = dialogWrap(address);
         fields.addView(test);
-        new AlertDialog.Builder(this).setTitle("添加服务器").setView(fields)
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("添加服务器").setView(scrollDialog(fields))
                 .setNegativeButton("取消", null).setPositiveButton("保存并选择", (d, w) -> {
                     String value = address.getText().toString().trim();
                     if (value.isEmpty()) { showError("请输入服务器地址"); return; }
                     lanTest = test.isChecked();
                     loginUser = "";
                     page = "messages";
+                    if (locationSharing != null) locationSharing.stopLive();
                     controller.setServer(value, lanTest);
-                }).show();
+                }).create();
+        showInputDialog(dialog);
     }
 
     private void switchServer(String address) {
@@ -560,6 +993,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         loginUser = "";
         draft = "";
         page = "messages";
+        if (locationSharing != null) locationSharing.stopLive();
         controller.setServer(address, lanTest);
     }
 
@@ -582,26 +1016,6 @@ public final class MainActivity extends Activity implements ChatController.Liste
         return new JSONArray();
     }
 
-    private List<String> contactNames() {
-        List<String> result = new ArrayList<>();
-        JSONArray names = state.optJSONArray("contacts");
-        if (names != null) for (int i = 0; i < names.length(); i++) {
-            String name = names.optString(i);
-            if (!name.isEmpty() && !result.contains(name)) result.add(name);
-        }
-        return result;
-    }
-
-    private List<String> conversationNames() {
-        List<String> result = new ArrayList<>();
-        JSONArray names = state.optJSONArray("conversations");
-        if (names != null) for (int i = 0; i < names.length(); i++) {
-            String name = names.optString(i);
-            if (!name.isEmpty() && !result.contains(name)) result.add(name);
-        }
-        return result;
-    }
-
     private String relation(String peer) {
         JSONObject relations = state.optJSONObject("relationships");
         JSONObject item = relations == null ? null : relations.optJSONObject(peer);
@@ -615,6 +1029,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private String peerStatus(String peer) {
         if (isDeleted(peer)) return "该用户已销户";
+        if (identityChanged(peer)) return "身份已更新 · 待核对安全码";
         JSONObject relations = state.optJSONObject("relationships");
         JSONObject item = relations == null ? null : relations.optJSONObject(peer);
         if (item == null) return "在线状态未知";
@@ -623,6 +1038,11 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (status.equals("pending_incoming")) return presence + " · 待你同意";
         if (status.equals("pending_outgoing")) return presence + " · 等待同意";
         return presence;
+    }
+
+    private boolean identityChanged(String peer) {
+        JSONObject changes = state.optJSONObject("identityChanges");
+        return changes != null && changes.has(peer);
     }
 
     private boolean matches(String name, String query) {
@@ -639,9 +1059,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
         params.setMargins(dp(16), dp(12), dp(16), dp(10));
         body.addView(search, params);
         search.addTextChangedListener(new TextWatcher() {
+            private Runnable pending;
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                listener.onQuery(s.toString());
+                if (pending != null) main.removeCallbacks(pending);
+                String query = s.toString();
+                pending = () -> {
+                    if (search.isAttachedToWindow()) listener.onQuery(query);
+                };
+                main.postDelayed(pending, 120);
             }
             @Override public void afterTextChanged(Editable s) { }
         });
@@ -661,38 +1087,88 @@ public final class MainActivity extends Activity implements ChatController.Liste
                 .setPositiveButton("清除", (d, w) -> controller.clearConversation(peer)).show();
     }
 
-    private Map<String, JSONObject> latestMessages() {
-        Map<String, JSONObject> result = new HashMap<>();
-        JSONArray messages = state.optJSONArray("messages");
-        String own = state.optString("username");
-        if (messages != null) for (int i = 0; i < messages.length(); i++) {
-            JSONObject item = messages.optJSONObject(i);
-            if (item == null) continue;
-            String peer = own.equals(item.optString("sender")) ? item.optString("recipient") : item.optString("sender");
-            if (!peer.isEmpty()) result.put(peer, item);
-        }
-        return result;
+    @Override public void onState(JSONObject snapshot, String error) {
+        final long generation = ++snapshotGeneration;
+        JSONObject next = snapshot == null ? new JSONObject() : snapshot;
+        try {
+            uiPreparation.execute(() -> {
+                if (destroyed || generation != snapshotGeneration) return;
+                MessageIndex prepared = MessageIndex.build(next, messageIndex);
+                main.post(() -> {
+                    if (!destroyed && generation == snapshotGeneration) acceptState(next, error, prepared);
+                });
+            });
+        } catch (RejectedExecutionException ignored) { /* Activity is closing. */ }
     }
 
-    private String time(JSONObject item) { return item == null ? "" : item.optString("createdAt"); }
+    private String headerKey() {
+        return screenKey() + ':' + state.optBoolean("online") + ':' + state.optString("uiError") + ':' + peerStatus(detailPeer) + ':' + state.optJSONObject("locationSharing");
+    }
 
-    @Override public void onState(JSONObject snapshot, String error) {
+    private String bodyKey() {
+        if (!detailPeer.isEmpty()) return relation(detailPeer) + ':' + isDeleted(detailPeer) + ':' + identityChanged(detailPeer);
+        if (page.equals("contacts") && signedIn()) return messageIndex.contactRows;
+        if (page.equals("messages") && signedIn()) return messageIndex.messageRows;
+        if (page.equals("settings")) return state.optString("status") + ':' + state.optJSONArray("servers");
+        // Background connection notices must not recreate username/password fields.
+        return String.valueOf(state.optJSONArray("servers"));
+    }
+
+    private void acceptState(JSONObject snapshot, String error, MessageIndex prepared) {
         boolean wasSigned = signedIn();
+        boolean wasOnline = state.optBoolean("online");
+        String previousUsername = state.optString("username");
         String previousServer = server();
+        String oldScreen = screenKey();
+        String oldHeader = headerKey();
+        String oldBody = bodyKey();
+        String oldHistory = detailPeer.isEmpty() ? "" : visibleHistoryKey();
+        int oldHistorySize = messageIndex.messages(detailPeer).size();
+        boolean readingHistory = conversationScroll != null && conversationStream != null
+                && conversationScroll.getScrollY() + conversationScroll.getHeight() < conversationStream.getHeight() - dp(48);
+        JSONObject oldChanges = state.optJSONObject("identityChanges");
+        String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
+        messageIndex = prepared;
+        if (readingHistory) historyLimit += Math.max(0, messageIndex.messages(detailPeer).size() - oldHistorySize);
         if (error != null && !error.isEmpty()) try { state.put("uiError", error); } catch (Exception ignored) { }
-        if ((!wasSigned && signedIn()) || !previousServer.equals(server()) || wasSigned && !signedIn()) {
+        if ((!wasSigned && signedIn()) || !previousServer.equals(server()) || wasSigned && !signedIn()
+                || !previousUsername.equals(state.optString("username"))) {
+            if (locationSharing != null) locationSharing.stopLive();
+            pendingLocationPeer = pendingLocationAction = "";
+            historySearchGeneration++;
+            if (historyDialog != null) { historyDialog.dismiss(); historyDialog = null; }
             loginUser = "";
             detailPeer = "";
             draft = "";
+            historyLimit = HISTORY_PAGE;
+            revealedHistoryIndex = -1;
             page = "messages";
         }
-        if (safetyDialog != null && isDeleted(safetyPeer)) {
+        if (locationSharing != null && wasOnline && !state.optBoolean("online")) locationSharing.stopLive();
+        JSONObject newChanges = state.optJSONObject("identityChanges");
+        String newSafetyChange = newChanges == null ? "" : String.valueOf(newChanges.opt(safetyPeer));
+        if (safetyDialog != null && (isDeleted(safetyPeer) || !oldSafetyChange.equals(newSafetyChange)
+                || !previousUsername.equals(state.optString("username")) || !previousServer.equals(server()))) {
             safetyDialog.dismiss();
             safetyDialog = null;
             safetyPeer = "";
         }
-        render();
+        if (!oldScreen.equals(screenKey()) || !oldBody.equals(bodyKey()) &&
+                (messageResults == null && contactResults == null || !detailPeer.isEmpty())) {
+            render();
+            return;
+        }
+        if (!oldHeader.equals(headerKey())) {
+            header.removeAllViews();
+            renderHeader(signedIn());
+        }
+        if (!oldBody.equals(bodyKey())) {
+            if (messageResults != null) populateMessages(messageResults);
+            if (contactResults != null) populateContacts(contactResults);
+        }
+        if (conversationStream != null && !oldHistory.equals(visibleHistoryKey())) updateConversationStream(true);
+        if (conversationStatus != null) conversationStatus.setText(state.optString("status"));
     }
 
     private AlertDialog safetyDialog;
@@ -717,15 +1193,19 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     @Override public void onSent() {
         draft = "";
+        drafts.remove(composerDraftKey);
         if (composer != null) composer.setText("");
     }
 
     private void saveDraft() {
         if (composer != null) {
             draft = composer.getText().toString();
+            if (!composerDraftKey.isEmpty()) drafts.put(composerDraftKey, draft);
             composer = null;
         }
     }
+
+    private String draftKey(String peer) { return server() + '\0' + state.optString("username") + '\0' + peer; }
 
     private void showError(String message) {
         try { state.put("uiError", message); } catch (Exception ignored) { }
@@ -742,6 +1222,18 @@ public final class MainActivity extends Activity implements ChatController.Liste
         box.setPadding(dp(22), dp(8), dp(22), 0);
         box.addView(child);
         return box;
+    }
+
+    private ScrollView scrollDialog(View fields) {
+        ScrollView scroll = scroll();
+        scroll.addView(fields);
+        return scroll;
+    }
+
+    private void showInputDialog(AlertDialog dialog) {
+        dialog.show();
+        if (dialog.getWindow() != null)
+            dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
     }
 
     private LinearLayout column() {
@@ -814,6 +1306,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private EditText field(String hint, int type) {
         EditText field = new EditText(this);
         field.setHint(hint);
+        field.setTag(hint);
         field.setTextSize(16);
         field.setTextColor(INK);
         field.setHintTextColor(MUTED);
@@ -834,7 +1327,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         LinearLayout line = row();
         line.setPadding(dp(18), dp(12), dp(16), dp(12));
         line.setBackgroundColor(Color.WHITE);
-        TextView avatar = text(title.isEmpty() ? "?" : title.substring(0, 1).toUpperCase(), 18, true, Color.WHITE);
+        TextView avatar = text(title.isEmpty() ? "?" : title.substring(0, 1).toUpperCase(java.util.Locale.ROOT), 18, true, Color.WHITE);
         avatar.setGravity(Gravity.CENTER);
         avatar.setBackground(rounded(Color.rgb(102, 175, 143), 10, Color.rgb(102, 175, 143)));
         line.addView(avatar, new LinearLayout.LayoutParams(dp(42), dp(42)));

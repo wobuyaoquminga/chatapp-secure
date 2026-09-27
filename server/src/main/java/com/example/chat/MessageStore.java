@@ -22,7 +22,8 @@ public class MessageStore {
     public record SaveResult(Message message, boolean newContact) {}
     public record Contact(String username, String status, boolean online) {}
     public record DeletedAccount(String accountId, List<String> peers) {}
-    public record AccountDeletionEvent(String id, String username, String accountId, String identityKey, String deletedAt) {}
+    public record AccountDeletionEvent(String id, String username, String accountId, String identityKey, String deletedAt,
+                                       String kind, String newAccountId, String newIdentityKey) {}
     private record EventRecipient(String username, String accountId) {}
     private Message map(ResultSet r, int row) throws SQLException {
         return new Message(r.getString("id"), r.getString("client_id"), r.getString("sender"),
@@ -49,8 +50,9 @@ public class MessageStore {
         String identityKey = identities.isEmpty() ? "" : identities.get(0);
         var recipients = db.query("SELECT username,account_id FROM app_users WHERE username<>? AND username IN ("
             + "SELECT CASE WHEN user_a=? THEN user_b ELSE user_a END FROM contacts WHERE user_a=? OR user_b=? "
-            + "UNION SELECT CASE WHEN sender=? THEN recipient ELSE sender END FROM messages WHERE sender=? OR recipient=?) ORDER BY username",
-            (r, i) -> new EventRecipient(r.getString("username"), r.getString("account_id")), user, user, user, user, user, user, user);
+            + "UNION SELECT CASE WHEN sender=? THEN recipient ELSE sender END FROM messages WHERE sender=? OR recipient=? "
+            + "UNION SELECT CASE WHEN user_a=? THEN user_b ELSE user_a END FROM history_peers WHERE user_a=? OR user_b=?) ORDER BY username",
+            (r, i) -> new EventRecipient(r.getString("username"), r.getString("account_id")), user, user, user, user, user, user, user, user, user, user);
         OffsetDateTime deletedAt = OffsetDateTime.now(ZoneOffset.UTC);
         for (var peer : recipients) {
             db.update("INSERT INTO account_deletion_events(id,recipient,recipient_account_id,username,account_id,identity_key,deleted_at) "
@@ -64,11 +66,39 @@ public class MessageStore {
         db.update("DELETE FROM app_users WHERE username=?", user);
         return Optional.of(new DeletedAccount(accountId, recipients.stream().map(EventRecipient::username).toList()));
     }
+    // Called within the reset transaction after the user row has been locked and verified.
+    public List<String> resetIdentity(String user, String oldAccountId, String oldIdentity,
+                                      String newAccountId, String newIdentity) {
+        var recipients = db.query("SELECT username,account_id FROM app_users WHERE username<>? AND username IN ("
+            + "SELECT CASE WHEN user_a=? THEN user_b ELSE user_a END FROM contacts WHERE user_a=? OR user_b=? "
+            + "UNION SELECT CASE WHEN sender=? THEN recipient ELSE sender END FROM messages WHERE sender=? OR recipient=? "
+            + "UNION SELECT CASE WHEN user_a=? THEN user_b ELSE user_a END FROM history_peers WHERE user_a=? OR user_b=?) ORDER BY username",
+            (r, i) -> new EventRecipient(r.getString("username"), r.getString("account_id")),
+            user, user, user, user, user, user, user, user, user, user);
+        OffsetDateTime changedAt = OffsetDateTime.now(ZoneOffset.UTC);
+        for (var peer : recipients) {
+            db.update("INSERT INTO account_deletion_events(id,recipient,recipient_account_id,username,account_id,identity_key,deleted_at,kind,new_account_id,new_identity_key) "
+                + "SELECT ?,username,account_id,?,?,?,?,'identity_reset',?,? FROM app_users WHERE username=? AND account_id=?",
+                UUID.randomUUID().toString(), user, oldAccountId, oldIdentity, changedAt,
+                newAccountId, newIdentity, peer.username(), peer.accountId());
+        }
+        // Ciphertexts and delivery receipts belong to the lost device generation.
+        db.update("DELETE FROM messages WHERE sender=? OR recipient=?", user, user);
+        // Password-verified recovery preserves pending peer identity proofs for this logical account.
+        db.update("UPDATE account_deletion_events SET recipient_account_id=? WHERE recipient=? AND recipient_account_id=?",
+            newAccountId, user, oldAccountId);
+        db.update("UPDATE app_users SET account_id=? WHERE username=? AND account_id=?", newAccountId, user, oldAccountId);
+        return recipients.stream().map(EventRecipient::username).toList();
+    }
+    public boolean currentGeneration(String user, String accountId) {
+        return db.queryForList("SELECT account_id FROM app_users WHERE username=?", String.class, user).contains(accountId);
+    }
     public List<AccountDeletionEvent> accountEvents(String user, String accountId) {
         return db.query("SELECT e.* FROM account_deletion_events e JOIN app_users u ON u.username=e.recipient AND u.account_id=e.recipient_account_id "
             + "WHERE e.recipient=? AND e.recipient_account_id=? ORDER BY e.deleted_at,e.id",
             (r, i) -> new AccountDeletionEvent(r.getString("id"), r.getString("username"), r.getString("account_id"),
-                r.getString("identity_key"), r.getObject("deleted_at", OffsetDateTime.class).toString()), user, accountId);
+                r.getString("identity_key"), r.getObject("deleted_at", OffsetDateTime.class).toString(),
+                r.getString("kind"), r.getString("new_account_id"), r.getString("new_identity_key")), user, accountId);
     }
     @Transactional
     public void acknowledgeAccountEvents(String user, String accountId, List<String> ids) {
@@ -87,7 +117,19 @@ public class MessageStore {
     }
     @Transactional
     public SaveResult save(String sender, String recipient, String clientId, String ciphertext) {
+        return save(sender, recipient, clientId, ciphertext, null, null);
+    }
+    @Transactional
+    public SaveResult save(String sender, String recipient, String clientId, String ciphertext, String senderAccountId) {
+        return save(sender, recipient, clientId, ciphertext, senderAccountId, null);
+    }
+    @Transactional
+    public SaveResult save(String sender, String recipient, String clientId, String ciphertext, String senderAccountId, String recipientAccountId) {
         if (!lockPair(sender, recipient)) throw new IllegalArgumentException("用户不存在，请重新登录");
+        if (senderAccountId != null && !currentGeneration(sender, senderAccountId))
+            throw new IllegalArgumentException("设备身份已更新，请重新登录");
+        if (recipientAccountId != null && !currentGeneration(recipient, recipientAccountId))
+            throw new IllegalArgumentException("对方设备身份已更新，请重新核对后发送");
         var existing = db.query("SELECT * FROM messages WHERE sender=? AND client_id=?", this::map, sender, clientId);
         if (!existing.isEmpty()) {
             Message old = existing.get(0);
@@ -100,6 +142,8 @@ public class MessageStore {
         boolean newContact = relations.isEmpty();
         if (newContact) db.update("INSERT INTO contacts(user_a,user_b,initiator) VALUES (?,?,?)", pair[0], pair[1], sender);
         else if (!relations.get(0)) throw new IllegalArgumentException("等待对方接受聊天请求");
+        if (db.queryForList("SELECT user_a FROM history_peers WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)", String.class, pair[0], pair[1], pair[1], pair[0]).isEmpty())
+            db.update("INSERT INTO history_peers(user_a,user_b) VALUES (?,?)", pair[0], pair[1]);
         db.update("INSERT INTO messages(client_id,sender,recipient,ciphertext,created_at) VALUES (?,?,?,?,?)",
             clientId, sender, recipient, ciphertext, OffsetDateTime.now(ZoneOffset.UTC));
         return new SaveResult(db.query("SELECT * FROM messages WHERE sender=? AND client_id=?", this::map, sender, clientId).get(0), newContact);
@@ -141,8 +185,14 @@ public class MessageStore {
     }
     @Transactional
     public Message acknowledge(String user, long id) {
+        return acknowledge(user, id, null);
+    }
+    @Transactional
+    public Message acknowledge(String user, long id, String accountId) {
         if (db.queryForList("SELECT username FROM app_users WHERE username=? FOR UPDATE", String.class, user).isEmpty())
             throw new IllegalArgumentException("用户不存在，请重新登录");
+        if (accountId != null && !currentGeneration(user, accountId))
+            throw new IllegalArgumentException("设备身份已更新，请重新登录");
         var found = db.query("SELECT * FROM messages WHERE id=? AND recipient=?", this::map, id, user);
         if (found.isEmpty()) throw new IllegalArgumentException("消息不存在或无权确认");
         db.update("UPDATE messages SET acknowledged=TRUE WHERE id=? AND recipient=?", id, user);

@@ -141,6 +141,28 @@ public class SignalInteropTest {
         assertEquals("after Java restart", bob.decrypt(delivery(next, ALICE, BOB)).getString("body"));
     }
 
+    @Test public void encryptedLocationLiveAndStopCrossJavaNode() throws Exception {
+        SignalEngine alice = SignalEngine.create(ALICE);
+        NodePeer bob = new NodePeer(BOB);
+        alice.establish(BOB,selectedBundle(BOB,bob.publicBundle(2)));
+        long now = System.currentTimeMillis();
+        String session = java.util.UUID.randomUUID().toString();
+        String live = LocationPayload.encode("live",session,0,31.2,121.5,50,now,now+3600000);
+        JSONObject first = alice.encrypt(BOB,live);
+        assertFalse(first.getString("ciphertext").contains("31.2"));
+        assertFalse(first.getString("ciphertext").contains(LocationPayload.PREFIX));
+        String received = bob.decrypt(delivery(first,ALICE,BOB)).getString("body");
+        assertEquals(live,received);
+        assertEquals("live",LocationPayload.parse(received,now).kind);
+        String stop = LocationPayload.encode("stop",session,1,0,0,0,now,now);
+        JSONObject reply = bob.encrypt(ALICE,stop);
+        SignalEngine restored = new SignalEngine(new JSONObject(alice.state().toString()));
+        String decrypted = restored.decrypt(delivery(reply,BOB,ALICE)).getString("body");
+        assertEquals(stop,decrypted);
+        assertEquals("stop",LocationPayload.parse(decrypted,now).kind);
+        assertEquals(session,LocationPayload.parse(decrypted,now).sessionId);
+    }
+
     @Test public void chineseUsernamesExchangeKeysMessagesAndSafetyCodes() throws Exception {
         String aliceName = "小明", bobName = "测试_bob";
         assertTrue(Usernames.valid(aliceName));

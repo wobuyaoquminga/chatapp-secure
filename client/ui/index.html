@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; base-uri 'none'; form-action 'none'">
   <title>Chat</title>
-  <link rel="stylesheet" href="style.css"><script defer src="app.js"></script>
+  <link rel="stylesheet" href="style.css"><script defer src="features.js"></script><script defer src="app.js"></script>
 </head>
 <body>
 <main>
@@ -26,7 +26,7 @@
       <h2 id="registrationNoticeTitle">注册前请务必了解</h2>
       <ul>
         <li><strong>账号和密码不可修改。</strong>目前不支持修改用户名或密码，请妥善保管。</li>
-        <li><strong>本机数据清理后无法恢复。</strong>账号的加密身份与本机应用数据绑定；清除 Chat 应用数据或本机用户资料后，本机账号、私钥和聊天记录将丢失。密码和服务器无法找回私钥，请勿清理应用数据。</li>
+        <li><strong>本机数据清理后无法恢复。</strong>清除应用数据后，私钥和本地聊天记录将丢失，无法恢复历史。账号仍可凭用户名和密码重新登录，系统重建设备身份，旧设备退出；联系人需要重新核对安全码。</li>
         <li><strong>请至少每周连接一次。</strong>连续 7 天未成功认证并连接服务器，账号及服务器保存的相关数据会被清理。登录后请确认显示“在线”；仅打开软件但连接失败不算成功连接。</li>
         <li><strong>首次聊天需要对方同意。</strong>接受前只能发送一条消息，接受后才能继续聊天。</li>
       </ul>
@@ -45,9 +45,12 @@
     <div class="conversation">
       <div id="emptyConversation" class="emptyConversation"><div class="emptySymbol">✦</div><h2>选择一位联系人</h2><p>开始一段端到端加密对话</p></div>
       <div id="conversationContent" class="conversationContent" hidden>
-        <div class="conversationHeader"><div><h2 id="conversationName"></h2><span id="conversationStatus"></span><span id="verification">尚未核对安全码</span></div><div class="headerActions"><button id="acceptContact" type="button" class="secondary" hidden>接受聊天</button><button id="clearConversation" type="button" class="textButton">清除会话</button><button id="removeContact" type="button" class="textButton" hidden>删除联系人</button><button id="history" type="button" class="textButton">同步回执</button><button id="safety" type="button" class="textButton">核对安全码</button></div></div>
+        <div class="conversationHeader"><div><h2 id="conversationName"></h2><span id="conversationStatus"></span><span id="verification">尚未核对安全码</span></div><div class="headerActions"><button id="acceptContact" type="button" class="secondary" hidden>接受聊天</button><button id="clearConversation" type="button" class="textButton">清除会话</button><button id="removeContact" type="button" class="textButton" hidden>删除联系人</button><button id="history" type="button" class="textButton">同步回执</button><button id="safety" type="button" class="textButton">核对安全码</button><div class="moreWrap"><button id="more" type="button" class="iconButton" aria-label="聊天菜单" aria-expanded="false">···</button><div id="moreMenu" class="moreMenu" hidden><button id="locationMenu" type="button">位置</button><button id="findHistory" type="button">查找聊天记录</button></div></div></div></div>
         <div id="safetyPanel" hidden><p>请通过见面或已信任的通话渠道比较双方的完整数字：</p><code id="safetyCode"></code><button id="confirmSafety" type="button" class="secondary">已通过可信渠道核对一致</button></div>
+        <section id="locationPanel" class="featurePanel" hidden><div class="panelHeading"><strong>位置</strong><button id="closeLocation" type="button" class="textButton">关闭</button></div><p>系统定位可能为近似位置；Windows 设备可能没有可用定位服务。坐标只在点击发送后端到端加密发送。</p><div class="actions"><button id="sendPosition" type="button">发送当前位置</button><button id="startLive" type="button" class="secondary">共享实时位置（1 小时）</button><button id="stopLive" type="button" class="secondary" hidden>停止共享</button></div><p id="locationStatus" role="status"></p><details><summary>定位不可用？手动输入坐标发送</summary><p>手动坐标是你选择的固定位置，不代表设备当前位置，不能用于实时共享。</p><form id="manualPosition"><label>纬度<input id="latitude" type="number" min="-90" max="90" step="any" required></label><label>经度<input id="longitude" type="number" min="-180" max="180" step="any" required></label><button type="submit">发送选定坐标</button></form></details></section>
+        <section id="searchPanel" class="featurePanel" hidden><div class="panelHeading"><strong>查找聊天记录</strong><button id="closeSearch" type="button" class="textButton">关闭</button></div><div class="historyFilters"><input id="historyQuery" type="search" placeholder="搜索当前聊天正文"><label>开始日期<input id="historyFrom" type="date"></label><label>结束日期<input id="historyTo" type="date"></label></div><p id="historyCount"></p><ul id="historyResults"></ul><div class="actions"><button id="historyPrev" type="button" class="secondary">上一页</button><button id="historyNext" type="button" class="secondary">下一页</button></div><p class="fineprint">仅搜索当前账号本机已保存的历史；同步回执不会恢复丢失的正文。</p></section>
         <div id="messages" role="log" aria-live="polite"></div>
+        <button id="olderMessages" type="button" class="textButton" hidden>查看更早消息</button>
         <form id="sendForm" class="composer"><label for="body" class="srOnly">消息</label><textarea id="body" maxlength="4000" rows="2" required placeholder="发送消息…"></textarea><button id="send" type="submit">发送</button></form>
         <p class="deliveryNote">“服务器已保存密文”不等于送达；“对方客户端已接收”不代表已读。</p>
       </div>
@@ -65,10 +68,11 @@
         <li>首次使用先填写服务器地址；之后可在这里添加、切换多台服务器。每台服务器的账号和联系人分别显示。</li>
         <li>在所选服务器上注册账号并设置密码，以后用该账号和密码登录。请妥善保管密码。</li>
         <li>私钥和解密后的聊天记录保存在当前 Windows 用户的应用数据中（默认位于 %APPDATA%\Chat\default），由 Windows 安全存储加密保护。账号的加密聊天身份与这份本机私钥绑定，请在原 Windows 用户下使用。</li>
-        <li>只删除 Chat.exe 或下载的 ZIP 文件，不一定会删除上述本机数据；删除本机用户资料或应用数据、重装系统，或改用另一 Windows 用户后，若原私钥已丢失或无法读取，现有账号便无法继续用于加密聊天。密码和服务器都无法恢复私钥或旧聊天记录。</li>
+        <li>只删除 Chat.exe 或下载的 ZIP 文件，不一定会删除上述本机数据；删除本机用户资料或应用数据、重装系统，或改用另一 Windows 用户后，若原私钥已丢失或无法读取，可以凭用户名和密码重新登录并重建设备身份，但旧私钥和聊天记录无法恢复。旧设备退出登录，联系人需重新核对安全码。</li>
         <li>首次向某人发起聊天时，只能先发一条消息；等对方接受后，才能继续发送。</li>
         <li>删除联系人会撤销对方继续向你发消息的权限，已有聊天记录仍保留；“清除会话”只把它从会话列表隐藏。</li>
         <li>“在线”表示你已成功连上服务器。对方不在线时，服务器暂存加密消息，等对方连接后再送达。“服务器已保存密文”不代表对方收到；“对方客户端已接收”也不代表已读。</li>
+        <li>聊天右上角“···”可发送位置或查找本机聊天记录；实时位置最多共享一小时，应用离开前台、断线或退出时停止。定位失败可手动发送固定坐标。</li>
         <li>聊天前可通过见面或可信通话，和对方比较完整的安全码；一致后点击“已通过可信渠道核对一致”。</li>
         <li>账号连续 7 天未成功连接服务器，服务器会删除该账号及服务器上的密钥、加密消息，无法从服务器恢复。打开应用或输入密码但连接失败不算成功；请至少每周登录，并确认客户端显示“在线”。本机历史记录可能仍在。</li>
       </ul>

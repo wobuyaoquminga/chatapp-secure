@@ -2,13 +2,14 @@ const path=require('node:path');
 const WebSocket=require('ws');
 const {SignalEngine}=require('./signal.cjs');
 const {Vault,AccountRegistry}=require('./vault.cjs');
-const validUser=user=>typeof user==='string'&&/^[a-z0-9_\p{Script=Han}]{2,32}$/u.test(user)&&(/\p{Script=Han}/u.test(user)||user.length>=3);
+const Location=require('./ui/features.js');
+const validUser=user=>typeof user==='string'&&/^[a-z0-9_\p{Script=Han}]{2,32}$/u.test(user);
 
 class Controller {
   constructor(directory,safeStorage,notify) {
     this.vaults=path.join(directory,'vaults');this.safeStorage=safeStorage;this.notify=notify;
     this.registry=new AccountRegistry(directory,safeStorage);this.queue=Promise.resolve();this.generation=0;
-    this.status='未登录';this.online=false;this.contactState={};
+    this.status='未登录';this.online=false;this.contactState={};this.liveSessions=new Map();
   }
   serial(task) { const run=this.queue.then(task);this.queue=run.catch(()=>{});return run; }
   // A corrupt index must never keep the user away from keys that are still intact in its vault.
@@ -33,6 +34,7 @@ class Controller {
       contactStates:Object.values(this.contactState),
       verifiedPeers:this.engine?Object.keys(this.engine.state.verified):[],
       deletedPeers:this.engine?.state.deletedPeers||{},
+      identityChanges:this.engine?.state.identityChanges||{},
       messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>m) : []};
   }
   update(error) { this.notify({...this.snapshot(),error:error||this.listError||''}); }
@@ -58,15 +60,16 @@ class Controller {
     const url=new URL(server);
     if (!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash) throw new Error('请输入服务器根地址，例如 https://chat.example.com');
     if(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)) throw new Error('远程服务器必须使用 HTTPS，HTTP 仅允许本机测试');
-    if(!validUser(username)) throw new Error('用户名限 2–32 位中文、小写字母、数字、下划线；纯英文等至少 3 位');
+    if(!validUser(username)) throw new Error('用户名限 2–32 位中文、小写字母、数字、下划线');
     this.server=url.origin;
     const auth=await this.request('/api/auth/'+(register?'register':'login'),'POST',{username,password});
     this.token=auth.token;this.user=username;
     try {
       this.vault=new Vault(this.vaults,this.server,username,this.safeStorage);
       const saved=this.vault.read();this.engine=saved ? new SignalEngine(saved) : await SignalEngine.create(username);
-      const own=await this.request('/api/keys/me'),publicInfo=await this.engine.publicBundle();
-      if(own.identityKey && own.identityKey!==publicInfo.identityKey) throw new Error('账号已绑定另一份本地密钥。本版单设备，无法仅用密码恢复，请使用原客户端');
+      let own=await this.request('/api/keys/me');
+      await this.recoverIdentity(own,password);
+      own=await this.request('/api/keys/me');
       this.vault.write(this.engine.state);
       // Keys for this account are now confirmed to live on this device, so it is safe to remember it.
       try{this.registry.remember(this.server,username);}catch(e){this.listError='账号列表保存失败：'+e.message;}
@@ -75,6 +78,34 @@ class Controller {
       await this.refreshContacts();
       this.connect();return this.snapshot();
     } catch(e) {this.logout();throw e;}
+  }
+  async promoteIdentity(candidate) {
+    const old=this.engine.state;
+    for(const name of ['messages','hiddenSessions','hiddenContacts','trusted','peerAccountIds','deletedPeers','appliedAccountEvents'])
+      candidate.state[name]=structuredClone(old[name]||{});
+    for(const message of Object.values(candidate.state.messages)) {
+      if(message.id){message.archivedServerId=message.id;delete message.id;}
+      if(old.outbox[message.clientId])message.status='设备身份已更新，旧消息未发送';
+    }
+    candidate.state.identityChanges={};
+    for(const peer of Object.keys(candidate.state.peerAccountIds))candidate.state.identityChanges[peer]={identityKey:candidate.state.trusted[peer+'.1'],accountId:candidate.state.peerAccountIds[peer],message:'本机身份已更新，请重新核对安全码'};
+    this.vault.write(candidate.state);this.engine=candidate;
+  }
+  async recoverIdentity(own,password) {
+    const state=this.engine.state;
+    let candidate=state.pendingIdentityReset?new SignalEngine(structuredClone(state.pendingIdentityReset)):null;
+    if(candidate&&(await candidate.publicBundle()).identityKey===own.identityKey) {
+      await this.promoteIdentity(candidate);return;
+    }
+    if(!own.identityKey || own.identityKey===(await this.engine.publicBundle()).identityKey)return;
+    if(!candidate) {
+      candidate=await SignalEngine.create(this.user);await candidate.publicBundle(30);
+      state.pendingIdentityReset=structuredClone(candidate.state);
+      this.vault.write(state); // Persist candidate keys before remote commit; history is kept once.
+    }
+    const auth=await this.request('/api/keys/reset','POST',{password,bundle:await candidate.publicBundle()});
+    this.token=auth.token;candidate.state.accountId=auth.accountId;
+    await this.promoteIdentity(candidate);
   }
   normalizeServer(server) {
     const url=new URL(server);
@@ -136,7 +167,7 @@ class Controller {
       let event;
       try { event=JSON.parse(data.toString());await this.event(event); }
       catch(e){
-        if(['ready','account_deleted'].includes(event?.type)){
+        if(['ready','account_deleted','identity_reset'].includes(event?.type)){
           this.online=false;this.status='账号状态同步失败，正在重连';socket.close();
         }
         this.update('消息未确认：'+e.message);
@@ -144,7 +175,7 @@ class Controller {
     }));
     socket.on('close',(code)=>this.serial(async()=>{
       if(epoch!==this.generation)return;
-      this.online=false;
+      this.online=false;this.liveSessions.clear();
       if(code===1008){this.status='认证已失效，请退出后重新登录';this.update();return;}
       this.status='离线，正在重连';this.update();
       this.retry=setTimeout(()=>{if(epoch===this.generation)this.connect();},2000);
@@ -158,6 +189,8 @@ class Controller {
       if(!info.accountId||info.accountId===retired.accountId)throw new Error('该用户已销户，请等待对方重新注册后重新发起聊天');
       delete this.engine.state.deletedPeers[peer];
     }
+    const known=this.engine.state.peerAccountIds?.[peer];
+    if(!retired&&known&&info.accountId&&known!==info.accountId)throw new Error('对方设备身份已更新，请等待服务器身份通知后重试');
     const result=await this.engine.safety(peer,info.identityKey);
     if(info.accountId)(this.engine.state.peerAccountIds ||= {})[peer]=info.accountId;
     return result;
@@ -172,6 +205,7 @@ class Controller {
       const newer=(known&&known!==event.accountId)||(trusted&&event.identityKey&&trusted!==event.identityKey);
       if(!newer) {
         await this.engine.retirePeer(peer);
+        if(state.identityChanges)delete state.identityChanges[peer];
         (state.deletedPeers ||= {})[peer]={accountId:event.accountId,identityKey:event.identityKey,deletedAt:event.deletedAt||''};
         if(state.hiddenSessions)delete state.hiddenSessions[peer];
         if(state.peerAccountIds)delete state.peerAccountIds[peer];
@@ -181,11 +215,28 @@ class Controller {
     });
     if(retired)delete this.contactState[event.username];
   }
+  async applyAccountEvent(event) {
+    if(event?.kind!=='identity_reset')return this.applyAccountDeletion(event);
+    if(typeof event.id!=='string'||!validUser(event.username)||event.username===this.user||typeof event.accountId!=='string'||typeof event.identityKey!=='string'||!event.newAccountId||!event.newIdentityKey)throw new Error('身份更新通知格式无效');
+    await this.transaction(async()=>{
+      const state=this.engine.state,handled=(state.appliedAccountEvents ||= {}),peer=event.username;
+      if(handled[event.id])return;
+      const known=state.peerAccountIds?.[peer],trusted=state.trusted?.[peer+'.1'];
+      if((!known||known===event.accountId)&&(!trusted||trusted===event.identityKey)) {
+        await this.engine.retirePeer(peer,'对方设备身份已更新，旧消息未发送');
+        await this.engine.safety(peer,event.newIdentityKey);
+        (state.peerAccountIds ||= {})[peer]=event.newAccountId;
+        (state.identityChanges ||= {})[peer]={identityKey:event.newIdentityKey,accountId:event.newAccountId,message:'对方设备身份已更新，请重新核对安全码'};
+        if(state.deletedPeers)delete state.deletedPeers[peer];
+      }
+      handled[event.id]=true;
+    });
+  }
   async syncAccountEvents() {
     let events;
     try{events=await this.request('/api/account-events');}catch(error){if(error.status===404)return;throw error;}
     if(!Array.isArray(events))throw new Error('账号清理通知列表格式无效');
-    for(const event of events)await this.applyAccountDeletion(event);
+    for(const event of events)await this.applyAccountEvent(event);
     for(let start=0;start<events.length;start+=1000)
       await this.request('/api/account-events/ack','POST',{ids:events.slice(start,start+1000).map(event=>event.id)});
   }
@@ -196,8 +247,8 @@ class Controller {
       await this.refreshContacts();
       this.online=true;this.status='在线 · 端到端加密';
       for(const item of Object.values(this.engine.state.outbox))this.wire(item);
-    } else if(event.type==='account_deleted') {
-      await this.applyAccountDeletion(event.event);
+    } else if(['account_deleted','identity_reset'].includes(event.type)) {
+      await this.applyAccountEvent({...event.event,kind:event.type});
       await this.request('/api/account-events/ack','POST',{ids:[event.event.id]});
     } else if(event.type==='message') {
       if(!this.online)return;
@@ -232,10 +283,34 @@ class Controller {
     }
     this.update();
   }
-  async send({peer,body}) {
+  async sendLocation({peer,body}) {
+    const location=Location.parse(body);if(!location)throw new Error('位置数据无效');
+    if(this.contactState[peer]?.status!=='accepted')throw new Error('位置功能需要双方接受聊天');
+    if(!this.online||!this.token||!this.engine||this.socket?.readyState!==WebSocket.OPEN)throw new Error('离线时不能共享位置');
+    if(Date.parse(location.expiresAt)<=Date.now()&&location.kind!=='stop')throw new Error('位置已过期');
+    const key=peer+'\0'+location.sessionId,previous=this.liveSessions.get(key);
+    if(location.kind==='live'){
+      if(previous&&(previous.stopped||location.seq<=previous.seq||Date.now()>=previous.expiresAt))throw new Error('共享已停止或更新过期');
+      if(previous&&Date.now()-previous.sentAt<10000)throw new Error('实时位置每十秒最多更新一次');
+      if(previous&&Date.parse(location.expiresAt)>previous.expiresAt)throw new Error('不能延长共享时间');
+    }
+    const result=await this.send({peer,body,ephemeral:location.kind!=='pin',location:true});
+    if(location.kind!=='pin')this.liveSessions.set(key,{peer,sessionId:location.sessionId,seq:location.seq,sentAt:Date.now(),expiresAt:previous?.expiresAt||Date.parse(location.expiresAt),stopped:location.kind==='stop'});
+    return result;
+  }
+  async stopLocations() {
+    for(const item of this.liveSessions.values())if(!item.stopped&&item.expiresAt>Date.now()){
+      try{await this.sendLocation({peer:item.peer,body:Location.encode({v:1,kind:'stop',sessionId:item.sessionId,seq:item.seq+1,recordedAt:new Date().toISOString(),expiresAt:new Date(Math.max(Date.now(),item.expiresAt)).toISOString()})});}catch{}
+    }
+    this.liveSessions.clear();
+  }
+  async send({peer,body,ephemeral=false,location=false}) {
+    if(!location&&typeof body==='string'&&body.startsWith(Location.PREFIX))return this.sendLocation({peer,body});
+    const generation=this.generation;
     if(!this.engine||!this.online)throw new Error('请等待连接恢复');
     if(!validUser(peer)||peer===this.user)throw new Error('请输入另一位有效用户');
     if(typeof body!=='string'||!body.trim()||body.length>4000)throw new Error('消息须为 1–4000 字符');
+    if(this.engine.state.identityChanges?.[peer])throw new Error('设备身份已更新，请先核对新的安全码');
     const status=this.contactState[peer]?.status;
     if(status==='pending_incoming')throw new Error('请先接受对方的聊天请求');
     if(status==='pending_outgoing')
@@ -245,9 +320,16 @@ class Controller {
     await this.transaction(()=>this.bindPeerIdentity(peer,identity));
     if(!await this.engine.hasSession(peer)) {
       const bundle=await this.request('/api/keys/'+encodeURIComponent(peer)+'/claim','POST');
-      await this.transaction(()=>this.engine.establish(peer,bundle));
+      await this.transaction(async()=>{await this.bindPeerIdentity(peer,bundle);await this.engine.establish(peer,bundle);});
     }
-    const envelope=await this.transaction(()=>this.engine.encrypt(peer,body));
+    const envelope=await this.transaction(async()=>{
+      if(ephemeral&&(!this.online||generation!==this.generation||this.socket?.readyState!==WebSocket.OPEN))throw new Error('连接已断开，实时位置没有排队');
+      const value=await this.engine.encrypt(peer,body);
+      if(this.engine.state.peerAccountIds?.[peer])value.toAccountId=this.engine.state.peerAccountIds[peer];
+      // Persist the ratchet and encrypted local history, but never a retry queue for live updates.
+      if(ephemeral)delete this.engine.state.outbox[value.clientId];
+      return value;
+    });
     if(!status)this.contactState[peer]={username:peer,status:'pending_outgoing',online:false};
     if(this.engine.state.hiddenSessions?.[peer])await this.transaction(()=>{delete this.engine.state.hiddenSessions[peer];});
     this.wire(envelope);this.update();return this.snapshot();
@@ -285,7 +367,7 @@ class Controller {
       const result=await this.bindPeerIdentity(peer,info);
       if(confirm) {
         if(expectedCode!==result.code)throw new Error('安全码已改变，请重新核对');
-        this.engine.state.verified[peer]=info.identityKey;result.verified=true;
+        this.engine.state.verified[peer]=info.identityKey;if(this.engine.state.identityChanges)delete this.engine.state.identityChanges[peer];result.verified=true;
       }
       return result;
     });
@@ -298,7 +380,7 @@ class Controller {
     this.update();return this.snapshot();
   }
   logout() {
-    ++this.generation;clearTimeout(this.retry);this.socket?.close();this.socket=null;
+    this.liveSessions.clear();++this.generation;clearTimeout(this.retry);this.socket?.close();this.socket=null;
     this.user=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.update();
   }
 }

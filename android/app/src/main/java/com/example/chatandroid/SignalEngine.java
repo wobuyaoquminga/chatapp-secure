@@ -39,7 +39,7 @@ public final class SignalEngine {
             throw new IllegalArgumentException("不支持的本地加密状态");
         data = state;
         for (String field : new String[] {"signed", "pre", "kyber", "usedKyber", "sessions",
-                "trusted", "verified", "messages", "outbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents"}) {
+                "trusted", "verified", "messages", "outbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents", "identityChanges"}) {
             if (data.optJSONObject(field) == null) put(data, field, new JSONObject());
         }
         if (data.optJSONArray("pendingUpload") == null)
@@ -62,7 +62,7 @@ public final class SignalEngine {
         put(signedMap, "1", encode(signed.serialize()));
         put(state, "signed", signedMap);
         for (String field : new String[] {"pre", "kyber", "usedKyber", "sessions", "trusted",
-                "verified", "messages", "outbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents"}) put(state, field, new JSONObject());
+                "verified", "messages", "outbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents", "identityChanges"}) put(state, field, new JSONObject());
         put(state, "nextKey", 1);
         put(state, "pendingUpload", new JSONArray());
         return new SignalEngine(state);
@@ -70,6 +70,130 @@ public final class SignalEngine {
 
     /** Caller must persist this complete state atomically before network I/O. */
     public synchronized JSONObject state() { return data; }
+
+    /** Stage inside SecureVault before publishing. The old private state remains recoverable. */
+    public synchronized SignalEngine stageIdentityReset() {
+        JSONObject pending = data.optJSONObject("pendingIdentityReset");
+        SignalEngine replacement = pending == null ? create(string(data, "username"))
+                : new SignalEngine(copy(pending));
+        for (String field : new String[] {"messages", "trusted", "peerAccountIds", "deletedPeers",
+                "appliedAccountEvents", "hiddenContacts", "hiddenConversations", "identityChanges"})
+            put(replacement.data, field, copy(object(data, field)));
+        java.util.Iterator<String> peers = object(data, "peerAccountIds").keys();
+        while (peers.hasNext()) {
+            String peer = peers.next();
+            if (isDeleted(peer)) continue;
+            JSONObject notice = new JSONObject();
+            put(notice, "identityKey", object(data, "trusted").optString(address(peer).toString(), ""));
+            put(notice, "message", "本机身份已更新，请重新核对安全码");
+            put(object(replacement.data, "identityChanges"), peer, notice);
+        }
+        JSONObject old = new JSONObject();
+        for (String field : new String[] {"identity", "registrationId", "signed", "pre", "kyber", "usedKyber"})
+            put(old, field, data.opt(field) instanceof JSONObject ? copy(object(data, field)) : data.opt(field));
+        // Retain all old private material only inside the encrypted vault, never in publicBundle.
+        put(replacement.data, "archivedIdentity", old);
+        JSONObject history = object(replacement.data, "messages");
+        java.util.Iterator<String> keys = history.keys();
+        while (keys.hasNext()) {
+            JSONObject message = history.optJSONObject(keys.next());
+            if (message == null) continue;
+            if (message.has("id")) {
+                put(message, "archivedServerId", message.opt("id"));
+                message.remove("id");
+            }
+            if (object(data, "outbox").has(message.optString("clientId")))
+                put(message, "status", "本机身份已更新 · 未发送");
+        }
+        saveIdentityResetCandidate(replacement);
+        return replacement;
+    }
+
+    /** Save only candidate cryptographic state; do not duplicate the conversation history. */
+    public synchronized void saveIdentityResetCandidate(SignalEngine replacement) {
+        if (!string(data, "username").equals(string(replacement.data, "username")))
+            throw new IllegalArgumentException("候选身份账号不匹配");
+        JSONObject candidate = copy(replacement.data);
+        for (String field : new String[] {"messages", "trusted", "peerAccountIds", "deletedPeers",
+                "appliedAccountEvents", "hiddenContacts", "hiddenConversations", "identityChanges",
+                "archivedIdentity", "pendingIdentityReset"}) candidate.remove(field);
+        put(data, "pendingIdentityReset", candidate);
+    }
+
+    private static JSONObject copy(JSONObject source) {
+        try { return new JSONObject(source.toString()); }
+        catch (Exception e) { throw new IllegalStateException("本地状态无法复制", e); }
+    }
+
+    /** All account events are server proofs, scoped to the currently authenticated account. */
+    public synchronized boolean applyAccountEvent(JSONObject event) {
+        String recipient = event.optString("recipientAccountId", "");
+        if (!recipient.isEmpty() && !recipient.equals(data.optString("accountId", ""))) return false;
+        String kind = event.optString("kind", "account_deleted");
+        if ("identity_reset".equals(kind)) return applyIdentityReset(event);
+        if (!"account_deleted".equals(kind) && !"deleted".equals(kind))
+            throw new IllegalArgumentException("不支持的账号事件");
+        return applyAccountDeletion(event);
+    }
+
+    /** A matching reset proof is the only way to advance an existing peer identity. */
+    public synchronized boolean applyIdentityReset(JSONObject event) {
+        String id = string(event, "id"), peer = string(event, "username");
+        String oldId = string(event, "accountId"), oldKey = string(event, "identityKey");
+        String nextId = string(event, "newAccountId"), nextKey = string(event, "newIdentityKey");
+        if (id.isEmpty() || oldId.isEmpty() || nextId.isEmpty() || oldId.equals(nextId)
+                || oldKey.isEmpty() || nextKey.isEmpty() || oldKey.equals(nextKey)
+                || !Usernames.valid(peer) || peer.equals(string(data, "username")))
+            throw new IllegalArgumentException("无效身份更新事件");
+        // Validate the public key before changing or marking any state.
+        try { new IdentityKey(decode(nextKey)); }
+        catch (Exception e) { throw failure("身份更新公钥无效", e); }
+        JSONObject applied = object(data, "appliedAccountEvents");
+        if (applied.has(id)) return false;
+        String bound = object(data, "peerAccountIds").optString(peer, "");
+        String trusted = object(data, "trusted").optString(address(peer).toString(), "");
+        JSONObject tombstone = object(data, "deletedPeers").optJSONObject(peer);
+        if (bound.isEmpty() && tombstone != null) bound = tombstone.optString("accountId", "");
+        boolean matching = (!bound.isEmpty() || !trusted.isEmpty())
+                && (bound.isEmpty() || bound.equals(oldId))
+                && (trusted.isEmpty() || trusted.equals(oldKey));
+        put(applied, id, true);
+        if (!matching) return false;
+        store.deleteAllSessions(peer);
+        object(data, "trusted").remove(address(peer).toString());
+        object(data, "verified").remove(peer);
+        JSONObject outbox = object(data, "outbox");
+        java.util.List<String> remove = new java.util.ArrayList<>();
+        java.util.Iterator<String> queued = outbox.keys();
+        while (queued.hasNext()) {
+            String clientId = queued.next();
+            JSONObject request = outbox.optJSONObject(clientId);
+            if (request == null || !peer.equals(request.optString("to"))) continue;
+            remove.add(clientId);
+            JSONObject message = object(data, "messages").optJSONObject(string(data, "username") + ":" + clientId);
+            if (message != null) put(message, "status", "对方身份已更新 · 未发送");
+        }
+        for (String clientId : remove) outbox.remove(clientId);
+        java.util.Iterator<String> records = object(data, "messages").keys();
+        while (records.hasNext()) {
+            JSONObject message = object(data, "messages").optJSONObject(records.next());
+            if (message != null && (peer.equals(message.optString("sender"))
+                    || peer.equals(message.optString("recipient"))) && message.has("id")) {
+                put(message, "archivedServerId", message.opt("id"));
+                message.remove("id");
+            }
+        }
+        // Pin the proof's target immediately. A later GET may not silently choose another key.
+        put(object(data, "trusted"), address(peer).toString(), nextKey);
+        put(object(data, "peerAccountIds"), peer, nextId);
+        put(object(data, "identityChanges"), peer, new JSONObject());
+        JSONObject notice = object(data, "identityChanges").optJSONObject(peer);
+        put(notice, "accountId", nextId);
+        put(notice, "identityKey", nextKey);
+        put(notice, "message", "对方重新登录后身份已更新，请重新核对安全码");
+        object(data, "deletedPeers").remove(peer);
+        return true;
+    }
 
     public synchronized JSONObject publicBundle(int count) {
         if (count < 0 || count > 50) throw new IllegalArgumentException("每批最多 50 组预密钥");
@@ -131,6 +255,8 @@ public final class SignalEngine {
 
     public synchronized JSONObject encrypt(String to, String body) {
         if (isDeleted(to)) throw new SecurityException("该用户已销户，不能发送消息");
+        if (object(data, "identityChanges").has(to))
+            throw new SecurityException("设备身份已更新，请先核对新的安全码");
         if (body == null) throw new IllegalArgumentException("消息不能为空");
         String clientId = UUID.randomUUID().toString();
         JSONObject content = new JSONObject();
@@ -153,6 +279,8 @@ public final class SignalEngine {
             put(request, "type", "send");
             put(request, "clientId", clientId);
             put(request, "to", to);
+            String targetAccount = object(data, "peerAccountIds").optString(to, "");
+            if (!targetAccount.isEmpty()) put(request, "toAccountId", targetAccount);
             put(request, "ciphertext", ciphertext);
             put(object(data, "outbox"), clientId, request);
             put(content, "status", "待发送");
@@ -235,6 +363,7 @@ public final class SignalEngine {
         store.deleteAllSessions(peer);
         object(data, "trusted").remove(address(peer).toString());
         object(data, "verified").remove(peer);
+        object(data, "identityChanges").remove(peer);
         object(data, "peerAccountIds").remove(peer);
         object(data, "hiddenContacts").remove(peer);
         // Keep the conversation and plaintext history, but never replay old ciphertext.
@@ -275,11 +404,14 @@ public final class SignalEngine {
     /** Reopening a deleted name requires proof that it now denotes a new account. */
     public synchronized JSONObject bindPeer(String peer, JSONObject identity, boolean reopen) {
         String accountId = identity.optString("accountId", "");
+        String bound = object(data, "peerAccountIds").optString(peer, "");
         JSONObject tombstone = object(data, "deletedPeers").optJSONObject(peer);
         if (tombstone != null) {
             if (!reopen || accountId.isEmpty() || accountId.equals(tombstone.optString("accountId")))
                 throw new SecurityException("该用户已销户，无法向不存在的账号发送消息");
         }
+        if (tombstone == null && !bound.isEmpty() && !accountId.isEmpty() && !bound.equals(accountId))
+            throw new SecurityException("对方账号身份已改变，等待服务器身份更新证明");
         JSONObject result = safety(peer, string(identity, "identityKey"));
         if (tombstone != null) object(data, "deletedPeers").remove(peer);
         if (!accountId.isEmpty()) put(object(data, "peerAccountIds"), peer, accountId);

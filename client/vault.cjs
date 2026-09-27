@@ -24,10 +24,18 @@ class Journal {
     catch { throw new Error(this.corruptMessage); }
   }
   write(state) {
+    if(!this.crypto.isEncryptionAvailable())throw new Error('Windows 安全存储不可用，拒绝明文保存');
     const data=this.crypto.encryptString(JSON.stringify(state));
     // Append a complete encrypted checkpoint, then flush before advancing the protocol.
     // No cross-volume rename dependency, including redirected Windows profile folders.
-    fs.appendFileSync(this.file,data.toString('base64')+'\n',{flush:true});
+    const record=data.toString('base64')+'\n';
+    fs.appendFileSync(this.file,record,{flush:true});
+    // Append is already committed; optional compaction failure cannot invalidate it.
+    const temp=this.file+'.compact';
+    try {if(fs.statSync(this.file).size>Math.max(8*1024*1024,Buffer.byteLength(record)*3)){
+      fs.writeFileSync(temp,record,{flag:'w',flush:true});fs.renameSync(temp,this.file);
+    }}catch {try{fs.unlinkSync(temp);}catch{}}
+
   }
 }
 class Vault extends Journal {

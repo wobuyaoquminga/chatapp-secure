@@ -58,6 +58,7 @@ public class ChatSocket extends TextWebSocketHandler {
                 return;
             }
             if (!Instant.now().isBefore(c.expires)) { close(c, "token expired"); return; }
+            if (!store.currentGeneration(c.user, c.accountId)) { close(c, "identity reset"); return; }
             switch (type) {
                 case "send" -> {
                     clientId = field(request, "clientId");
@@ -66,14 +67,17 @@ public class ChatSocket extends TextWebSocketHandler {
                     if (!Username.valid(peer) || peer.equals(c.user)) throw new IllegalArgumentException("请选择另一位有效用户");
                     validateCiphertext(ciphertext);
                     if (!store.keysExist(c.user) || !store.keysExist(peer)) throw new IllegalArgumentException("双方必须先初始化加密设备");
-                    var saved = store.save(c.user, peer, clientId, ciphertext);
+                    String toAccountId = request.has("toAccountId") ? field(request, "toAccountId") : null;
+                    if (toAccountId != null && !toAccountId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
+                        throw new IllegalArgumentException("toAccountId 必须为 UUID");
+                    var saved = store.save(c.user, peer, clientId, ciphertext, c.accountId, toAccountId);
                     emit(c, Map.of("type", "accepted", "message", saved.message()));
                     if (saved.newContact()) notifyContactChanged(c.user, peer);
                     for (Connection target : List.copyOf(connections.values())) if (peer.equals(target.user)) pump(target);
                 }
                 case "ack" -> {
                     String id = field(request, "id");
-                    var message = store.acknowledge(c.user, Long.parseLong(id));
+                    var message = store.acknowledge(c.user, Long.parseLong(id), c.accountId);
                     emit(c, Map.of("type", "ack_ok", "id", id));
                     for (Connection target : List.copyOf(connections.values())) {
                         if (message.sender().equals(target.user)) emit(target, Map.of("type", "delivered", "id", id));
@@ -107,6 +111,7 @@ public class ChatSocket extends TextWebSocketHandler {
     }
     private void pump(Connection c) {
         if (!c.socket.isOpen() || c.user == null || !Instant.now().isBefore(c.expires)) return;
+        if (!store.currentGeneration(c.user, c.accountId)) { close(c, "identity reset"); return; }
         int capacity = 100 - c.inFlight.size();
         if (capacity <= 0) return;
         for (var message : store.pending(c.user, c.cursor, capacity)) {
@@ -139,7 +144,7 @@ public class ChatSocket extends TextWebSocketHandler {
             if (c.user == null || !peers.contains(c.user)) continue;
             for (var event : store.accountEvents(c.user, c.accountId)) {
                 if (user.equals(event.username()) && accountId.equals(event.accountId()))
-                    emit(c, Map.of("type", "account_deleted", "event", event));
+                    emit(c, Map.of("type", event.kind(), "event", event));
             }
         }
     }
@@ -160,6 +165,10 @@ public class ChatSocket extends TextWebSocketHandler {
     public synchronized void disconnectDeletedAccount(String user, String accountId) {
         for (Connection c : List.copyOf(connections.values()))
             if (user.equals(c.user) && accountId.equals(c.accountId)) close(c, "account deleted");
+    }
+    public synchronized void disconnectResetIdentity(String user, String accountId) {
+        for (Connection c : List.copyOf(connections.values()))
+            if (user.equals(c.user) && accountId.equals(c.accountId)) close(c, "identity reset");
     }
     @Scheduled(fixedDelay=1000)
     public synchronized void expireConnections() {

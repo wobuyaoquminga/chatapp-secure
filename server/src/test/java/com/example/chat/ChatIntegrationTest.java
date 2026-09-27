@@ -66,13 +66,13 @@ class ChatIntegrationTest {
         return json.writeValueAsString(Map.of("v", 1, "type", 2, "data", Base64.getEncoder().encodeToString(("opaque-test-payload-padding-" + body).getBytes(java.nio.charset.StandardCharsets.UTF_8))));
     }
     String send(Client c, Account recipient, String body, String clientId) throws Exception {
-        c.send(Map.of("type", "send", "to", recipient.name(), "ciphertext", wire(body), "clientId", clientId));
+        c.send(Map.of("type", "send", "to", recipient.name(), "toAccountId", accountId(recipient), "ciphertext", wire(body), "clientId", clientId));
         return c.await("accepted").path("message").path("id").asText();
     }
     @Test void chineseUsernamesCanRegisterLoginAndSend() throws Exception {
         var a = account("小明");
         var b = account("小红");
-        assertThat(rest.postForEntity("/api/auth/register", Map.of("username", "ab", "password", "password123"), String.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(rest.postForEntity("/api/auth/register", Map.of("username", "a", "password", "password123"), String.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(rest.postForEntity("/api/auth/login", Map.of("username", a.name(), "password", "password123"), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(rest.exchange("/api/keys/" + b.name(), HttpMethod.GET, auth(a), JsonNode.class).getBody().path("username").asText()).isEqualTo(b.name());
         try (var alice = new Client(a); var bob = new Client(b)) {
@@ -423,6 +423,163 @@ class ChatIntegrationTest {
         var boundary = account();
         db.update("UPDATE app_users SET last_connected_at=CURRENT_TIMESTAMP - INTERVAL '7' DAY WHERE username=?", boundary.name());
         assertThat(store.deleteIfInactive(boundary.name())).isPresent();
+    }
+    Map<String,Object> resetBundle(int marker) {
+        byte[] ec = new byte[33]; ec[0] = 5; ec[1] = (byte) marker;
+        String key = Base64.getEncoder().encodeToString(ec);
+        String signature = Base64.getEncoder().encodeToString(new byte[64]);
+        return Map.of("identityKey", key, "registrationId", 12,
+            "signedPreKey", Map.of("id", 2, "publicKey", key, "signature", signature),
+            "preKeys", List.of(Map.of("id", 1, "publicKey", key,
+                "kyberPublicKey", Base64.getEncoder().encodeToString(new byte[1569]), "kyberSignature", signature)));
+    }
+    ResponseEntity<JsonNode> reset(Account a, String password, Map<String,Object> bundle) {
+        return rest.exchange("/api/keys/reset", HttpMethod.POST,
+            new HttpEntity<>(Map.of("password", password, "bundle", bundle), bearer(a)), JsonNode.class);
+    }
+    Account resetAccount(Account a, int marker) {
+        var result = reset(a, "password123", resetBundle(marker));
+        assertThat(result.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(result.getBody().path("accountId").asText()).isEqualTo(accountId(a));
+        return new Account(a.name(), result.getBody().path("token").asText());
+    }
+    @Test void twoCharacterAsciiAndChineseNamesUseTheSameMinimum() {
+        var a = account("ab");
+        var b = account("中a");
+        assertThat(rest.postForEntity("/api/auth/login", Map.of("username", a.name(), "password", "password123"), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(rest.exchange("/api/keys/" + b.name(), HttpMethod.GET, auth(a), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        for (String invalid : List.of("a", "中", "a".repeat(33)))
+            assertThat(rest.postForEntity("/api/auth/register", Map.of("username", invalid, "password", "password123"), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+    @Test void identityResetRequiresPasswordAndRollsBackInvalidBundle() throws Exception {
+        var a = account(); var b = account();
+        store.save(b.name(), a.name(), UUID.randomUUID().toString(), wire("pending"));
+        String original = accountId(a);
+        String originalHash = db.queryForObject("SELECT password_hash FROM app_users WHERE username=?", String.class, a.name());
+        String originalIdentity = db.queryForObject("SELECT identity_key FROM device_keys WHERE username=?", String.class, a.name());
+        assertThat(rest.postForEntity("/api/keys/reset", Map.of("password", "password123", "bundle", resetBundle(10)), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(reset(a, "wrongpassword", resetBundle(10)).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        var malformed = new HashMap<>(resetBundle(10)); malformed.put("preKeys", List.of(Map.of("id", 1)));
+        assertThat(reset(a, "password123", malformed).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(accountId(a)).isEqualTo(original);
+        assertThat(db.queryForObject("SELECT identity_key FROM device_keys WHERE username=?", String.class, a.name())).isEqualTo(originalIdentity);
+        assertThat(db.queryForObject("SELECT password_hash FROM app_users WHERE username=?", String.class, a.name())).isEqualTo(originalHash);
+        assertThat(history(a, b.name())).hasSize(1);
+        assertThat(accountEvents(b)).isEmpty();
+    }
+    @Test void resetKeepsAccountAndConsentClosesOldSocketAndPushesIdentityReset() throws Exception {
+        var a = account(); var b = account();
+        String oldGeneration = accountId(a);
+        String oldIdentity = db.queryForObject("SELECT identity_key FROM device_keys WHERE username=?", String.class, a.name());
+        try (var oldDevice = new Client(a); var peer = new Client(b)) {
+            send(oldDevice, b, "previous conversation", UUID.randomUUID().toString()); peer.await("message");
+            accept(b, a);
+            var replacement = resetAccount(a, 21);
+            assertThat(oldDevice.closed.get(5, TimeUnit.SECONDS)).isEqualTo(1008);
+            var event = peer.await("identity_reset").path("event");
+            assertThat(event.path("kind").asText()).isEqualTo("identity_reset");
+            assertThat(event.path("username").asText()).isEqualTo(a.name());
+            assertThat(event.path("accountId").asText()).isEqualTo(oldGeneration);
+            assertThat(event.path("identityKey").asText()).isEqualTo(oldIdentity);
+            assertThat(event.path("newAccountId").asText()).isEqualTo(accountId(replacement)).isNotEqualTo(oldGeneration);
+            assertThat(event.path("newIdentityKey").asText()).isEqualTo(resetBundle(21).get("identityKey"));
+            assertThat(accountEvents(b).get(0)).isEqualTo(event);
+            assertThat(contacts(replacement).get(0).path("status").asText()).isEqualTo("accepted");
+            assertThat(contacts(b).get(0).path("status").asText()).isEqualTo("accepted");
+            assertThat(rest.exchange("/api/keys/me", HttpMethod.GET, auth(a), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            assertThat(reset(a, "password123", resetBundle(22)).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            var own = rest.exchange("/api/keys/me", HttpMethod.GET, auth(replacement), JsonNode.class).getBody();
+            assertThat(own.path("accountId").asText()).isEqualTo(accountId(replacement));
+            assertThat(own.path("identityKey").asText()).isEqualTo(resetBundle(21).get("identityKey"));
+            var login = rest.postForEntity("/api/auth/login", Map.of("username", a.name(), "password", "password123"), JsonNode.class);
+            assertThat(login.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(login.getBody().path("accountId").asText()).isEqualTo(accountId(replacement));
+            try (var newDevice = new Client(replacement)) {
+                send(newDevice, b, "new conversation", UUID.randomUUID().toString()); peer.await("message");
+            }
+        }
+    }
+    @Test void offlineResetEventsAreDurableAndOldCiphertextsNeverReachReplacement() throws Exception {
+        var a = account(); var b = account(); var stranger = account();
+        store.save(b.name(), a.name(), UUID.randomUUID().toString(), wire("old pending"));
+        var replacement = resetAccount(a, 30);
+        String eventId = accountEvents(b).get(0).path("id").asText();
+        assertThat(accountEvents(stranger)).isEmpty();
+        assertThat(contacts(replacement).get(0).path("status").asText()).isEqualTo("pending_incoming");
+        assertThat(history(replacement, b.name())).isEmpty();
+        assertThat(history(b, a.name())).isEmpty();
+        assertThat(store.pending(replacement.name(), 0, 100)).isEmpty();
+        try (var fresh = new Client(replacement)) {
+            fresh.send(Map.of("type", "ping")); fresh.await("pong");
+            assertThat(fresh.events.stream().filter(e -> e.path("type").asText().equals("message"))).isEmpty();
+        }
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try (var offlinePeer = new Client(b)) {
+                assertThat(accountEvents(b).get(0).path("id").asText()).isEqualTo(eventId);
+            }
+        }
+        assertThat(ackAccountEvents(stranger, List.of(eventId))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(accountEvents(b)).hasSize(1);
+        assertThat(ackAccountEvents(b, List.of(eventId))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(ackAccountEvents(b, List.of(eventId))).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(accountEvents(b)).isEmpty();
+    }
+    @Test void passwordVerifiedResetPreservesPendingPeerProofsButRejectsOldRecipientToken() throws Exception {
+        var a = account(); var b = account();
+        store.save(a.name(), b.name(), UUID.randomUUID().toString(), wire("peer"));
+        var nextA = resetAccount(a, 41);
+        String oldBGeneration = accountId(b);
+        String oldEvent = accountEvents(b).get(0).path("id").asText();
+        var nextB = resetAccount(b, 42);
+        assertThat(accountEvents(nextB)).hasSize(1);
+        assertThat(accountEvents(nextB).get(0).path("id").asText()).isEqualTo(oldEvent);
+        assertThat(accountEvents(nextB).get(0).path("newAccountId").asText()).isEqualTo(accountId(nextA));
+        assertThat(rest.exchange("/api/account-events", HttpMethod.GET, auth(b), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(ackAccountEvents(b, List.of(oldEvent))).isEqualTo(HttpStatus.UNAUTHORIZED);
+        var latestA = resetAccount(nextA, 43);
+        var events = accountEvents(nextB);
+        assertThat(events).hasSize(2);
+        String newEvent = events.get(1).path("id").asText();
+        assertThat(newEvent).isNotEqualTo(oldEvent);
+        assertThat(ackAccountEvents(b, List.of(newEvent))).isEqualTo(HttpStatus.UNAUTHORIZED);
+        store.acknowledgeAccountEvents(b.name(), oldBGeneration, List.of(newEvent));
+        assertThat(accountEvents(nextB)).hasSize(2);
+        assertThat(accountEvents(nextB).get(0).path("id").asText()).isEqualTo(oldEvent);
+        assertThat(store.accountEvents(b.name(), oldBGeneration)).isEmpty();
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(resetBundle(44), bearer(a)), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(rest.exchange("/api/keys/" + latestA.name() + "/claim", HttpMethod.POST, auth(nextB), JsonNode.class).getBody().path("accountId").asText()).isEqualTo(accountId(latestA));
+    }
+    @Test void resetNotifiesFormerHistoricalPeerWithoutRecreatingContact() throws Exception {
+        var a = account(); var b = account();
+        store.save(a.name(), b.name(), UUID.randomUUID().toString(), wire("former conversation"));
+        accept(b, a); remove(a, b);
+        var next = resetAccount(a, 51);
+        assertThat(accountEvents(b).get(0).path("kind").asText()).isEqualTo("identity_reset");
+        String firstEventId = accountEvents(b).get(0).path("id").asText();
+        ackAccountEvents(b, List.of(firstEventId));
+        assertThat(accountEvents(b)).isEmpty();
+        resetAccount(next, 52);
+        assertThat(accountEvents(b)).hasSize(1);
+        assertThat(accountEvents(b).get(0).path("id").asText()).isNotEqualTo(firstEventId);
+        assertThat(contacts(b)).isEmpty();
+        expire(b); cleanup.removeInactiveAccounts();
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM history_peers WHERE user_a=? OR user_b=?", Integer.class, b.name(), b.name())).isZero();
+    }
+    @Test void oldRecipientGenerationCannotReceiveDelayedCiphertextAfterReset() throws Exception {
+        var sender = account(); var receiver = account();
+        store.save(sender.name(), receiver.name(), UUID.randomUUID().toString(), wire("invite"));
+        accept(receiver, sender);
+        String oldGeneration = accountId(receiver);
+        var fresh = resetAccount(receiver, 61);
+        try (var peer = new Client(sender); var device = new Client(fresh)) {
+            peer.send(Map.of("type", "send", "to", receiver.name(), "toAccountId", oldGeneration,
+                "ciphertext", wire("old device ciphertext"), "clientId", UUID.randomUUID().toString()));
+            assertThat(peer.await("error").path("error").asText()).contains("身份已更新");
+            assertThat(store.pending(receiver.name(), 0, 100)).isEmpty();
+            String id = send(peer, fresh, "new device ciphertext", UUID.randomUUID().toString());
+            assertThat(device.await("message").path("message").path("id").asText()).isEqualTo(id);
+            assertThat(history(fresh, sender.name())).hasSize(1);
+        }
     }
     private String token(String username, Instant expiry) {
         var claims = JwtClaimsSet.builder().issuer("chat").subject(username)

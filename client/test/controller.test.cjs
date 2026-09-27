@@ -13,9 +13,9 @@ function fixture(){
   controller.contactState={'小红':{username:'小红',status:'accepted',online:true}};
   return {controller,close:()=>fs.rmSync(dir,{recursive:true,force:true})};
 }
-test('Chinese names allow two Han characters while legacy ASCII minimum remains three',()=>{
-  for(const name of ['小明','张三_1','alice','abc_123'])assert.equal(validUser(name),true);
-  for(const name of ['ab','Aaa','小','小 明','a-b','😀😀','a'.repeat(33)])assert.equal(validUser(name),false);
+test('All usernames allow two characters',()=>{
+  for(const name of ['ab','小明','张三_1','alice','abc_123'])assert.equal(validUser(name),true);
+  for(const name of ['a','Aaa','小','小 明','a-b','😀😀','a'.repeat(33)])assert.equal(validUser(name),false);
 });
 test('clearing a session and revoking a contact preserve encrypted local history',async()=>{
   const {controller,close}=fixture();

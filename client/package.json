@@ -1,7 +1,7 @@
 {
   "name": "chat-client",
   "productName": "Chat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Chat desktop client",
   "main": "main.cjs",
   "private": true,
@@ -11,6 +11,12 @@
     "test": "node --test test/*.test.cjs",
     "package": "electron-packager . Chat --platform=win32 --arch=x64 --out=../release --overwrite --icon=assets/icon.ico --ignore=^/test --ignore=^/qa"
   },
-  "dependencies": { "@signalapp/libsignal-client": "0.103.0", "ws": "8.20.0" },
-  "devDependencies": { "electron": "44.4.5", "@electron/packager": "20.3.0" }
+  "dependencies": {
+    "@signalapp/libsignal-client": "0.103.0",
+    "ws": "8.20.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "44.4.5"
+  }
 }

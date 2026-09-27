@@ -62,7 +62,86 @@ final class ChatController {
     private SecureVault vault;
     private SignalEngine engine;
     private volatile WebSocket socket;
-    private long generation;
+    private volatile long generation;
+    private String livePeer = "";
+    private volatile String liveSession = "";
+    private long liveExpiry, lastLiveSent;
+    private int liveSeq;
+    private java.util.concurrent.ScheduledFuture<?> liveTimeout;
+    private volatile Runnable locationStopped;
+    private long messagesRevision;
+    private String messagesSignature = "";
+    private JSONArray cachedMessages = new JSONArray();
+    private SignalEngine cachedEngine;
+    private int messagesAppendFrom = -1;
+    private long messagesBaseRevision;
+    private final java.util.Map<String,String> messageSourceCache = new java.util.HashMap<>();
+    private final java.util.Map<String,JSONObject> cleanMessageCache = new java.util.HashMap<>();
+    void setLocationStoppedListener(Runnable stopped) { locationStopped = stopped; }
+    long locationContext() { return generation; }
+    void sendPin(String peer, double latitude, double longitude, double accuracy) { sendPin(peer,latitude,longitude,accuracy,generation); }
+    void sendPin(String peer, double latitude, double longitude, double accuracy, long expectedContext) {
+        execute(() -> {
+            if (expectedContext != generation) throw new Exception("账号或连接已改变，请重新获取位置");
+            requireLocationPeer(peer);
+            long now = System.currentTimeMillis();
+            sendBody(peer, LocationPayload.encode("pin", java.util.UUID.randomUUID().toString(),
+                    0, latitude, longitude, accuracy, now, now + LocationPayload.MAX_DURATION), false);
+        });
+    }
+    void startLive(String peer) { startLive(peer,generation); }
+    void startLive(String peer, long expectedContext) {
+        execute(() -> {
+            stopLiveInternal(false);
+            try {
+                if (expectedContext != generation) throw new Exception("账号或连接已改变，请重新发起分享");
+                requireLocationPeer(peer);
+                livePeer = peer; liveSession = java.util.UUID.randomUUID().toString();
+                liveExpiry = System.currentTimeMillis() + LocationPayload.MAX_DURATION;
+                liveSeq = 0; lastLiveSent = 0;
+                String session = liveSession;
+                liveTimeout = worker.schedule(() -> { if (session.equals(liveSession)) { stopLiveInternal(); publish(""); } }, LocationPayload.MAX_DURATION, TimeUnit.MILLISECONDS);
+                publish("");
+            } catch (Exception error) { notifyLocationStopped(); throw error; }
+        });
+    }
+    void sendLiveLocation(double latitude, double longitude, double accuracy) {
+        execute(() -> {
+            long now = System.currentTimeMillis();
+            if (liveSession.isEmpty()) return;
+            if (now >= liveExpiry || !online) { stopLiveInternal(); publish(""); return; }
+            if (now - lastLiveSent < 10000) return;
+            try {
+                requireLocationPeer(livePeer);
+                sendBody(livePeer, LocationPayload.encode("live", liveSession, liveSeq++, latitude, longitude, accuracy, now, liveExpiry), true);
+                lastLiveSent = now;
+            } catch (Exception error) { stopLiveInternal(); throw error; }
+        });
+    }
+    void stopLive() { execute(() -> { stopLiveInternal(); publish(""); }); }
+    void stopLiveForPin() { execute(() -> { stopLiveInternal(false); publish(""); }); }
+    private void requireLocationPeer(String peer) throws Exception {
+        requirePeer(peer);
+        if (!online || !relationship(peer).equals("accepted")) throw new Exception("实时位置仅可发送给已同意聊天的联系人，请先连接服务器");
+        if (engine.isDeleted(peer) || engine.state().getJSONObject("identityChanges").has(peer)) throw new Exception("请先核对联系人设备身份");
+    }
+    private void notifyLocationStopped() {
+        Runnable stopped = locationStopped;
+        if (stopped != null) main.post(stopped);
+    }
+    private void stopLiveInternal() { stopLiveInternal(true); }
+    private void stopLiveInternal(boolean notify) {
+        if (liveTimeout != null) { liveTimeout.cancel(false); liveTimeout = null; }
+        if (liveSession.isEmpty()) return;
+        String peer = livePeer, session = liveSession; int sequence = liveSeq;
+        long now = System.currentTimeMillis();
+        livePeer = ""; liveSession = ""; liveExpiry = 0;
+        if (notify) notifyLocationStopped();
+        if (online && engine != null) {
+            try { sendBody(peer, LocationPayload.encode("stop",session,sequence,0,0,0,now,now),true); }
+            catch (Exception ignored) { /* Receiver expiry remains authoritative. */ }
+        }
+    }
 
     ChatController(Context context, Listener listener) {
         this.context = context.getApplicationContext();
@@ -76,7 +155,7 @@ final class ChatController {
             clearSession();
             storageFailed = false;
             server = validateServer(address, allowLanTest);
-            if (!validUser(user)) throw new Exception("用户名限 2–32 位汉字、小写字母、数字、下划线（纯英文至少 3 位）");
+            if (!validUser(user)) throw new Exception("用户名限 2–32 位汉字、小写字母、数字、下划线");
             if (password == null || password.length() < 8
                     || password.getBytes(StandardCharsets.UTF_8).length > 72)
                 throw new Exception("密码至少 8 字符、最多 72 UTF-8 字节");
@@ -94,8 +173,32 @@ final class ChatController {
                 JSONObject own = requestObject("/api/keys/me", "GET", null);
                 JSONObject bundle = engine.publicBundle(0);
                 String remoteIdentity = own.optString("identityKey", "");
-                if (!remoteIdentity.isEmpty() && !remoteIdentity.equals(bundle.getString("identityKey")))
-                    throw new Exception("账号已绑定另一设备的密钥；本版单设备，不能用密码恢复，请使用原客户端或注册新账号");
+                if (!remoteIdentity.isEmpty() && !remoteIdentity.equals(bundle.getString("identityKey"))) {
+                    SignalEngine replacement = engine.stageIdentityReset();
+                    JSONObject resetBundle = replacement.publicBundle(
+                            replacement.state().getJSONArray("pendingUpload").length() == 0 ? 30 : 0);
+                    // Candidate keys and the old history stay in the existing encrypted vault.
+                    engine.saveIdentityResetCandidate(replacement);
+                    vault.write(engine.state());
+                    if (!remoteIdentity.equals(resetBundle.getString("identityKey"))) {
+                        JSONObject reset = requestObject("/api/keys/reset", "POST",
+                                new JSONObject().put("password", password).put("bundle", resetBundle));
+                        if (!username.equals(reset.getString("username")))
+                            throw new Exception("服务器返回的账号不匹配");
+                        token = reset.getString("token");
+                        replacement.state().put("accountId", reset.getString("accountId"));
+                    } else {
+                        // A previous reset succeeded before the final local write completed.
+                        replacement.state().put("accountId", auth.getString("accountId"));
+                    }
+                    replacement.state().put("pendingUpload", new JSONArray());
+                    engine = replacement;
+                    vault.write(engine.state());
+                    own = requestObject("/api/keys/me", "GET", null);
+                } else {
+                    engine.state().remove("pendingIdentityReset");
+                    if (auth.has("accountId")) engine.state().put("accountId", auth.getString("accountId"));
+                }
                 // Never publish a public key until its private half survives a durable write.
                 vault.write(engine.state());
                 accounts.remember(server, username);
@@ -175,11 +278,14 @@ final class ChatController {
         });
     }
 
-    void send(String peer, String body) {
-        execute(() -> {
+    void send(String peer, String body) { execute(() -> sendBody(peer, body, false)); }
+
+    private void sendBody(String peer, String body, boolean transientLocation) throws Exception {
             requirePeer(peer);
             if (!online) throw new Exception("请等待连接恢复");
             if (engine.isDeleted(peer)) throw new Exception("该用户已销户，无法向不存在的账号发送消息");
+            if (engine.state().getJSONObject("identityChanges").has(peer))
+                throw new Exception("设备身份已更新，请先核对新的安全码");
             String relation = relationship(peer);
             if (relation.equals("pending_outgoing")) throw new Exception("已发送首条消息，请等待对方同意");
             if (relation.equals("pending_incoming")) throw new Exception("请先同意对方的聊天请求");
@@ -195,17 +301,20 @@ final class ChatController {
                 transaction(() -> { engine.bindPeer(peer, bundle, false); engine.establish(peer, bundle); return null; });
             }
             JSONObject envelope = transaction(() -> {
+                if (body.startsWith(LocationPayload.PREFIX) && engine.state().getJSONObject("peerAccountIds").optString(peer).isEmpty())
+                    throw new Exception("联系人账号信息缺失，位置发送已停止");
                 JSONObject result = engine.encrypt(peer, body);
+                // Ratchet and history are durable; live packets must never replay after reconnect.
+                if (transientLocation) engine.state().getJSONObject("outbox").remove(result.getString("clientId"));
                 engine.state().optJSONObject("hiddenConversations").remove(peer);
                 return result;
             });
             if (relation.isEmpty()) relationships.put(peer, new JSONObject()
                     .put("username", peer).put("status", "pending_outgoing").put("online", false));
-            selectedPeer = peer;
+            if (!body.startsWith(LocationPayload.PREFIX)) selectedPeer = peer;
             wire(envelope);
-            main.post(listener::onSent);
+            if (!body.startsWith(LocationPayload.PREFIX)) main.post(listener::onSent);
             publish("");
-        });
     }
 
     void safety(String peer, boolean confirm, String expectedCode) {
@@ -219,6 +328,7 @@ final class ChatController {
                     if (expectedCode == null || !expectedCode.equals(checked.getString("code")))
                         throw new Exception("安全码已改变，请重新核对");
                     engine.state().getJSONObject("verified").put(peer, identity.getString("identityKey"));
+                    engine.state().getJSONObject("identityChanges").remove(peer);
                     checked.put("verified", true);
                 }
                 return checked;
@@ -246,6 +356,7 @@ final class ChatController {
         execute(() -> {
             requirePeer(peer);
             requestObject("/api/contacts/remove", "POST", new JSONObject().put("peer", peer));
+            if (peer.equals(livePeer)) stopLiveInternal();
             relationships.remove(peer);
             // Older versions only hid contacts locally. A later request must be visible.
             clearHiddenContact(peer);
@@ -297,7 +408,7 @@ final class ChatController {
     private void syncAccountEvents(JSONArray events) throws Exception {
         AccountEventSync.run(events, batch -> {
             transaction(() -> {
-                for (int i = 0; i < batch.length(); i++) engine.applyAccountDeletion(batch.getJSONObject(i));
+                for (int i = 0; i < batch.length(); i++) engine.applyAccountEvent(batch.getJSONObject(i));
                 return null;
             });
             for (int i = 0; i < batch.length(); i++) {
@@ -316,6 +427,7 @@ final class ChatController {
 
     private void pauseAccountSync(Exception error) {
         online = false;
+        stopLiveInternal();
         status = "账号状态同步失败，正在重连";
         WebSocket current = socket;
         if (current != null) current.cancel();
@@ -326,8 +438,7 @@ final class ChatController {
     synchronized void close() {
         if (closed) return;
         closed = true;
-        WebSocket current = socket;
-        if (current != null) current.close(1000, "activity closed");
+        notifyLocationStopped();
         worker.execute(this::clearSession);
         worker.shutdown();
         client.dispatcher().executorService().shutdown();
@@ -351,6 +462,7 @@ final class ChatController {
             T result = action.call();
             try {
                 vault.write(engine.state());
+                refreshMessageCache();
             } catch (Exception error) {
                 storageFailed = true;
                 throw error;
@@ -410,6 +522,8 @@ final class ChatController {
     private void disconnected(long epoch, int code) {
         if (epoch != generation || reconnectPending || token == null) return;
         online = false;
+        stopLiveInternal();
+        notifyLocationStopped();
         socket = null;
         if (code == 1008 || code == 401 || code == 403) {
             status = "认证已失效，请退出后重新登录";
@@ -438,6 +552,7 @@ final class ChatController {
                 while (ids.hasNext()) wire(outbox.getJSONObject(ids.next()));
                 break;
             case "account_deleted":
+            case "identity_reset":
                 try { syncAccountEvents(new JSONArray().put(event.getJSONObject("event"))); }
                 catch (Exception error) { pauseAccountSync(error); return; }
                 break;
@@ -497,6 +612,10 @@ final class ChatController {
             default:
                 break;
         }
+        if (!liveSession.isEmpty()) {
+            try { requireLocationPeer(livePeer); }
+            catch (Exception invalid) { stopLiveInternal(); }
+        }
         publish("");
     }
 
@@ -546,6 +665,8 @@ final class ChatController {
     }
 
     private void clearSession() {
+        stopLiveInternal();
+        notifyLocationStopped();
         ++generation;
         WebSocket old = socket;
         socket = null;
@@ -577,6 +698,34 @@ final class ChatController {
         catch (RejectedExecutionException ignored) { /* Activity is closing. */ }
     }
 
+    private void refreshMessageCache() throws Exception {
+        JSONObject saved = engine == null ? new JSONObject() : engine.state().getJSONObject("messages");
+        String signature = saved.toString();
+        cachedEngine = engine;
+        if (signature.equals(messagesSignature)) return;
+        messagesSignature = signature;
+        messagesBaseRevision = messagesRevision; ++messagesRevision;
+        List<JSONObject> ordered = new ArrayList<>();
+        for (Iterator<String> keys = saved.keys(); keys.hasNext();) {
+            String key = keys.next();
+            String source = saved.getJSONObject(key).toString();
+            JSONObject clean = cleanMessageCache.get(key);
+            if (clean == null || !source.equals(messageSourceCache.get(key))) {
+                clean = new JSONObject(source); clean.remove("ciphertext");
+                messageSourceCache.put(key,source); cleanMessageCache.put(key,clean);
+            }
+            ordered.add(clean);
+        }
+        Collections.sort(ordered, (a,b) -> a.optString("createdAt").compareTo(b.optString("createdAt")));
+        messagesAppendFrom = cachedMessages.length() <= ordered.size() ? cachedMessages.length() : -1;
+        for (int i=0; messagesAppendFrom >= 0 && i<cachedMessages.length(); i++) {
+            if (cachedMessages.optJSONObject(i) != ordered.get(i)) messagesAppendFrom = -1;
+        }
+        if (engine == null) { cleanMessageCache.clear(); messageSourceCache.clear(); messagesAppendFrom = -1; }
+        cachedMessages = new JSONArray();
+        for (JSONObject item : ordered) cachedMessages.put(item);
+    }
+
     private void publish(String error) {
         JSONObject snapshot = new JSONObject();
         try {
@@ -591,11 +740,16 @@ final class ChatController {
                     .put("status", status).put("online", online)
                     .put("selectedPeer", selectedPeer)
                     .put("selectedServer", accounts.lastServer()).put("servers", servers);
-            JSONArray messages = new JSONArray();
+            if (engine != cachedEngine) refreshMessageCache();
+            JSONArray messages = cachedMessages;
+            snapshot.put("messagesRevision", messagesRevision).put("messagesBaseRevision",messagesBaseRevision).put("messagesAppendFrom",messagesAppendFrom);
+            snapshot.put("locationSharing", new JSONObject().put("active", !liveSession.isEmpty()).put("peer",livePeer)
+                    .put("sessionId",liveSession).put("expiresAt",liveExpiry));
             TreeSet<String> contacts = new TreeSet<>();
             TreeSet<String> conversations = new TreeSet<>();
             if (engine != null) {
                 snapshot.put("deletedPeers", new JSONObject(engine.state().getJSONObject("deletedPeers").toString()));
+                snapshot.put("identityChanges", new JSONObject(engine.state().getJSONObject("identityChanges").toString()));
                 JSONObject hiddenContacts = engine.state().getJSONObject("hiddenContacts");
                 JSONObject hiddenConversations = engine.state().getJSONObject("hiddenConversations");
                 Iterator<String> deleted = engine.state().getJSONObject("deletedPeers").keys();
@@ -611,25 +765,11 @@ final class ChatController {
                             && !hiddenContacts.optBoolean(peer) && !engine.isDeleted(peer)) contacts.add(peer);
                     if (!hiddenConversations.optBoolean(peer)) conversations.add(peer);
                 }
-                JSONObject savedMessages = engine.state().optJSONObject("messages");
-                if (savedMessages != null) {
-                    List<JSONObject> ordered = new ArrayList<>();
-                    Iterator<String> keys = savedMessages.keys();
-                    while (keys.hasNext()) {
-                        JSONObject source = savedMessages.getJSONObject(keys.next());
-                        JSONObject clean = new JSONObject(source.toString());
-                        clean.remove("ciphertext");
-                        ordered.add(clean);
-                        String sender = clean.optString("sender");
-                        String recipient = clean.optString("recipient");
-                        if (validUser(sender) && !sender.equals(username)
-                                && !hiddenConversations.optBoolean(sender)) conversations.add(sender);
-                        if (validUser(recipient) && !recipient.equals(username)
-                                && !hiddenConversations.optBoolean(recipient)) conversations.add(recipient);
-                    }
-                    Collections.sort(ordered, (a, b) -> a.optString("createdAt")
-                            .compareTo(b.optString("createdAt")));
-                    for (JSONObject item : ordered) messages.put(item);
+                for (int i = 0; i < messages.length(); i++) {
+                    JSONObject clean = messages.getJSONObject(i);
+                    String sender = clean.optString("sender"), recipient = clean.optString("recipient");
+                    if (validUser(sender) && !sender.equals(username) && !hiddenConversations.optBoolean(sender)) conversations.add(sender);
+                    if (validUser(recipient) && !recipient.equals(username) && !hiddenConversations.optBoolean(recipient)) conversations.add(recipient);
                 }
             }
             JSONArray contactList = new JSONArray();
