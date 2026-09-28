@@ -15,14 +15,16 @@ class Controller {
     this.status='未登录';this.online=false;this.contactState={};this.liveSessions=new Map();
   }
   serial(task) { const run=this.queue.then(task);this.queue=run.catch(()=>{});return run; }
-  // A corrupt index must never keep the user away from keys that are still intact in its vault.
-  accountList() {
-    try { this.listError='';return this.registry.list(); }
-    catch(e) { this.listError=e.message;return []; }
-  }
   snapshot() {
-    const accounts=this.accountList();let servers=[],selectedServer='';
-    try{servers=this.registry.servers();selectedServer=this.registry.selectedServer();}
+    let accounts=[],servers=[],selectedServer='';
+    // Read/decrypt once per update so all three fields describe one committed index.
+    // Do not cache across updates: corruption and changes on disk must remain visible.
+    try{
+      const registry=this.registry.read()||{};this.listError='';
+      accounts=registry.accounts||[];
+      servers=registry.servers||[...new Set(accounts.map(account=>account.server))];
+      selectedServer=registry.selectedServer||servers[0]||'';
+    }
     catch(e){this.listError=e.message;}
     const contacts=Object.values(this.contactState).filter(item=>item.status==='accepted'&&!this.engine?.state.deletedPeers?.[item.username]&&!this.engine?.state.hiddenContacts?.[item.username]).map(item=>item.username);
     const sessions=new Set();

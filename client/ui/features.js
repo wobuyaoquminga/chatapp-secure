@@ -31,5 +31,54 @@ function search(messages,user,peer,{query='',from='',to='',page=0,pageSize=20}={
  const q=query.trim().toLocaleLowerCase();const all=messages.filter(m=>((m.sender===user&&m.recipient===peer)||(m.sender===peer&&m.recipient===user))&&Date.parse(m.createdAt)>=start&&Date.parse(m.createdAt)<=end&&summary(m.body).toLocaleLowerCase().includes(q)).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
  const size=Math.max(1,Math.min(50,pageSize)),index=Math.max(0,Number.isSafeInteger(page)?page:0);return {total:all.length,items:all.slice(index*size,(index+1)*size)};
 }
-return {PREFIX,HOUR,parse,encode,summary,sessions,search};
+// One index belongs to one account snapshot. The caller replaces it whenever
+// the snapshot or account changes; only the most recent search is retained.
+function messageIndex(messages,user,server){
+ const byPeer=new Map(),bodyLower=new WeakMap();let cachedSearch=null,cachedRows=null;
+ for(const m of messages){
+  let peer;
+  if(m.sender===user&&m.recipient!==user)peer=m.recipient;
+  else if(m.recipient===user&&m.sender!==user)peer=m.sender;
+  else continue;
+  if(!byPeer.has(peer))byPeer.set(peer,[]);
+  byPeer.get(peer).push(m);
+ }
+ for(const rows of byPeer.values())rows.sort((a,b)=>a.createdAt.localeCompare(b.createdAt));
+ function forPeer(peer){return byPeer.get(peer)||[];}
+ function lowerBody(m){if(!bodyLower.has(m))bodyLower.set(m,m.body.toLocaleLowerCase());return bodyLower.get(m);}
+ function hasBodyMatch(peer,query){return forPeer(peer).some(m=>lowerBody(m).includes(query));}
+ function newestRows(peer){
+  if(cachedRows?.peer===peer)return cachedRows.rows;
+  const oldest=forPeer(peer),rows=[];
+  // Reverse timestamp groups, leaving equal-timestamp messages in input order.
+  for(let end=oldest.length;end>0;){let start=end-1;
+   while(start>0&&oldest[start-1].createdAt.localeCompare(oldest[end-1].createdAt)===0)start--;
+   for(let i=start;i<end;i++)rows.push({message:oldest[i],when:null,summaryLower:null});end=start;
+  }
+  cachedRows={peer,rows};return rows;
+ }
+ function find(peer,{query='',from='',to='',page=0,pageSize=20}={}){
+  const q=query.trim().toLocaleLowerCase(),key=JSON.stringify([peer,q,from,to]);
+  if(!cachedSearch||cachedSearch.key!==key){
+   const start=from?Date.parse(from+'T00:00:00'):-Infinity,end=to?Date.parse(to+'T23:59:59.999'):Infinity;
+   const matches=[];
+   for(const row of newestRows(peer)){
+    if(row.when===null)row.when=Date.parse(row.message.createdAt);
+    if(!(row.when>=start&&row.when<=end))continue;
+    if(!q){matches.push(row.message);continue;}
+    if(row.summaryLower===null){
+     const body=row.message.body;
+     if(body.startsWith(PREFIX))row.summaryLower=summary(body).toLocaleLowerCase();
+     else row.summaryLower=lowerBody(row.message);
+    }
+    if(row.summaryLower.includes(q))matches.push(row.message);
+   }
+   cachedSearch={key,matches};
+  }
+  const size=Math.max(1,Math.min(50,pageSize)),index=Math.max(0,Number.isSafeInteger(page)?page:0);
+  return {total:cachedSearch.matches.length,items:cachedSearch.matches.slice(index*size,(index+1)*size)};
+ }
+ return {user,server,messages:forPeer,hasBodyMatch,search:find};
+}
+return {PREFIX,HOUR,parse,encode,summary,sessions,search,messageIndex};
 });

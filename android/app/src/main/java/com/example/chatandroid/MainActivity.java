@@ -54,7 +54,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private String pendingLocationPeer = "", pendingLocationAction = "";
     private static final int LOCATION_PERMISSION = 501;
     private AlertDialog historyDialog;
-    private long historySearchGeneration;
+    private volatile long historySearchGeneration;
     private final Runnable expiryRefresh = new Runnable() {
         @Override public void run() {
             if (!destroyed && conversationStream != null) refreshLocationCards();
@@ -76,8 +76,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private MessageIndex messageIndex = new MessageIndex();
     private volatile long snapshotGeneration;
     private volatile boolean destroyed;
-    private static final int HISTORY_PAGE = 80;
-    private int historyLimit = HISTORY_PAGE;
+    private HistoryWindow historyWindow = HistoryWindow.latest(0);
     private int revealedHistoryIndex = -1;
     private LinearLayout conversationStream, messageResults, contactResults;
     private TextView conversationStatus;
@@ -554,8 +553,10 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private String visibleHistoryKey() {
         List<JSONObject> history = messageIndex.messages(detailPeer);
-        StringBuilder key = new StringBuilder().append(history.size()).append(':');
-        for (int i = Math.max(0, history.size() - historyLimit); i < history.size(); i++) key.append(history.get(i));
+        StringBuilder key = new StringBuilder().append(history.size()).append(':')
+                .append(historyWindow.start).append(':').append(historyWindow.end).append(':');
+        for (int i = historyWindow.start; i < Math.min(historyWindow.end, history.size()); i++)
+            key.append(messageIndex.rowKey(detailPeer, i)).append(':');
         return key.toString();
     }
 
@@ -572,7 +573,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             if (child.getBottom() > oldY) { anchor = child; anchorTop = child.getTop(); break; }
         }
         List<JSONObject> history = messageIndex.messages(detailPeer);
-        int start = Math.max(0, history.size() - historyLimit);
+        int start = historyWindow.start, end = Math.min(historyWindow.end, history.size());
         List<View> desired = new ArrayList<>();
         Map<String, View> retained = new HashMap<>();
         if (start > 0) {
@@ -580,16 +581,16 @@ public final class MainActivity extends Activity implements ChatController.Liste
             View older = messageViews.get(key);
             if (older == null) older = button("加载更早的消息（还有 " + start + " 条）", 14, GREEN, v -> {
                 // Loading is explicit; no record is removed from local storage.
-                historyLimit += HISTORY_PAGE;
+                historyWindow = historyWindow.older();
                 updateConversationStream(true);
             });
             retained.put(key, older);
             desired.add(older);
         }
-        for (int i = start; i < history.size(); i++) {
+        for (int i = start; i < end; i++) {
             JSONObject item = history.get(i);
             if (messageIndex.hidden(detailPeer, i) && i != revealedHistoryIndex) continue;
-            String key = messageViewKey(i, item);
+            String key = messageViewKey(i);
             View line = messageViews.get(key);
             if (line == null) {
                 MessageIndex.LocationCard card = messageIndex.card(detailPeer, i);
@@ -605,6 +606,26 @@ public final class MainActivity extends Activity implements ChatController.Liste
             }
             retained.put(key, line);
             desired.add(line);
+        }
+        if (historyWindow.hasNewer(history.size())) {
+            String key = "newer:" + end + ":" + history.size();
+            View newer = messageViews.get(key);
+            if (newer == null) newer = button("加载较新的消息（还有 " + (history.size() - end) + " 条）", 14, GREEN, v -> {
+                historyWindow = historyWindow.newer(messageIndex.messages(detailPeer).size());
+                updateConversationStream(true);
+            });
+            retained.put(key, newer);
+            desired.add(newer);
+            String latestKey = "latest:" + history.size();
+            View latest = messageViews.get(latestKey);
+            if (latest == null) latest = button("返回最新消息", 14, GREEN, v -> {
+                historyWindow = HistoryWindow.latest(messageIndex.messages(detailPeer).size());
+                revealedHistoryIndex = -1;
+                updateConversationStream(false);
+                scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+            });
+            retained.put(latestKey, latest);
+            desired.add(latest);
         }
         if (history.isEmpty()) {
             View empty = messageViews.get("empty");
@@ -636,9 +657,9 @@ public final class MainActivity extends Activity implements ChatController.Liste
         }
     }
 
-    private String messageViewKey(int index, JSONObject item) {
+    private String messageViewKey(int index) {
         MessageIndex.LocationCard card = messageIndex.card(detailPeer, index);
-        return index + ":" + item.toString() + (card == null ? "" : ":" + card.key());
+        return index + ":" + messageIndex.rowKey(detailPeer, index) + (card == null ? "" : ":" + card.key());
     }
 
     private View messageBubble(JSONObject item, MessageIndex.LocationCard location) {
@@ -804,10 +825,13 @@ public final class MainActivity extends Activity implements ChatController.Liste
             String q = query.getText().toString(), start = from.getText().toString(), end = to.getText().toString();
             pending[0] = () -> {
                 try { uiPreparation.execute(() -> {
+                    if (destroyed || token != historySearchGeneration) return;
                     List<Integer> matches;
                     String failure = "";
-                    try { matches = HistorySearch.find(records, q, start, end, java.time.ZoneId.systemDefault()); }
+                    try { matches = HistorySearch.find(records, q, start, end, java.time.ZoneId.systemDefault(),
+                            () -> destroyed || token != historySearchGeneration); }
                     catch (IllegalArgumentException invalid) { matches = new ArrayList<>(); failure = invalid.getMessage(); }
+                    if (destroyed || token != historySearchGeneration) return;
                     List<Integer> completed = matches; String error = failure;
                     main.post(() -> {
                         if (destroyed || token != historySearchGeneration || historyDialog == null || !historyDialog.isShowing()
@@ -838,17 +862,20 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private void jumpToMessage(JSONObject target) {
         List<JSONObject> history = messageIndex.messages(detailPeer);
         int index = -1;
+        String targetKey = null;
         for (int i = 0; i < history.size(); i++) {
             JSONObject item = history.get(i);
-            if (item.toString().equals(target.toString()) || (!target.optString("clientId").isEmpty()
+            if (item == target || (!target.optString("clientId").isEmpty()
                     && target.optString("clientId").equals(item.optString("clientId"))
                     && target.optString("sender").equals(item.optString("sender")))) { index = i; break; }
+            if (targetKey == null) targetKey = MessageIndex.rowKey(target);
+            if (targetKey.equals(messageIndex.rowKey(detailPeer, i))) { index = i; break; }
         }
         if (index < 0 || conversationScroll == null) return;
         revealedHistoryIndex = index;
-        historyLimit = Math.max(historyLimit, history.size() - index);
+        historyWindow = HistoryWindow.around(history.size(), index);
         updateConversationStream(false);
-        final String key = messageViewKey(index, history.get(index));
+        final String key = messageViewKey(index);
         conversationAtBottom = false;
         conversationScroll.post(() -> {
             View view = messageViews.get(key);
@@ -943,7 +970,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         saveDraft();
         detailPeer = peer;
         draft = drafts.getOrDefault(draftKey(peer), "");
-        historyLimit = HISTORY_PAGE;
+        historyWindow = HistoryWindow.latest(messageIndex.messages(peer).size());
         revealedHistoryIndex = -1;
         conversationAtBottom = true;
         conversationScrollY = 0;
@@ -1123,14 +1150,16 @@ public final class MainActivity extends Activity implements ChatController.Liste
         String oldHeader = headerKey();
         String oldBody = bodyKey();
         String oldHistory = detailPeer.isEmpty() ? "" : visibleHistoryKey();
-        int oldHistorySize = messageIndex.messages(detailPeer).size();
-        boolean readingHistory = conversationScroll != null && conversationStream != null
-                && conversationScroll.getScrollY() + conversationScroll.getHeight() < conversationStream.getHeight() - dp(48);
+        boolean readingHistory = !detailPeer.isEmpty() && (historyWindow.hasNewer(messageIndex.messages(detailPeer).size())
+                || conversationScroll != null && conversationStream != null
+                && conversationScroll.getScrollY() + conversationScroll.getHeight() < conversationStream.getHeight() - dp(48));
         JSONObject oldChanges = state.optJSONObject("identityChanges");
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
         messageIndex = prepared;
-        if (readingHistory) historyLimit += Math.max(0, messageIndex.messages(detailPeer).size() - oldHistorySize);
+        if (!detailPeer.isEmpty()) historyWindow = readingHistory
+                ? historyWindow.retain(messageIndex.messages(detailPeer).size())
+                : HistoryWindow.latest(messageIndex.messages(detailPeer).size());
         if (error != null && !error.isEmpty()) try { state.put("uiError", error); } catch (Exception ignored) { }
         if ((!wasSigned && signedIn()) || !previousServer.equals(server()) || wasSigned && !signedIn()
                 || !previousUsername.equals(state.optString("username"))) {
@@ -1141,7 +1170,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             loginUser = "";
             detailPeer = "";
             draft = "";
-            historyLimit = HISTORY_PAGE;
+            historyWindow = HistoryWindow.latest(0);
             revealedHistoryIndex = -1;
             page = "messages";
         }

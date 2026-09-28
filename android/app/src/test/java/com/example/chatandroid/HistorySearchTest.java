@@ -3,6 +3,8 @@ package com.example.chatandroid;
 import static org.junit.Assert.*;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -34,6 +36,15 @@ public class HistorySearchTest {
             try { HistorySearch.find(List.of(), "", bounds[0], bounds[1], ZoneId.of("UTC")); fail("expected validation"); }
             catch (IllegalArgumentException expected) { assertFalse(expected.getMessage().isEmpty()); }
         }
+    }
+    @Test public void cancelledSearchStopsBeforeScanningRemainingHistory() throws Exception {
+        List<JSONObject> records = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) records.add(record("a", "me", "needle", "2026-09-26T00:00:00Z"));
+        AtomicInteger checks = new AtomicInteger();
+        List<Integer> matches = HistorySearch.find(records, "needle", "", "", ZoneId.of("UTC"),
+                () -> checks.incrementAndGet() > 25);
+        assertTrue(matches.isEmpty());
+        assertEquals(26, checks.get());
     }
     @Test public void cacheRevisionReuseAndAccountChangeIsolation() throws Exception {
         JSONObject state = new JSONObject().put("username", "me").put("server", "https://a").put("messagesRevision", 1)

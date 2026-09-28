@@ -1,6 +1,7 @@
 const $=id=>document.getElementById(id);
 const F=window.ChatFeatures;let locationEpoch=0,live=null,watch=null,liveTimer=null,expiryTimer=null,searchTimer=null,searchPage=0,visibleEnd=null,historicalSnapshot=null,renderPeer='',messageNodes=new Map();
 let state={accounts:[],servers:[],contacts:[],sessions:[],contactStates:[],messages:[]};
+let indexedSnapshot=null,messageIndex=null;
 let selected=null,activePeer='',tab='sessions',settingsOpen=false,safetyResult=null,safetyPeer='',context='';
 const notice=message=>{$('notice').textContent=message||'';};
 async function command(action,payload){const result=await window.chat.command(action,payload);if(!result.ok)throw new Error(result.error);return result.value;}
@@ -29,13 +30,13 @@ function renderServers(){
   const list=$('serverList');list.replaceChildren();
   for(const address of state.servers||[]){const item=document.createElement('li');const pick=document.createElement('button');pick.type='button';pick.className='serverPick'+(address===server()?' active':'');pick.textContent=address;pick.onclick=()=>switchServer(address);item.append(pick);list.append(item);}
 }
-function peerMessages(peer){return (state.messages||[]).filter(message=>(message.sender===state.username&&message.recipient===peer)||(message.sender===peer&&message.recipient===state.username)).sort((a,b)=>a.createdAt.localeCompare(b.createdAt));}
+function peerMessages(peer){return messageIndex?.messages(peer)||[];}
 function contact(peer){return (state.contactStates||[]).find(item=>item.username===peer);}
 function peerStatus(peer){if(state.deletedPeers?.[peer])return '该用户已销户';if(state.identityChanges?.[peer])return '身份已更新，请重新核对';const item=contact(peer),presence=item?.online?'在线':'离线';if(item?.status==='pending_incoming')return presence+' · 等待你接受';if(item?.status==='pending_outgoing')return presence+' · 等待对方接受';if(item?.status==='accepted')return presence;return '尚未建立联系';}
 function peers(){
   const names=new Set(tab==='contacts'?state.contacts||[]:state.sessions||[]);names.delete(state.username);names.delete('');
   const query=$('peerSearch').value.trim().toLocaleLowerCase();
-  return [...names].map(name=>({name,messages:peerMessages(name)})).filter(item=>!query||item.name.toLocaleLowerCase().includes(query)||item.messages.some(message=>message.body.toLocaleLowerCase().includes(query))).sort((a,b)=>{
+  return [...names].map(name=>({name,messages:peerMessages(name)})).filter(item=>!query||item.name.toLocaleLowerCase().includes(query)||messageIndex.hasBodyMatch(item.name,query)).sort((a,b)=>{
     if(tab==='contacts')return a.name.localeCompare(b.name,'zh-CN');
     const at=a.messages.at(-1)?.createdAt||'',bt=b.messages.at(-1)?.createdAt||'';return bt.localeCompare(at)||a.name.localeCompare(b.name);
   });
@@ -77,6 +78,7 @@ function renderConversation(){
 async function openPeer(peer){try{if(activePeer!==peer)resetPanels();activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;if(!(state.sessions||[]).includes(peer))render(await command('openConversation',{peer}));else{renderPeers();renderConversation();}$('body').focus();}catch(error){notice(error.message);}}
 function render(next){
   const oldIdentity=context;if(live&&(!next.online||next.server!==state.server||next.username!==state.username))stopLive();state=next;const current=(state.username?state.server+'\0'+state.username:'')+'|'+server();
+  if(indexedSnapshot!==next||messageIndex?.user!==state.username||messageIndex?.server!==server()){messageIndex=F.messageIndex(state.messages||[],state.username,server());indexedSnapshot=next;}
   if(oldIdentity&&oldIdentity!==current){clearConversation();selected=null;$('username').value='';$('password').value='';$('peerSearch').value='';}
   context=current;
   const hasServer=!!server();$('serverSetup').hidden=hasServer||settingsOpen;$('auth').hidden=!hasServer||!!state.username||settingsOpen;$('chat').hidden=!state.username||settingsOpen;$('settings').hidden=!settingsOpen;
@@ -125,7 +127,7 @@ function renderMessages(jump){
  $('olderMessages').hidden=end<=100;
  if(jumpKey){const node=messageNodes.get(jumpKey);node?.scrollIntoView({block:'center'});node?.classList.add('highlight');setTimeout(()=>node?.classList.remove('highlight'),1800);}else if(wasBottom&&visibleEnd===null)log.scrollTop=log.scrollHeight;
 }
-function renderSearch(){if(!activePeer)return;const from=$('historyFrom').value,to=$('historyTo').value;if(from&&to&&from>to){$('historyCount').textContent='开始日期不能晚于结束日期';$('historyResults').replaceChildren();$('historyPrev').disabled=$('historyNext').disabled=true;return;}const result=F.search(state.messages||[],state.username,activePeer,{query:$('historyQuery').value,from,to,page:searchPage});$('historyCount').textContent=`共 ${result.total} 条 · 第 ${searchPage+1} 页`;$('historyPrev').disabled=searchPage===0;$('historyNext').disabled=(searchPage+1)*20>=result.total;$('historyResults').replaceChildren();for(const m of result.items){const row=document.createElement('li'),button=document.createElement('button');button.type='button';button.textContent=new Date(m.createdAt).toLocaleString()+' · '+F.summary(m.body);button.onclick=()=>renderMessages(m);row.append(button);$('historyResults').append(row);}}
+function renderSearch(){if(!activePeer)return;const from=$('historyFrom').value,to=$('historyTo').value;if(from&&to&&from>to){$('historyCount').textContent='开始日期不能晚于结束日期';$('historyResults').replaceChildren();$('historyPrev').disabled=$('historyNext').disabled=true;return;}const result=messageIndex.search(activePeer,{query:$('historyQuery').value,from,to,page:searchPage});$('historyCount').textContent=`共 ${result.total} 条 · 第 ${searchPage+1} 页`;$('historyPrev').disabled=searchPage===0;$('historyNext').disabled=(searchPage+1)*20>=result.total;$('historyResults').replaceChildren();for(const m of result.items){const row=document.createElement('li'),button=document.createElement('button');button.type='button';button.textContent=new Date(m.createdAt).toLocaleString()+' · '+F.summary(m.body);button.onclick=()=>renderMessages(m);row.append(button);$('historyResults').append(row);}}
 function closeMenu(){$('moreMenu').hidden=true;$('more').setAttribute('aria-expanded','false');}
 $('more').onclick=()=>{const open=$('moreMenu').hidden;$('moreMenu').hidden=!open;$('more').setAttribute('aria-expanded',String(open));};
 $('locationMenu').onclick=()=>{closeMenu();if(live)$('locationStatus').textContent='正在与 '+live.peer+' 共享位置；停止后可向当前联系人共享。';$('locationPanel').hidden=false;$('searchPanel').hidden=true;if(historicalSnapshot){historicalSnapshot=null;visibleEnd=null;renderMessages();}};$('findHistory').onclick=()=>{closeMenu();$('searchPanel').hidden=false;$('locationPanel').hidden=true;searchPage=0;renderSearch();$('historyQuery').focus();};

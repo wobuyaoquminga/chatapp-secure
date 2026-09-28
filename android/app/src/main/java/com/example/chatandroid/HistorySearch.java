@@ -7,17 +7,24 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.BooleanSupplier;
 
 /** Searches only the already decrypted cache for one conversation. Dates use device time zone. */
 final class HistorySearch {
     static final int PAGE_SIZE = 40;
     static List<Integer> find(List<JSONObject> history, String query, String from, String to, ZoneId zone) {
+        return find(history, query, from, to, zone, () -> false);
+    }
+    static List<Integer> find(List<JSONObject> history, String query, String from, String to, ZoneId zone,
+                              BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean()) return new ArrayList<>();
         LocalDate first = date(from), last = date(to);
         if (first != null && last != null && first.isAfter(last))
             throw new IllegalArgumentException("开始日期不能晚于结束日期");
         String needle = query.trim().toLowerCase(Locale.ROOT);
         List<Integer> matches = new ArrayList<>();
         for (int i = history.size() - 1; i >= 0; i--) {
+            if (cancelled.getAsBoolean()) return new ArrayList<>();
             JSONObject item = history.get(i);
             if (!item.has("body") || !preview(item).toLowerCase(Locale.ROOT).contains(needle)) continue;
             if (first != null || last != null) {

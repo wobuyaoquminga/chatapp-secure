@@ -8,10 +8,15 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
 
 /** Prepared off the UI thread. Reuses unchanged snapshots and indexes append deltas only. */
 final class MessageIndex {
     final Map<String, List<JSONObject>> history = new HashMap<>();
+    final Map<String, List<String>> rowKeys = new HashMap<>();
     final Map<String, JSONObject> latest = new HashMap<>();
     final List<String> conversations = new ArrayList<>();
     final List<String> contacts = new ArrayList<>();
@@ -49,6 +54,7 @@ final class MessageIndex {
                 && previous.revision == state.optLong("messagesBaseRevision", -2) && index.scope.equals(previous.scope);
         if (reuse || append) {
             index.history.putAll(previous.history); index.latest.putAll(previous.latest);
+            index.rowKeys.putAll(previous.rowKeys);
             index.locationCards.putAll(previous.locationCards); index.hiddenLocations.putAll(previous.hiddenLocations);
             index.sessions.putAll(previous.sessions);
         }
@@ -67,6 +73,13 @@ final class MessageIndex {
             List<JSONObject> records = index.history.computeIfAbsent(peer, key -> new ArrayList<>());
             int position = records.size();
             records.add(item);
+            // Controller snapshots reuse immutable message objects when only another row changed.
+            // Reuse their digest too, so a delivery receipt does not rehash the whole history.
+            List<JSONObject> prior = previous != null && index.scope.equals(previous.scope)
+                    ? previous.history.get(peer) : null;
+            String key = prior != null && position < prior.size() && prior.get(position) == item
+                    ? previous.rowKey(peer, position) : rowKey(item);
+            index.rowKeys.computeIfAbsent(peer, ignored -> new ArrayList<>()).add(key);
             LocationPayload location = LocationPayload.parse(item.optString("body"), System.currentTimeMillis());
             if (location != null) index.addLocation(peer, item.optString("sender"), position, location);
             index.latest.put(peer, item);
@@ -87,6 +100,7 @@ final class MessageIndex {
 
     private void copyPeer(String peer) {
         if (history.containsKey(peer)) history.put(peer, new ArrayList<>(history.get(peer)));
+        if (rowKeys.containsKey(peer)) rowKeys.put(peer, new ArrayList<>(rowKeys.get(peer)));
         if (hiddenLocations.containsKey(peer)) hiddenLocations.put(peer, new java.util.HashSet<>(hiddenLocations.get(peer)));
         Map<Integer, LocationCard> cards = locationCards.get(peer);
         if (cards != null) {
@@ -132,6 +146,14 @@ final class MessageIndex {
     List<JSONObject> messages(String peer) {
         List<JSONObject> result = history.get(peer);
         return result == null ? Collections.emptyList() : result;
+    }
+
+    String rowKey(String peer, int position) { return rowKeys.get(peer).get(position); }
+    static String rowKey(JSONObject item) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(item.toString().getBytes(StandardCharsets.UTF_8));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+        } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
 
     private static void names(JSONArray array, List<String> destination) {
