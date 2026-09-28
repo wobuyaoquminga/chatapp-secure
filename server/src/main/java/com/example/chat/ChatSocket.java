@@ -26,6 +26,8 @@ public class ChatSocket extends TextWebSocketHandler {
         String accountId;
         Instant expires;
         long cursor;
+        long callWindowStarted = System.nanoTime();
+        int callsInWindow;
         final Set<String> inFlight = new HashSet<>();
         Connection(WebSocketSession socket) { this.socket = new ConcurrentWebSocketSessionDecorator(socket, 5000, 128 * 1024); }
     }
@@ -85,6 +87,7 @@ public class ChatSocket extends TextWebSocketHandler {
                     }
                 }
                 case "ping" -> emit(c, Map.of("type", "pong"));
+                case "call" -> handleCall(c, request);
                 default -> throw new IllegalArgumentException("未知消息类型");
             }
         } catch (JwtException e) { close(c, "invalid token"); }
@@ -160,6 +163,58 @@ public class ChatSocket extends TextWebSocketHandler {
     }
     private void close(Connection c, String reason) {
         close(c, 1008, reason);
+    }
+    private void handleCall(Connection sender, JsonNode request) {
+        String callId = request.path("callId").isTextual() ? request.path("callId").textValue() : "";
+        try {
+            if (!request.isObject() || request.size() > 7) throw new IllegalArgumentException("通话字段无效");
+            var fields = request.fieldNames();
+            while (fields.hasNext())
+                if (!Set.of("type", "to", "toAccountId", "callId", "action", "mode", "payload").contains(fields.next()))
+                    throw new IllegalArgumentException("通话字段无效");
+            callId = field(request, "callId");
+            if (callId.length() != 36 || !callId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
+                throw new IllegalArgumentException("callId 必须为 UUID");
+            String peer = field(request, "to");
+            if (!Username.valid(peer) || peer.equals(sender.user)) throw new IllegalArgumentException("通话对象无效");
+            String accountId = field(request, "toAccountId");
+            if (accountId.length() != 36 || !accountId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
+                throw new IllegalArgumentException("toAccountId 必须为 UUID");
+            String action = field(request, "action"), mode = field(request, "mode");
+            if (!Set.of("offer", "answer", "ice", "reject", "busy", "hangup").contains(action))
+                throw new IllegalArgumentException("通话动作无效");
+            if (!Set.of("audio", "video").contains(mode)) throw new IllegalArgumentException("通话模式无效");
+            boolean hasPayload = request.has("payload");
+            String payload = hasPayload ? field(request, "payload") : null;
+            if (Set.of("offer", "answer", "ice").contains(action) && (payload == null || payload.isBlank()))
+                throw new IllegalArgumentException("通话信令内容缺失");
+            if (!Set.of("offer", "answer", "ice").contains(action) && hasPayload)
+                throw new IllegalArgumentException("此通话动作不允许携带内容");
+            int payloadLimit = "ice".equals(action) ? 4096 : 65536;
+            if (payload != null && (payload.length() > payloadLimit || payload.isBlank()))
+                throw new IllegalArgumentException("通话信令内容无效");
+            long now = System.nanoTime();
+            if (now - sender.callWindowStarted >= 1_000_000_000L) {
+                sender.callWindowStarted = now; sender.callsInWindow = 0;
+            }
+            if (++sender.callsInWindow > 30) throw new IllegalArgumentException("通话信令发送过于频繁");
+            if (!store.currentGeneration(peer, accountId)) throw new IllegalArgumentException("对方设备身份已更新");
+            var contact = store.contact(sender.user, peer);
+            if (contact == null || !"accepted".equals(contact.status())) throw new IllegalArgumentException("双方须先互相接受联系人请求");
+            List<Connection> targets = connections.values().stream()
+                .filter(c -> peer.equals(c.user) && accountId.equals(c.accountId) && c.socket.isOpen()
+                    && c.expires != null && Instant.now().isBefore(c.expires))
+                .toList();
+            if (targets.isEmpty()) throw new IllegalArgumentException("对方当前不在线");
+            Map<String, Object> event = new HashMap<>(Map.of("type", "call", "from", sender.user,
+                "fromAccountId", sender.accountId, "callId", callId, "action", action, "mode", mode));
+            if (payload != null) event.put("payload", payload);
+            boolean delivered = false;
+            for (Connection target : targets) delivered |= emit(target, event);
+            if (!delivered) throw new IllegalArgumentException("对方当前不在线");
+        } catch (IllegalArgumentException e) {
+            emit(sender, Map.of("type", "call_error", "callId", callId.length() <= 36 ? callId : "", "error", e.getMessage()));
+        }
     }
     private void close(Connection c, int code, String reason) {
         remove(c);

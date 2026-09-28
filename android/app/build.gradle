@@ -7,8 +7,8 @@ android {
         applicationId 'com.example.chatandroid'
         minSdk 26
         targetSdk 35
-        versionCode 5
-        versionName '0.3.2'
+        versionCode 6
+        versionName '0.4.0'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildFeatures { buildConfig true }
@@ -50,6 +50,7 @@ dependencies {
     implementation 'org.signal:libsignal-client:0.103.0'
     implementation 'org.signal:libsignal-android:0.103.0'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'io.github.webrtc-sdk:android:150.7871.01'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'
     androidTestImplementation 'androidx.test:runner:1.6.2'

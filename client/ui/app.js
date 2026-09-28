@@ -9,7 +9,7 @@ const accountKey=account=>account.server+'\0'+account.user;
 const server=()=>state.selectedServer||state.server||(state.servers||[])[0]||'';
 const accounts=()=>((state.accounts||[]).filter(account=>account.server===server()));
 function resetPanels(){ $('moreMenu').hidden=true;$('more').setAttribute('aria-expanded','false');$('locationPanel').hidden=true;$('searchPanel').hidden=true;$('historyQuery').value='';$('historyFrom').value='';$('historyTo').value='';searchPage=0;clearTimeout(searchTimer);clearInterval(expiryTimer);expiryTimer=null;visibleEnd=null;historicalSnapshot=null;renderPeer='';messageNodes.clear();}
-function clearConversation(){resetPanels();activePeer='';safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;}
+function clearConversation(){resetPanels();activePeer='';safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;calls.snapshot();}
 function useAccount(account){selected=account;$('username').value=account.user;$('username').readOnly=true;$('register').hidden=true;$('usernameLabel').hidden=true;$('password').focus();renderAccountSelection();}
 function useNewAccount(){selected=null;$('username').value='';$('username').readOnly=false;$('usernameLabel').hidden=false;$('register').hidden=false;renderAccountSelection();$('username').focus();}
 function renderAccountSelection(){$('registrationWarning').hidden=$('register').hidden;for(const item of document.querySelectorAll('#accountList .account'))item.classList.toggle('active',!!selected&&item.dataset.key===accountKey(selected));}
@@ -75,7 +75,7 @@ function renderConversation(){
   renderMessages();if(!$('searchPanel').hidden)renderSearch();
 
 }
-async function openPeer(peer){try{if(activePeer!==peer)resetPanels();activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;if(!(state.sessions||[]).includes(peer))render(await command('openConversation',{peer}));else{renderPeers();renderConversation();}$('body').focus();}catch(error){notice(error.message);}}
+async function openPeer(peer){try{if(activePeer!==peer)resetPanels();activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;if(!(state.sessions||[]).includes(peer))render(await command('openConversation',{peer}));else{renderPeers();renderConversation();}calls.snapshot();$('body').focus();}catch(error){notice(error.message);}}
 function render(next){
   const oldIdentity=context;if(live&&(!next.online||next.server!==state.server||next.username!==state.username))stopLive();state=next;const current=(state.username?state.server+'\0'+state.username:'')+'|'+server();
   if(indexedSnapshot!==next||messageIndex?.user!==state.username||messageIndex?.server!==server()){messageIndex=F.messageIndex(state.messages||[],state.username,server());indexedSnapshot=next;}
@@ -84,7 +84,7 @@ function render(next){
   const hasServer=!!server();$('serverSetup').hidden=hasServer||settingsOpen;$('auth').hidden=!hasServer||!!state.username||settingsOpen;$('chat').hidden=!state.username||settingsOpen;$('settings').hidden=!settingsOpen;
   $('authServer').textContent=server();$('identity').textContent=state.username||'';$('connection').textContent=state.status||'';
   $('accountSettings').hidden=!state.username;$('settingsAccount').textContent=state.username?state.username+' · '+state.server:'';
-  if(!state.username)renderAccounts();renderServers();renderPeers();renderConversation();if(state.error)notice(state.error);
+  if(!state.username)renderAccounts();renderServers();renderPeers();renderConversation();calls.snapshot();if(state.error)notice(state.error);
 }
 async function forgetAccount(account){try{if(selected&&accountKey(selected)===accountKey(account)){selected=null;$('username').value='';}render(await command('forgetAccount',{server:account.server,user:account.user}));notice('已从列表移除 '+account.user+'；本机密钥和受保护的历史缓存仍保留。');}catch(error){notice(error.message);}}
 async function saveServer(address){await stopLive();try{render(await command('saveServer',{server:address.trim()}));settingsOpen=false;render(state);notice('服务器已保存。');}catch(error){notice(error.message);}}
@@ -107,6 +107,8 @@ $('sendForm').onsubmit=async event=>{event.preventDefault();if(!activePeer)retur
 $('history').onclick=async()=>{try{render(await command('history',{peer:activePeer}));notice('已同步服务器回执；历史正文来自本机受保护的缓存。');}catch(error){notice(error.message);}};
 $('safety').onclick=async()=>{try{safetyPeer=activePeer;safetyResult=await command('safety',{peer:safetyPeer});$('safetyCode').textContent=safetyResult.code.match(/.{1,5}/g).join(' ');$('safetyPanel').hidden=false;$('verification').textContent=safetyResult.verified?'安全码已核对':'请通过可信渠道核对安全码';}catch(error){notice(error.message);}};
 $('confirmSafety').onclick=async()=>{try{if(!safetyResult||safetyPeer!==activePeer)throw new Error('请重新获取安全码');safetyResult=await command('safety',{peer:safetyPeer,confirm:true,expectedCode:safetyResult.code});$('verification').textContent='安全码已核对';notice('核对结果已在本机保存，身份密钥变化将被阻止。');}catch(error){notice(error.message);}};
+const calls=window.ChatCalls.create({command,notice,getState:()=>state,getPeer:()=>activePeer});
+window.chat.onCall(event=>calls.onEvent(event));
 window.chat.subscribe(render);
 command('snapshot').then(render).catch(error=>notice(error.message));
 function messageKey(m){return m.sender+':'+m.clientId;}

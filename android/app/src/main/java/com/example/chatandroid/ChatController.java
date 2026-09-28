@@ -38,6 +38,9 @@ final class ChatController {
         void onState(JSONObject snapshot, String error);
         void onSafety(String peer, JSONObject result);
         void onSent();
+        void onCall(JSONObject frame, long context);
+        void onCallReady(CallSession session, JSONArray iceServers, long context);
+        void onCallContextLost();
     }
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
@@ -84,6 +87,46 @@ final class ChatController {
     private final java.util.Map<String,JSONObject> cleanMessageCache = new java.util.HashMap<>();
     void setLocationStoppedListener(Runnable stopped) { locationStopped = stopped; }
     long locationContext() { return generation; }
+    void prepareCall(String peer, String mode) {
+        execute(() -> {
+            String account = requireCallPeer(peer);
+            CallSession session = new CallSession(java.util.UUID.randomUUID().toString(), peer, account, mode, true);
+            JSONArray ice = iceServers();
+            long context = generation;
+            main.post(() -> listener.onCallReady(session, ice, context));
+        });
+    }
+    void prepareIncomingCall(CallSession session, long expectedContext) {
+        execute(() -> {
+            if (expectedContext != generation || !session.accountId.equals(requireCallPeer(session.peer))) return;
+            JSONArray ice = iceServers();
+            main.post(() -> listener.onCallReady(session, ice, expectedContext));
+        });
+    }
+    private JSONArray iceServers() {
+        try {
+            JSONArray list = requestObject("/api/calls/ice", "GET", null).optJSONArray("iceServers");
+            if (list != null && list.length() > 0) return list;
+        } catch (Exception ignored) { /* Public STUN is a best effort fallback. */ }
+        return new JSONArray().put(new JSONObject(java.util.Map.of("urls", "stun:stun.l.google.com:19302")));
+    }
+    void sendCall(CallSession session, String action, String payload, long expectedContext) {
+        execute(() -> {
+            if (expectedContext != generation || !session.accountId.equals(requireCallPeer(session.peer))) return;
+            WebSocket current = socket;
+            if (current == null || !current.send(session.frame(action, payload).toString()))
+                throw new Exception("通话连接已断开");
+        });
+    }
+    private String requireCallPeer(String peer) throws Exception {
+        requirePeer(peer);
+        if (!online || !"accepted".equals(relationship(peer))) throw new Exception("通话需要双方已接受联系人请求并在线");
+        if (engine.isDeleted(peer) || engine.state().getJSONObject("identityChanges").has(peer))
+            throw new Exception("请先核对联系人设备身份");
+        String account = engine.state().getJSONObject("peerAccountIds").optString(peer);
+        if (account.isEmpty()) throw new Exception("请先在此会话发送消息并确认联系人身份");
+        return account;
+    }
     void sendPin(String peer, double latitude, double longitude, double accuracy) { sendPin(peer,latitude,longitude,accuracy,generation); }
     void sendPin(String peer, double latitude, double longitude, double accuracy, long expectedContext) {
         execute(() -> {
@@ -549,6 +592,7 @@ final class ChatController {
         if (epoch != generation || reconnectPending || token == null) return;
         cancelAuthTimeout();
         online = false;
+        main.post(listener::onCallContextLost);
         stopLiveInternal();
         notifyLocationStopped();
         socket = null;
@@ -584,7 +628,7 @@ final class ChatController {
                 } catch (Exception error) { pauseAccountSync(error); return; }
                 online = true;
                 backoff.reset();
-                status = "在线 · 端到端加密";
+                status = "在线 · 消息端到端加密";
                 JSONObject outbox = engine.state().getJSONObject("outbox");
                 Iterator<String> ids = outbox.keys();
                 while (ids.hasNext()) wire(outbox.getJSONObject(ids.next()));
@@ -627,6 +671,21 @@ final class ChatController {
                 JSONObject present = relationships.optJSONObject(event.optString("username"));
                 if (present != null) present.put("online", event.optBoolean("online"));
                 break;
+            case "call":
+                if (!online) return;
+                String caller = event.optString("from");
+                if (validUser(caller) && "accepted".equals(relationship(caller))
+                        && engine != null && !engine.isDeleted(caller)
+                        && !engine.state().getJSONObject("identityChanges").has(caller)
+                        && event.optString("fromAccountId").equals(
+                            engine.state().getJSONObject("peerAccountIds").optString(caller))) {
+                    long context = generation;
+                    main.post(() -> listener.onCall(event, context));
+                }
+                return;
+            case "call_error":
+                main.post(() -> listener.onCall(event, generation));
+                return;
             case "accepted":
                 transaction(() -> { engine.accepted(event.getJSONObject("message")); return null; });
                 break;
@@ -703,6 +762,7 @@ final class ChatController {
     }
 
     private void clearSession() {
+        main.post(listener::onCallContextLost);
         cancelReconnect();
         cancelAuthTimeout();
         backoff.reset();
@@ -727,6 +787,7 @@ final class ChatController {
     }
 
     private void stopConnection(String reason, Exception error) {
+        main.post(listener::onCallContextLost);
         ++generation;
         cancelReconnect();
         cancelAuthTimeout();
@@ -824,6 +885,7 @@ final class ChatController {
             if (engine != null) {
                 snapshot.put("deletedPeers", new JSONObject(engine.state().getJSONObject("deletedPeers").toString()));
                 snapshot.put("identityChanges", new JSONObject(engine.state().getJSONObject("identityChanges").toString()));
+                snapshot.put("peerAccountIds", new JSONObject(engine.state().getJSONObject("peerAccountIds").toString()));
                 JSONObject hiddenContacts = engine.state().getJSONObject("hiddenContacts");
                 JSONObject hiddenConversations = engine.state().getJSONObject("hiddenConversations");
                 Iterator<String> deleted = engine.state().getJSONObject("deletedPeers").keys();

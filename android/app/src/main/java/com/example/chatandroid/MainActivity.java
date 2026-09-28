@@ -50,6 +50,12 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private static final int BG = Color.rgb(246, 248, 247);
     private static final int BORDER = Color.rgb(228, 233, 230);
     private ChatController controller;
+    private WebRtcCall call;
+    private static final int CALL_PERMISSION = 502;
+    private String pendingCallMode = "", pendingCallPeer = "";
+    private long pendingCallContext;
+    private boolean callToolsExpanded, callPreparing;
+    private LinearLayout callActions;
     private LocationSharing locationSharing;
     private String pendingLocationPeer = "", pendingLocationAction = "";
     private static final int LOCATION_PERMISSION = 501;
@@ -119,6 +125,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         shell.requestApplyInsets();
         render();
         controller = new ChatController(this, this);
+        call = new WebRtcCall(this, controller);
         locationSharing = new LocationSharing(this, controller, (live, peer, notice) -> main.post(() -> {
             if (!destroyed && notice != null && !notice.isEmpty() && !notice.startsWith("正在分享实时位置")) Toast.makeText(this, notice, Toast.LENGTH_LONG).show();
             if (!destroyed) { header.removeAllViews(); renderHeader(signedIn()); }
@@ -136,10 +143,14 @@ public final class MainActivity extends Activity implements ChatController.Liste
         main.removeCallbacks(expiryRefresh);
         if (locationSharing != null) locationSharing.stopLive();
         pendingLocationPeer = pendingLocationAction = "";
+        callPreparing = false;
+        pendingCallPeer = pendingCallMode = "";
+        if (call != null && call.busy()) call.finish("应用进入后台，通话结束", true, "hangup");
         super.onStop();
     }
 
     @Override protected void onDestroy() {
+        if (call != null) call.finish("", true, "hangup");
         destroyed = true;
         snapshotGeneration++;
         uiPreparation.shutdownNow();
@@ -151,6 +162,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     @Override public void onBackPressed() {
+        callToolsExpanded = false;
         if (!detailPeer.isEmpty()) {
             saveDraft();
             detailPeer = "";
@@ -541,7 +553,22 @@ public final class MainActivity extends Activity implements ChatController.Liste
         });
         sendButton.setEnabled(canSend);
         bar.addView(sendButton, new LinearLayout.LayoutParams(dp(62), dp(44)));
+        TextView callToggle = button("＋", 27, GREEN, v -> {
+            callToolsExpanded = !callToolsExpanded;
+            if (callActions != null) callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
+        });
+        callToggle.setContentDescription("展开通话选项");
+        bar.addView(callToggle, new LinearLayout.LayoutParams(dp(44), dp(44)));
         body.addView(bar);
+        callActions = row();
+        callActions.setBackgroundColor(Color.WHITE);
+        callActions.setPadding(dp(12), dp(4), dp(12), dp(12));
+        callActions.addView(button("语音通话", 16, GREEN, v -> requestCallPermissions("audio")),
+                new LinearLayout.LayoutParams(0, dp(48), 1));
+        callActions.addView(button("视频通话", 16, GREEN, v -> requestCallPermissions("video")),
+                new LinearLayout.LayoutParams(0, dp(48), 1));
+        callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
+        body.addView(callActions);
         content.addView(body);
         boolean atBottom = conversationAtBottom;
         int previousY = conversationScrollY;
@@ -768,6 +795,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(code, permissions, grants);
+        if (code == CALL_PERMISSION) {
+            if (callPermissionsGranted(pendingCallMode)) beginPermittedCall();
+            else {
+                if (call != null && call.busy()) call.finish("需要麦克风和摄像头权限", true, "reject");
+                else Toast.makeText(this, "通话需要麦克风和摄像头权限", Toast.LENGTH_LONG).show();
+                pendingCallMode = pendingCallPeer = "";
+            }
+            return;
+        }
         if (code != LOCATION_PERMISSION) return;
         String peer = pendingLocationPeer, action = pendingLocationAction;
         pendingLocationPeer = pendingLocationAction = "";
@@ -966,7 +1002,75 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private void openPeer(String peer) { openPeer(peer, false); }
 
+    void requestCallPermissions(String mode) {
+        if (call == null || controller == null) return;
+        if (call.busy()) {
+            pendingCallPeer = call.session().peer;
+            pendingCallMode = call.session().mode;
+            pendingCallContext = call.context();
+        } else {
+            if (callPreparing) return;
+            if (!"accepted".equals(relation(detailPeer)) || isDeleted(detailPeer) || identityChanged(detailPeer)
+                    || !state.optBoolean("online")) {
+                Toast.makeText(this, "请先连接服务器并与已接受的联系人通话", Toast.LENGTH_LONG).show();
+                return;
+            }
+            pendingCallPeer = detailPeer;
+            pendingCallMode = mode;
+            pendingCallContext = controller.locationContext();
+        }
+        if (callPermissionsGranted(pendingCallMode)) beginPermittedCall();
+        else requestPermissions(pendingCallMode.equals("video")
+                ? new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA}
+                : new String[]{Manifest.permission.RECORD_AUDIO}, CALL_PERMISSION);
+    }
+
+    private boolean callPermissionsGranted(String mode) {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                && (!"video".equals(mode) || checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED);
+    }
+
+    private void beginPermittedCall() {
+        String peer = pendingCallPeer, mode = pendingCallMode;
+        pendingCallPeer = pendingCallMode = "";
+        if (peer.isEmpty() || pendingCallContext != controller.locationContext()) return;
+        if (call.busy()) controller.prepareIncomingCall(call.session(), call.context());
+        else {
+            callPreparing = true;
+            controller.prepareCall(peer, mode);
+        }
+    }
+
+    @Override public void onCallReady(CallSession session, JSONArray iceServers, long context) {
+        callPreparing = false;
+        if (destroyed || call == null) return;
+        if (session.outgoing && call.busy()) return;
+        if (!session.outgoing && call.session() != session) return;
+        call.start(session, iceServers, context);
+    }
+
+    @Override public void onCall(JSONObject frame, long context) {
+        if (destroyed || call == null) return;
+        if ("call_error".equals(frame.optString("type"))) { call.error(frame); return; }
+        String action = frame.optString("action");
+        if (action.equals("offer")) {
+            try {
+                CallSession incoming = new CallSession(frame.getString("callId"), frame.getString("from"),
+                        frame.getString("fromAccountId"), frame.getString("mode"), false);
+                if (call.busy() || callPreparing) controller.sendCall(incoming, "busy", null, context);
+                else call.ring(incoming, CallSession.parseSdpPayload("offer", frame.getString("payload")), context);
+            } catch (Exception ignored) { }
+        } else call.signal(frame);
+    }
+
+    @Override public void onCallContextLost() {
+        callPreparing = false;
+        pendingCallPeer = pendingCallMode = "";
+        if (call != null) call.finish("连接已断开，通话结束", false, null);
+    }
+
     private void openPeer(String peer, boolean reopen) {
+        callToolsExpanded = false;
         saveDraft();
         detailPeer = peer;
         draft = drafts.getOrDefault(draftKey(peer), "");
@@ -1156,6 +1260,23 @@ public final class MainActivity extends Activity implements ChatController.Liste
         JSONObject oldChanges = state.optJSONObject("identityChanges");
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
+        if (call != null && call.busy()) {
+            CallSession active = call.session();
+            JSONObject relations = state.optJSONObject("relationships");
+            JSONObject relation = relations == null ? null : relations.optJSONObject(active.peer);
+            JSONObject deletedPeers = state.optJSONObject("deletedPeers");
+            JSONObject changes = state.optJSONObject("identityChanges");
+            JSONObject accountIds = state.optJSONObject("peerAccountIds");
+            if (!state.optBoolean("online") || !state.optString("username").equals(previousUsername)
+                    || !server().equals(previousServer) || relation == null
+                    || !"accepted".equals(relation.optString("status"))
+                    || deletedPeers != null && deletedPeers.has(active.peer)
+                    || changes != null && changes.has(active.peer)
+                    || accountIds == null || !active.accountId.equals(accountIds.optString(active.peer))
+                    || call.context() != controller.locationContext())
+                call.finish("通话已结束", false, null);
+        }
+        if (error != null && !error.isEmpty()) callPreparing = false;
         messageIndex = prepared;
         if (!detailPeer.isEmpty()) historyWindow = readingHistory
                 ? historyWindow.retain(messageIndex.messages(detailPeer).size())

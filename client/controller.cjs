@@ -13,6 +13,7 @@ class Controller {
     this.registry=new AccountRegistry(directory,safeStorage);this.queue=Promise.resolve();this.generation=0;
     this.connectionOptions={...DEFAULT_CONNECTION_OPTIONS,...connectionOptions};this.retryAttempt=0;
     this.status='未登录';this.online=false;this.contactState={};this.liveSessions=new Map();
+    this.call=null;
   }
   serial(task) { const run=this.queue.then(task);this.queue=run.catch(()=>{});return run; }
   snapshot() {
@@ -42,7 +43,10 @@ class Controller {
       identityChanges:this.engine?.state.identityChanges||{},
       messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>m) : []};
   }
-  update(error) { this.notify({...this.snapshot(),error:error||this.listError||''}); }
+  update(error) {
+    if(this.call){try{if(this.call.accountId!==this.callPeer(this.call.peer))this.endCall('联系人身份已变化');}catch{this.endCall('联系人状态已变化');}}
+    this.notify({...this.snapshot(),error:error||this.listError||''});
+  }
   async transaction(task) {
     if(this.storageFailed)throw new Error('本地保存失败后已暂停加解密，请退出并重新登录');
     const previous=structuredClone(this.engine.state);
@@ -75,7 +79,7 @@ class Controller {
     if(!validUser(username)) throw new Error('用户名限 2–32 位中文、小写字母、数字、下划线');
     this.server=url.origin;
     const auth=await this.request('/api/auth/'+(register?'register':'login'),'POST',{username,password});
-    this.token=auth.token;this.user=username;
+    this.token=auth.token;this.user=username;this.accountId=auth.accountId;
     try {
       this.vault=new Vault(this.vaults,this.server,username,this.safeStorage);
       const saved=this.vault.read();this.engine=saved ? new SignalEngine(saved) : await SignalEngine.create(username);
@@ -116,7 +120,7 @@ class Controller {
       this.vault.write(state); // Persist candidate keys before remote commit; history is kept once.
     }
     const auth=await this.request('/api/keys/reset','POST',{password,bundle:await candidate.publicBundle()});
-    this.token=auth.token;candidate.state.accountId=auth.accountId;
+    this.token=auth.token;this.accountId=auth.accountId;candidate.state.accountId=auth.accountId;
     await this.promoteIdentity(candidate);
   }
   normalizeServer(server) {
@@ -230,7 +234,7 @@ class Controller {
     socket.on('close',(code)=>this.serial(async()=>{
       if(epoch!==this.generation)return;
       this.clearConnectionTimers();this.socket=null;
-      this.online=false;this.liveSessions.clear();
+      this.online=false;this.liveSessions.clear();this.endCall('连接已断开');
       if(this.storageFailed){this.status='本地保存失败，已暂停连接，请退出并重新登录';this.update();return;}
       if(code===1008||this.authFailed){this.status='认证已失效，请退出后重新登录';this.update();return;}
       this.status='离线，正在重连';this.update();
@@ -239,6 +243,47 @@ class Controller {
     socket.on('error',()=>{});
   }
   wire(value) {if(this.socket?.readyState===WebSocket.OPEN)this.socket.send(JSON.stringify(value));}
+  callPeer(peer) {
+    if(!this.online||this.socket?.readyState!==WebSocket.OPEN)throw new Error('通话需要在线连接');
+    if(!validUser(peer)||peer===this.user||this.contactState[peer]?.status!=='accepted'||this.engine?.state.deletedPeers?.[peer]||this.engine?.state.identityChanges?.[peer])throw new Error('只能与已接受且身份未变化的联系人通话');
+    const accountId=this.engine?.state.peerAccountIds?.[peer]||this.contactState[peer]?.accountId;
+    if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(accountId||''))throw new Error('联系人账号信息未就绪，请刷新联系人');
+    return accountId;
+  }
+  endCall(reason) {if(this.call){this.call=null;this.notify({type:'call_end',reason});}}
+  cancelCall({callId}) {if(this.call?.callId===callId)this.endCall('通话已结束');return true;}
+  async callIce() {
+    if(!this.online)throw new Error('离线时不能通话');
+    const data=await this.request('/api/calls/ice');
+    if(!Array.isArray(data.iceServers))throw new Error('ICE 配置格式无效');
+    return data.iceServers;
+  }
+  beginCall({peer,callId,mode}) {
+    const accountId=this.callPeer(peer);
+    if(this.call||!['audio','video'].includes(mode)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(callId||''))throw new Error('当前无法开始通话');
+    this.call={peer,callId,mode,accountId,generation:this.generation,userApproved:true};return true;
+  }
+  approveCall({callId}) {if(!this.call||this.call.callId!==callId||this.call.userApproved||this.call.generation!==this.generation)throw new Error('来电已失效');this.callPeer(this.call.peer);this.call.userApproved=true;return true;}
+  sendCall({peer,callId,action,mode,payload}) {
+    const toAccountId=this.callPeer(peer);
+    if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(callId||'')||!['offer','answer','ice','reject','busy','hangup'].includes(action)||!['audio','video'].includes(mode)||(['offer','answer','ice'].includes(action)?typeof payload!=='string'||!payload.trim()||payload.length>(action==='ice'?4096:65536):payload!==undefined))throw new Error('通话信令无效');
+    if(!this.call||this.call.peer!==peer||this.call.callId!==callId||this.call.mode!==mode||this.call.accountId!==toAccountId||this.call.generation!==this.generation)throw new Error('通话已结束或联系人身份已变化');
+    if(['offer','answer','ice'].includes(action)&&!this.call.userApproved)throw new Error('尚未接听来电');
+    this.wire({type:'call',to:peer,toAccountId,callId,action,mode,...(payload===undefined?{}:{payload})});
+    if(['hangup','reject','busy'].includes(action))this.endCall('通话已结束');
+    return true;
+  }
+  receiveCall(event) {
+    if(!this.online||!validUser(event.from)||!['offer','answer','ice','reject','busy','hangup'].includes(event.action)||!['audio','video'].includes(event.mode)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(event.callId||'')||(['offer','answer','ice'].includes(event.action)?typeof event.payload!=='string'||!event.payload.trim()||event.payload.length>(event.action==='ice'?4096:65536):event.payload!==undefined))return;
+    let accountId;try{accountId=this.callPeer(event.from);}catch{return;}
+    if(event.fromAccountId!==accountId)return;
+    if(event.action==='offer'){
+      if(this.call){this.wire({type:'call',to:event.from,toAccountId:accountId,callId:event.callId,action:'busy',mode:event.mode});return;}
+      this.call={peer:event.from,callId:event.callId,mode:event.mode,accountId,generation:this.generation,userApproved:false};
+    }else if(!this.call||this.call.peer!==event.from||this.call.callId!==event.callId||this.call.mode!==event.mode||this.call.accountId!==accountId)return;
+    this.notify({type:'call',event:{type:'call',from:event.from,fromAccountId:accountId,callId:event.callId,action:event.action,mode:event.mode,...(typeof event.payload==='string'?{payload:event.payload}:{})}});
+    if(['reject','busy','hangup'].includes(event.action))this.endCall('对方已结束通话');
+  }
   async bindPeerIdentity(peer,info) {
     const retired=this.engine.state.deletedPeers?.[peer];
     if(retired) {
@@ -297,11 +342,13 @@ class Controller {
       await this.request('/api/account-events/ack','POST',{ids:events.slice(start,start+1000).map(event=>event.id)});
   }
   async event(event) {
+    if(event.type==='call'){this.receiveCall(event);return;}
+    if(event.type==='call_error'){if(this.call&&event.callId===this.call.callId){this.notify({type:'call_error',event});this.endCall(event.error||'通话信令失败');}return;}
     if(event.type==='ready') {
       this.online=false;this.status='同步账号状态';
       await this.syncAccountEvents();
       await this.refreshContacts();
-      this.online=true;this.status='在线 · 端到端加密';
+      this.online=true;this.status='在线 · 消息端到端加密';
       for(const item of Object.values(this.engine.state.outbox))this.wire(item);
     } else if(['account_deleted','identity_reset'].includes(event.type)) {
       await this.applyAccountEvent({...event.event,kind:event.type});
@@ -436,8 +483,8 @@ class Controller {
     this.update();return this.snapshot();
   }
   logout() {
-    this.liveSessions.clear();++this.generation;this.clearConnectionTimers();this.socket?.close();this.socket=null;this.retryAttempt=0;this.authFailed=false;
-    this.user=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.update();
+    this.endCall('账号已退出');this.liveSessions.clear();++this.generation;this.clearConnectionTimers();this.socket?.close();this.socket=null;this.retryAttempt=0;this.authFailed=false;
+    this.user=null;this.accountId=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.update();
   }
 }
 module.exports={Controller,validUser};

@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; media-src 'self' blob:; base-uri 'none'; form-action 'none'">
   <title>Chat</title>
-  <link rel="stylesheet" href="style.css"><script defer src="features.js"></script><script defer src="app.js"></script>
+  <link rel="stylesheet" href="style.css"><script defer src="features.js"></script><script defer src="calls.js"></script><script defer src="app.js"></script>
 </head>
 <body>
 <main>
@@ -51,11 +51,13 @@
         <section id="searchPanel" class="featurePanel" hidden><div class="panelHeading"><strong>查找聊天记录</strong><button id="closeSearch" type="button" class="textButton">关闭</button></div><div class="historyFilters"><input id="historyQuery" type="search" placeholder="搜索当前聊天正文"><label>开始日期<input id="historyFrom" type="date"></label><label>结束日期<input id="historyTo" type="date"></label></div><p id="historyCount"></p><ul id="historyResults"></ul><div class="actions"><button id="historyPrev" type="button" class="secondary">上一页</button><button id="historyNext" type="button" class="secondary">下一页</button></div><p class="fineprint">仅搜索当前账号本机已保存的历史；同步回执不会恢复丢失的正文。</p></section>
         <div id="messages" role="log" aria-live="polite"></div>
         <button id="olderMessages" type="button" class="textButton" hidden>查看更早消息</button>
-        <form id="sendForm" class="composer"><label for="body" class="srOnly">消息</label><textarea id="body" maxlength="4000" rows="2" required placeholder="发送消息…"></textarea><button id="send" type="submit">发送</button></form>
+        <form id="sendForm" class="composer"><label for="body" class="srOnly">消息</label><textarea id="body" maxlength="4000" rows="2" required placeholder="发送消息…"></textarea><button id="send" type="submit">发送</button><button id="toggleCallActions" type="button" class="secondary" aria-label="更多操作" aria-expanded="false" aria-controls="callActions">＋</button></form>
+        <div id="callActions" class="callActions" hidden><button id="startAudioCall" type="button" class="secondary">语音通话</button><button id="startVideoCall" type="button" class="secondary">视频通话</button></div>
         <p class="deliveryNote">“服务器已保存密文”不等于送达；“对方客户端已接收”不代表已读。</p>
       </div>
     </div>
   </section>
+  <section id="callPanel" class="callPanel" role="dialog" aria-modal="true" aria-label="通话" hidden><div class="callCard"><h2 id="callPeer"></h2><p id="callStatus" role="status"></p><div id="callVideos" class="callVideos" hidden><video id="remoteVideo" autoplay playsinline></video><video id="localVideo" autoplay muted playsinline></video></div><audio id="remoteAudio" autoplay></audio><div class="callControls"><button id="acceptCall" type="button" hidden>接听</button><button id="rejectCall" type="button" class="secondary" hidden>拒绝</button><button id="muteCall" type="button" class="secondary" hidden>静音</button><button id="hangupCall" type="button">挂断</button></div></div></section>
   <section id="settings" class="settings" hidden>
     <div class="settingsHeading"><button id="closeSettings" type="button" class="textButton">← 返回</button><h1>设置</h1></div>
     <h2>服务器</h2><p class="muted">选择服务器后，只显示这台服务器上的账号和联系人。</p><ul id="serverList" class="serverList"></ul>

@@ -581,6 +581,70 @@ class ChatIntegrationTest {
             assertThat(history(fresh, sender.name())).hasSize(1);
         }
     }
+    @Test void callSignalsReachOnlyAcceptedCurrentOnlineContact() throws Exception {
+        var caller = account(); var callee = account();
+        String callId = UUID.randomUUID().toString();
+        var offer = Map.of("type", "call", "to", callee.name(), "toAccountId", accountId(callee),
+            "callId", callId, "action", "offer", "mode", "video", "payload", "test-sdp");
+        try (var a = new Client(caller); var b = new Client(callee)) {
+            a.send(offer);
+            assertThat(a.await("call_error").path("error").asText()).contains("联系人");
+            send(a, callee, "invite", UUID.randomUUID().toString()); b.await("message");
+            a.send(offer);
+            assertThat(a.await("call_error").path("error").asText()).contains("联系人");
+            accept(callee, caller);
+            a.send(offer);
+            var received = b.await("call");
+            assertThat(received.path("from").asText()).isEqualTo(caller.name());
+            assertThat(received.path("fromAccountId").asText()).isEqualTo(accountId(caller));
+            assertThat(received.path("callId").asText()).isEqualTo(callId);
+            assertThat(received.path("action").asText()).isEqualTo("offer");
+            assertThat(received.path("mode").asText()).isEqualTo("video");
+            assertThat(received.path("payload").asText()).isEqualTo("test-sdp");
+            b.send(Map.of("type", "call", "to", caller.name(), "toAccountId", accountId(caller),
+                "callId", callId, "action", "answer", "mode", "video", "payload", "answer-sdp"));
+            assertThat(a.await("call").path("payload").asText()).isEqualTo("answer-sdp");
+            assertThat(history(caller, callee.name())).hasSize(1);
+        }
+        try (var a = new Client(caller)) {
+            a.send(offer);
+            assertThat(a.await("call_error").path("error").asText()).contains("不在线");
+        }
+    }
+    @Test void callRejectsStaleGenerationBadPayloadAndRemovedContact() throws Exception {
+        var caller = account(); var callee = account();
+        store.save(caller.name(), callee.name(), UUID.randomUUID().toString(), wire("invite"));
+        accept(callee, caller);
+        try (var a = new Client(caller); var b = new Client(callee)) {
+            String callId = UUID.randomUUID().toString();
+            var request = new HashMap<String, Object>(Map.of("type", "call", "to", callee.name(),
+                "toAccountId", accountId(callee), "callId", callId, "action", "ice", "mode", "audio", "payload", "candidate"));
+            request.put("callId", "bad"); a.send(request);
+            assertThat(a.await("call_error").path("error").asText()).contains("UUID");
+            request.put("callId", callId); request.remove("payload"); a.send(request);
+            assertThat(a.await("call_error").path("error").asText()).contains("缺失");
+            request.put("payload", "x".repeat(4097)); a.send(request);
+            assertThat(a.await("call_error").path("error").asText()).contains("无效");
+            request.put("action", "hangup"); request.put("payload", "not-allowed"); a.send(request);
+            assertThat(a.await("call_error").path("error").asText()).contains("不允许");
+            request.put("action", "ice");
+            request.put("payload", "candidate"); request.put("toAccountId", UUID.randomUUID().toString()); a.send(request);
+            assertThat(a.await("call_error").path("error").asText()).contains("身份已更新");
+            a.send(Map.of("type", "ping")); a.await("pong");
+            request.put("toAccountId", accountId(callee));
+            remove(caller, callee); a.awaitContactStatus(callee.name(), "removed"); b.awaitContactStatus(caller.name(), "removed");
+            a.send(request);
+            assertThat(a.await("call_error").path("error").asText()).contains("联系人");
+        }
+    }
+    @Test void iceEndpointRequiresJwtAndUsesConfiguredStun() {
+        assertThat(rest.getForEntity("/api/calls/ice", String.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        var a = account();
+        var response = rest.exchange("/api/calls/ice", HttpMethod.GET, auth(a), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody().path("iceServers").get(0).path("urls").get(0).asText())
+            .isEqualTo("stun:stun.l.google.com:19302");
+    }
     private String token(String username, Instant expiry) {
         var claims = JwtClaimsSet.builder().issuer("chat").subject(username)
             .claim("account_id", db.queryForObject("SELECT account_id FROM app_users WHERE username=?", String.class, username))

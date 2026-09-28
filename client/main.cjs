@@ -4,6 +4,7 @@ const path=require('node:path');
 const {pathToFileURL}=require('node:url');
 const {Controller}=require('./controller.cjs');
 const {NativeLocation}=require('./native-location.cjs');
+const {MediaLease}=require('./media-permission.cjs');
 const nativeLocation=new NativeLocation();
 const profileArg=process.argv.find(a=>a.startsWith('--profile='));
 const profile=profileArg?profileArg.slice(10):'default';
@@ -34,23 +35,25 @@ const testAppData=profile.startsWith('qa-migrate-')&&process.argv.includes('--te
 app.setPath('userData',userDataRoot(testAppData||app.getPath('appData')));
 if(!app.requestSingleInstanceLock()){app.quit();}else{
   let window,controller,geoUntil=0,geoPeer='',geoGeneration=-1;
+  const mediaLease=new MediaLease();
   app.on('second-instance',()=>{window?.show();window?.focus();});
   app.whenReady().then(()=>{
     const entry=path.join(__dirname,'ui','index.html');
     // Chromium upper-cases the drive letter of a file: URL while Node keeps the case it was
     // launched with, so both sides are folded before comparing, exactly as Windows paths are.
     const entryUrl=pathToFileURL(entry).href.toLowerCase();
-    controller=new Controller(app.getPath('userData'),safeStorage,event=>{if(window&&!window.isDestroyed())window.webContents.send('chat:event',event);});
+    controller=new Controller(app.getPath('userData'),safeStorage,event=>{if(window&&!window.isDestroyed())window.webContents.send(event?.type?.startsWith('call')?'chat:call':'chat:event',event);});
     window=new BrowserWindow({width:1040,height:900,minWidth:560,minHeight:650,show:false,title:'Chat',
       icon:path.join(__dirname,'assets','icon.ico'),
       webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,devTools:!app.isPackaged}});
     window.removeMenu();window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
     window.webContents.on('will-navigate',event=>event.preventDefault());
     const geoAllowed=(contents,permission,details)=>['geolocation','geolocation-approximate'].includes(permission)&&contents===window.webContents&&Date.now()<geoUntil&&window.isFocused()&&details?.isMainFrame===true&&details.requestingUrl?.toLowerCase()===entryUrl;
-    session.defaultSession.setPermissionRequestHandler((contents,permission,callback,details)=>callback(geoAllowed(contents,permission,details)));
-    session.defaultSession.setPermissionCheckHandler((contents,permission,_origin,details)=>geoAllowed(contents,permission,details));
-    window.on('blur',()=>{geoUntil=0;nativeLocation.cancel();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations());});
-    let closing=false;window.on('close',event=>{geoUntil=0;nativeLocation.cancel();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).finally(()=>window.destroy());});
+    const mediaAllowed=(contents,permission,details)=>permission==='media'&&contents===window.webContents&&window.isFocused()&&mediaLease.allows({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame,mediaTypes:details?.mediaTypes||(details?.mediaType?[details.mediaType]:null),server:controller.server,generation:controller.generation,call:controller.call});
+    session.defaultSession.setPermissionRequestHandler((contents,permission,callback,details)=>callback(geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details)));
+    session.defaultSession.setPermissionCheckHandler((contents,permission,_origin,details)=>geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details));
+    window.on('blur',()=>{geoUntil=0;mediaLease.revoke();nativeLocation.cancel();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations());});
+    let closing=false;window.on('close',event=>{geoUntil=0;mediaLease.revoke();nativeLocation.cancel();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).finally(()=>window.destroy());});
     ipcMain.handle('chat:command',async(event,{action,payload})=>{
       if(event.sender!==window.webContents||event.senderFrame.url.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
       if(action==='sendLocation'&&!window.isFocused()&&require('./ui/features.js').parse(payload?.body)?.kind!=='stop')return {ok:false,error:'请在应用前台发送位置'};
@@ -64,13 +67,21 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
         geoPeer=payload.peer;geoGeneration=controller.generation;geoUntil=Date.now()+(payload?.live?3600000:30000);return {ok:true,value:true};
       }
       if(action==='revokeLocationPermission'){geoUntil=0;nativeLocation.cancel();return {ok:true,value:true};}
-      if(!['sendLocation','stopLocations','login','send','history','safety','logout','forgetAccount','forgetServer','saveServer','selectServer','addContact','acceptContact','removeContact','clearConversation','openConversation','refreshContacts','snapshot'].includes(action))throw new Error('Unsupported command');
+      if(action==='callMediaPermission'){
+        try{
+          if(!window.isFocused()||!controller.online||!controller.call?.userApproved||controller.call.peer!==payload?.peer||controller.call.callId!==payload?.callId||controller.call.mode!==payload?.mode)throw new Error('通话媒体授权已失效');
+          if(controller.normalizeServer(controller.server)!==controller.server||controller.callPeer(payload.peer)!==controller.call.accountId)throw new Error('通话服务器或联系人身份已变化');
+          mediaLease.grant({server:controller.server,generation:controller.generation,callId:payload.callId,mode:payload.mode});return {ok:true,value:true};
+        }catch(e){return {ok:false,error:e.message};}
+      }
+      if(action==='revokeCallMediaPermission'){mediaLease.revoke();return {ok:true,value:true};}
+      if(!['beginCall','approveCall','cancelCall','sendCall','callIce','sendLocation','stopLocations','login','send','history','safety','logout','forgetAccount','forgetServer','saveServer','selectServer','addContact','acceptContact','removeContact','clearConversation','openConversation','refreshContacts','snapshot'].includes(action))throw new Error('Unsupported command');
       return controller.serial(async()=>{
-        try{if(['logout','login','saveServer','selectServer','forgetServer'].includes(action)){geoUntil=0;nativeLocation.cancel();await controller.stopLocations();}return {ok:true,value:await controller[action](payload)}}catch(e){return {ok:false,error:e.message}}
+        try{if(['logout','login','saveServer','selectServer','forgetServer'].includes(action)){geoUntil=0;mediaLease.revoke();nativeLocation.cancel();await controller.stopLocations();}return {ok:true,value:await controller[action](payload)}}catch(e){return {ok:false,error:e.message}}
       });
     });
     window.loadFile(entry);window.once('ready-to-show',()=>{if(!process.argv.includes('--test-hidden'))window.show();});
   });
   app.on('window-all-closed',()=>app.quit());
-  app.on('before-quit',()=>{nativeLocation.cancel();controller?.logout();});
+  app.on('before-quit',()=>{mediaLease.revoke();nativeLocation.cancel();controller?.logout();});
 }
