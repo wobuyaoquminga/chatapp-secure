@@ -20,6 +20,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
 
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -59,6 +61,9 @@ final class ChatController {
     private boolean online;
     private boolean storageFailed;
     private boolean reconnectPending;
+    private final ReconnectBackoff backoff = new ReconnectBackoff();
+    private ScheduledFuture<?> reconnectTask;
+    private ScheduledFuture<?> authTimeout;
     private SecureVault vault;
     private SignalEngine engine;
     private volatile WebSocket socket;
@@ -426,6 +431,11 @@ final class ChatController {
     }
 
     private void pauseAccountSync(Exception error) {
+        if (storageFailed || isAuthenticationFailure(error)) {
+            stopConnection(storageFailed ? "本地保存失败后已暂停加解密，请退出并重新登录"
+                    : "认证已失效，请退出后重新登录", error);
+            return;
+        }
         online = false;
         stopLiveInternal();
         status = "账号状态同步失败，正在重连";
@@ -475,7 +485,9 @@ final class ChatController {
     }
 
     private void connect() {
-        if (token == null) return;
+        if (closed || token == null || storageFailed) return;
+        cancelReconnect();
+        cancelAuthTimeout();
         long epoch = ++generation;
         reconnectPending = false;
         online = false;
@@ -486,9 +498,12 @@ final class ChatController {
             @Override public void onOpen(WebSocket webSocket, Response response) {
                 post(() -> {
                     if (epoch == generation && token != null) {
-                        try { webSocket.send(new JSONObject().put("type", "auth")
-                                .put("token", token).toString()); }
-                        catch (Exception error) { publish(error.getMessage()); }
+                        try {
+                            if (!webSocket.send(new JSONObject().put("type", "auth")
+                                    .put("token", token).toString())) webSocket.cancel();
+                        } catch (Exception error) { webSocket.cancel(); publish(readable(error)); }
+                    } else {
+                        webSocket.cancel();
                     }
                 });
             }
@@ -497,7 +512,12 @@ final class ChatController {
                 post(() -> {
                     if (epoch != generation) return;
                     try { event(new JSONObject(text)); }
-                    catch (Exception error) { publish("消息未确认：" + readable(error)); }
+                    catch (Exception error) {
+                        if (storageFailed || isAuthenticationFailure(error))
+                            stopConnection(storageFailed ? "本地保存失败后已暂停加解密，请退出并重新登录"
+                                    : "认证已失效，请退出后重新登录", error);
+                        else publish("消息未确认：" + readable(error));
+                    }
                 });
             }
 
@@ -517,14 +537,26 @@ final class ChatController {
                 post(() -> disconnected(epoch, response != null ? response.code() : 0));
             }
         });
+        authTimeout = worker.schedule(() -> {
+            if (epoch == generation && !online && socket != null) {
+                socket.cancel();
+                disconnected(epoch, 0);
+            }
+        }, 20, TimeUnit.SECONDS);
     }
 
     private void disconnected(long epoch, int code) {
         if (epoch != generation || reconnectPending || token == null) return;
+        cancelAuthTimeout();
         online = false;
         stopLiveInternal();
         notifyLocationStopped();
         socket = null;
+        if (storageFailed) {
+            status = "本地保存失败后已暂停加解密，请退出并重新登录";
+            publish("");
+            return;
+        }
         if (code == 1008 || code == 401 || code == 403) {
             status = "认证已失效，请退出后重新登录";
             publish("");
@@ -533,19 +565,25 @@ final class ChatController {
         status = "离线，正在重连";
         reconnectPending = true;
         publish("");
-        worker.schedule(() -> { if (!closed && epoch == generation) connect(); }, 2, TimeUnit.SECONDS);
+        long delay = backoff.nextDelayMillis(ThreadLocalRandom.current().nextDouble());
+        reconnectTask = worker.schedule(() -> {
+            reconnectTask = null;
+            if (!closed && epoch == generation && reconnectPending) connect();
+        }, delay, TimeUnit.MILLISECONDS);
     }
 
     private void event(JSONObject event) throws Exception {
         String type = event.optString("type", "");
         switch (type) {
             case "ready":
+                cancelAuthTimeout();
                 online = false;
                 try {
                     syncAccountEvents();
                     refreshContacts();
                 } catch (Exception error) { pauseAccountSync(error); return; }
                 online = true;
+                backoff.reset();
                 status = "在线 · 端到端加密";
                 JSONObject outbox = engine.state().getJSONObject("outbox");
                 Iterator<String> ids = outbox.keys();
@@ -665,6 +703,9 @@ final class ChatController {
     }
 
     private void clearSession() {
+        cancelReconnect();
+        cancelAuthTimeout();
+        backoff.reset();
         stopLiveInternal();
         notifyLocationStopped();
         ++generation;
@@ -685,10 +726,43 @@ final class ChatController {
         status = "未登录";
     }
 
+    private void stopConnection(String reason, Exception error) {
+        ++generation;
+        cancelReconnect();
+        cancelAuthTimeout();
+        online = false;
+        reconnectPending = false;
+        stopLiveInternal();
+        notifyLocationStopped();
+        WebSocket current = socket;
+        socket = null;
+        if (current != null) current.cancel();
+        status = reason;
+        publish(reason + "：" + readable(error));
+    }
+
+    private static boolean isAuthenticationFailure(Exception error) {
+        return error instanceof HttpFailure
+                && (((HttpFailure) error).code == 401 || ((HttpFailure) error).code == 403);
+    }
+
+    private void cancelReconnect() {
+        if (reconnectTask != null) { reconnectTask.cancel(false); reconnectTask = null; }
+    }
+
+    private void cancelAuthTimeout() {
+        if (authTimeout != null) { authTimeout.cancel(false); authTimeout = null; }
+    }
+
     private void execute(CheckedAction action) {
         post(() -> {
             try { action.run(); }
-            catch (Exception error) { publish(readable(error)); }
+            catch (Exception error) {
+                if (token != null && (storageFailed || isAuthenticationFailure(error)))
+                    stopConnection(storageFailed ? "本地保存失败后已暂停加解密，请退出并重新登录"
+                            : "认证已失效，请退出后重新登录", error);
+                else publish(readable(error));
+            }
         });
     }
 

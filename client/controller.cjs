@@ -1,14 +1,17 @@
 const path=require('node:path');
+const crypto=require('node:crypto');
 const WebSocket=require('ws');
 const {SignalEngine}=require('./signal.cjs');
 const {Vault,AccountRegistry}=require('./vault.cjs');
 const Location=require('./ui/features.js');
 const validUser=user=>typeof user==='string'&&/^[a-z0-9_\p{Script=Han}]{2,32}$/u.test(user);
+const DEFAULT_CONNECTION_OPTIONS={readyTimeoutMs:30000,heartbeatIntervalMs:30000,pongTimeoutMs:10000,retryBaseMs:1000,retryMaxMs:30000,random:Math.random};
 
 class Controller {
-  constructor(directory,safeStorage,notify) {
+  constructor(directory,safeStorage,notify,connectionOptions={}) {
     this.vaults=path.join(directory,'vaults');this.safeStorage=safeStorage;this.notify=notify;
     this.registry=new AccountRegistry(directory,safeStorage);this.queue=Promise.resolve();this.generation=0;
+    this.connectionOptions={...DEFAULT_CONNECTION_OPTIONS,...connectionOptions};this.retryAttempt=0;
     this.status='未登录';this.online=false;this.contactState={};this.liveSessions=new Map();
   }
   serial(task) { const run=this.queue.then(task);this.queue=run.catch(()=>{});return run; }
@@ -46,7 +49,14 @@ class Controller {
       try{this.vault.write(this.engine.state);}catch(e){this.storageFailed=true;throw e;}
       return result;
     }
-    catch(e) { this.engine.state=previous;throw e; }
+    catch(e) {
+      this.engine.state=previous;
+      if(this.storageFailed){
+        this.online=false;this.status='本地保存失败，已暂停连接，请退出并重新登录';
+        this.socket?.terminate();this.update();
+      }
+      throw e;
+    }
   }
   async request(endpoint,method='GET',body) {
     const response=await fetch(this.server+endpoint,{method,redirect:'error',signal:AbortSignal.timeout(15000),
@@ -157,28 +167,72 @@ class Controller {
     await this.request('/api/keys','PUT',bundle);
     await this.transaction(()=>{this.engine.state.pendingUpload=[];});
   }
+  clearConnectionTimers() {
+    clearTimeout(this.retry);clearTimeout(this.readyTimeout);clearTimeout(this.pongTimeout);clearInterval(this.heartbeat);
+    this.retry=this.readyTimeout=this.pongTimeout=this.heartbeat=null;
+    this.pingChallenge=null;
+  }
+  retryDelay() {
+    const {retryBaseMs,retryMaxMs,random}=this.connectionOptions;
+    const ceiling=Math.min(retryMaxMs,retryBaseMs*2**Math.min(this.retryAttempt++,30));
+    return Math.floor(ceiling*(0.5+Math.min(1,Math.max(0,random()))/2));
+  }
   connect() {
+    if(this.storageFailed||this.authFailed||!this.token||!this.server)return;
+    this.clearConnectionTimers();
     const epoch=++this.generation;
     this.status='连接中';this.online=false;this.update();
     const socket=new WebSocket(this.server.replace(/^http/,'ws')+'/ws',{maxPayload:131072,handshakeTimeout:10000});this.socket=socket;
-    socket.on('open',()=>{if(epoch===this.generation)socket.send(JSON.stringify({type:'auth',token:this.token}));});
-    socket.on('message',data=>this.serial(async()=>{
+    socket.on('open',()=>{
       if(epoch!==this.generation)return;
-      let event;
-      try { event=JSON.parse(data.toString());await this.event(event); }
-      catch(e){
-        if(['ready','account_deleted','identity_reset'].includes(event?.type)){
-          this.online=false;this.status='账号状态同步失败，正在重连';socket.close();
-        }
-        this.update('消息未确认：'+e.message);
+      this.readyTimeout=setTimeout(()=>{if(epoch===this.generation&&socket.readyState===WebSocket.OPEN)socket.terminate();},this.connectionOptions.readyTimeoutMs);
+      this.heartbeat=setInterval(()=>{
+        if(epoch!==this.generation||socket.readyState!==WebSocket.OPEN)return;
+        if(this.pongTimeout){socket.terminate();return;}
+        const challenge=crypto.randomBytes(8);this.pingChallenge=challenge;
+        this.pongTimeout=setTimeout(()=>{if(epoch===this.generation&&socket.readyState===WebSocket.OPEN)socket.terminate();},this.connectionOptions.pongTimeoutMs);
+        try{socket.ping(challenge);}catch{socket.terminate();}
+      },this.connectionOptions.heartbeatIntervalMs);
+      try{socket.send(JSON.stringify({type:'auth',token:this.token}));}catch{socket.terminate();}
+    });
+    socket.on('pong',data=>{
+      if(epoch===this.generation&&this.pingChallenge?.equals(data)){
+        clearTimeout(this.pongTimeout);this.pongTimeout=null;this.pingChallenge=null;
       }
-    }));
+    });
+    socket.on('message',data=>{
+      let event,parseError;
+      try{event=JSON.parse(data.toString());}
+      catch(e){parseError=e;}
+      // The ready frame has arrived even if an earlier message is still being processed.
+      if(event?.type==='ready'&&epoch===this.generation){clearTimeout(this.readyTimeout);this.readyTimeout=null;}
+      this.serial(async()=>{
+        if(epoch!==this.generation)return;
+        try {
+          if(parseError)throw parseError;
+          await this.event(event);
+          if(event?.type==='ready'&&socket.readyState===WebSocket.OPEN&&epoch===this.generation)this.retryAttempt=0;
+        }
+        catch(e){
+          if(this.storageFailed){this.online=false;this.status='本地保存失败，已暂停连接，请退出并重新登录';socket.terminate();}
+          if(event?.type==='ready'&&(e.status===401||e.status===403)){
+            this.authFailed=true;this.online=false;this.status='认证已失效，请退出后重新登录';socket.terminate();
+          }
+          if(['ready','account_deleted','identity_reset'].includes(event?.type)){
+            if(!this.storageFailed&&!this.authFailed){this.online=false;this.status='账号状态同步失败，正在重连';socket.close();}
+          }
+          this.update('消息未确认：'+e.message);
+        }
+      });
+    });
     socket.on('close',(code)=>this.serial(async()=>{
       if(epoch!==this.generation)return;
+      this.clearConnectionTimers();this.socket=null;
       this.online=false;this.liveSessions.clear();
-      if(code===1008){this.status='认证已失效，请退出后重新登录';this.update();return;}
+      if(this.storageFailed){this.status='本地保存失败，已暂停连接，请退出并重新登录';this.update();return;}
+      if(code===1008||this.authFailed){this.status='认证已失效，请退出后重新登录';this.update();return;}
       this.status='离线，正在重连';this.update();
-      this.retry=setTimeout(()=>{if(epoch===this.generation)this.connect();},2000);
+      this.retry=setTimeout(()=>{if(epoch===this.generation&&!this.storageFailed&&!this.authFailed)this.connect();},this.retryDelay());
     }));
     socket.on('error',()=>{});
   }
@@ -380,7 +434,7 @@ class Controller {
     this.update();return this.snapshot();
   }
   logout() {
-    this.liveSessions.clear();++this.generation;clearTimeout(this.retry);this.socket?.close();this.socket=null;
+    this.liveSessions.clear();++this.generation;this.clearConnectionTimers();this.socket?.close();this.socket=null;this.retryAttempt=0;this.authFailed=false;
     this.user=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.update();
   }
 }

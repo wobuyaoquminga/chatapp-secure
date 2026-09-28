@@ -123,7 +123,7 @@ public class ChatSocket extends TextWebSocketHandler {
         try {
             if (!c.socket.isOpen()) return false;
             c.socket.sendMessage(new TextMessage(json.writeValueAsString(event))); return true;
-        } catch (Exception e) { close(c, "connection unavailable"); return false; }
+        } catch (Exception e) { close(c, 1011, "connection unavailable"); return false; }
     }
     public synchronized boolean isOnline(String user) {
         Instant now = Instant.now();
@@ -159,8 +159,11 @@ public class ChatSocket extends TextWebSocketHandler {
             notifyPresence(c.user, false);
     }
     private void close(Connection c, String reason) {
+        close(c, 1008, reason);
+    }
+    private void close(Connection c, int code, String reason) {
         remove(c);
-        try { c.socket.close(new CloseStatus(1008, reason)); } catch (IOException ignored) { }
+        try { c.socket.close(new CloseStatus(code, reason)); } catch (IOException ignored) { }
     }
     public synchronized void disconnectDeletedAccount(String user, String accountId) {
         for (Connection c : List.copyOf(connections.values()))
@@ -182,6 +185,6 @@ public class ChatSocket extends TextWebSocketHandler {
         Connection c = connections.get(socket.getId()); if (c != null) remove(c);
     }
     @Override public synchronized void handleTransportError(WebSocketSession socket, Throwable error) {
-        Connection c = connections.get(socket.getId()); if (c != null) close(c, "transport error");
+        Connection c = connections.get(socket.getId()); if (c != null) close(c, 1011, "transport error");
     }
 }
