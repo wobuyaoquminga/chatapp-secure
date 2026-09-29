@@ -121,17 +121,54 @@ server {
     }
 }
 EOF
+cp -p "$conf" "$work/nginx-before-https"
+cp -p /etc/chat/chat.env "$work/chat.env"
+renew_service=/etc/systemd/system/chat-certbot-renew.service
+renew_timer=/etc/systemd/system/chat-certbot-renew.timer
+reload_hook=/etc/letsencrypt/renewal-hooks/deploy/chat-nginx-reload
+had_renew_service=0
+had_renew_timer=0
+had_reload_hook=0
+timer_was_enabled=0
+timer_was_active=0
+if [[ -f $renew_service ]]; then cp -p "$renew_service" "$work/renew.service"; had_renew_service=1; fi
+if [[ -f $renew_timer ]]; then cp -p "$renew_timer" "$work/renew.timer"; had_renew_timer=1; fi
+if [[ -f $reload_hook ]]; then cp -p "$reload_hook" "$work/reload-hook"; had_reload_hook=1; fi
+if systemctl is-enabled --quiet chat-certbot-renew.timer; then timer_was_enabled=1; fi
+if systemctl is-active --quiet chat-certbot-renew.timer; then timer_was_active=1; fi
+rollback_https() {
+  local status=$?
+  trap - EXIT
+  set +e
+  if (( status != 0 )); then
+    cp -p "$work/nginx-before-https" "$conf"
+    cp -p "$work/chat.env" /etc/chat/chat.env
+    if nginx -t; then systemctl reload nginx || true; fi
+    systemctl restart chat.service || true
+    systemctl disable --now chat-certbot-renew.timer || true
+    if (( had_renew_service )); then cp -p "$work/renew.service" "$renew_service"; else rm -f "$renew_service"; fi
+    if (( had_renew_timer )); then cp -p "$work/renew.timer" "$renew_timer"; else rm -f "$renew_timer"; fi
+    if (( had_reload_hook )); then cp -p "$work/reload-hook" "$reload_hook"; else rm -f "$reload_hook"; fi
+    systemctl daemon-reload || true
+    if (( timer_was_enabled )); then systemctl enable chat-certbot-renew.timer || true; fi
+    if (( timer_was_active )); then systemctl start chat-certbot-renew.timer || true; fi
+    echo 'HTTPS 配置未通过检查，已恢复之前的 nginx、应用来源和证书续期设置。' >&2
+  fi
+  rm -rf -- "$work"
+  exit "$status"
+}
+trap rollback_https EXIT
 apply_config "$work/https"
 install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-cat > /etc/letsencrypt/renewal-hooks/deploy/chat-nginx-reload <<'EOF'
+cat > "$reload_hook" <<'EOF'
 #!/usr/bin/env bash
 # Managed by chat enable-ip-https.sh
 set -euo pipefail
 /usr/sbin/nginx -t
 /usr/bin/systemctl reload nginx
 EOF
-chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/chat-nginx-reload
-cat > /etc/systemd/system/chat-certbot-renew.service <<EOF
+chmod 0755 "$reload_hook"
+cat > "$renew_service" <<EOF
 $marker
 [Unit]
 Description=Renew Chat short-lived IP TLS certificate
@@ -141,7 +178,7 @@ After=network-online.target
 Type=oneshot
 ExecStart=/opt/chat-certbot/bin/certbot renew --non-interactive --cert-name $certname
 EOF
-cat > /etc/systemd/system/chat-certbot-renew.timer <<EOF
+cat > "$renew_timer" <<EOF
 $marker
 [Unit]
 Description=Check Chat IP certificate renewal twice daily
@@ -155,7 +192,6 @@ EOF
 systemctl daemon-reload
 systemctl enable --now chat-certbot-renew.timer
 # Set only the origin entry; never print or source application secrets.
-cp -p /etc/chat/chat.env "$work/chat.env"
 if grep -q '^CHAT_ALLOWED_ORIGINS=' /etc/chat/chat.env; then
   sed -i "s|^CHAT_ALLOWED_ORIGINS=.*|CHAT_ALLOWED_ORIGINS=https://$ip|" /etc/chat/chat.env
 else

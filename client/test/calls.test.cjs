@@ -55,6 +55,19 @@ test('incoming call is busy while one call exists and old call errors cannot end
   }finally{f.close();}
 });
 
+test('repeated offer keeps the same incoming call and end event identifies its call',()=>{
+  const f=fixture(),id=crypto.randomUUID(),offer={type:'call',from:'bob',fromAccountId:peerId,callId:id,mode:'audio',action:'offer',payload:'sdp'};
+  try{
+    f.controller.receiveCall(offer);
+    f.controller.receiveCall(offer);
+    assert.equal(f.controller.call.callId,id);
+    assert.equal(f.sent.filter(frame=>frame.action==='busy').length,0);
+    assert.equal(f.events.filter(event=>event.type==='call').length,1);
+    f.controller.cancelCall({callId:id});
+    assert.equal(f.events.at(-1).callId,id);
+  }finally{f.close();}
+});
+
 test('media permission requires matching foreground document, server, call and media type',()=>{
   let now=1000;const lease=new MediaLease(()=>now),id=crypto.randomUUID();
   lease.grant({server:'https://chat.example',generation:5,callId:id,mode:'audio'});
@@ -64,8 +77,8 @@ test('media permission requires matching foreground document, server, call and m
   now+=20001;assert.equal(lease.allows(request),false);
 });
 
-function uiFixture() {
-  const elements=new Map(),sent=[],pcs=[];
+function uiFixture(options={}) {
+  const elements=new Map(),sent=[],pcs=[],notices=[];
   const element=id=>{if(!elements.has(id))elements.set(id,{hidden:false,disabled:false,textContent:'',srcObject:null,setAttribute(){}});return elements.get(id);};
   const stream={getTracks:()=>[{stop(){},enabled:true}],getAudioTracks:()=>[{enabled:true}]};
   class FakePeer {
@@ -74,23 +87,25 @@ function uiFixture() {
     async createOffer(){return {type:'offer',sdp:'offer'};}
     async createAnswer(){return {type:'answer',sdp:'answer'};}
     async setLocalDescription(description){this.localDescription=description;this.onicecandidate?.({candidate:{toJSON:()=>({candidate:'early-local'})}});}
-    async setRemoteDescription(description){this.remoteDescription=description;}
+    async setRemoteDescription(description){this.remoteDescription=description;this.remoteSetCount=(this.remoteSetCount||0)+1;}
     async addIceCandidate(candidate){this.added.push(candidate);}
     close(){}
   }
-  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>stream}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,setTimeout,clearTimeout};
+  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,setTimeout,clearTimeout,setInterval,clearInterval};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../ui/calls.js'),'utf8'),sandbox);
   const command=async(action,payload)=>{if(action==='callIce')return [{urls:'stun:test'}];if(action==='sendCall')sent.push(payload);return true;};
-  const calls=sandbox.window.ChatCalls.create({command,notice:()=>{},getState:()=>({online:true,username:'alice',contactStates:[{username:'bob',status:'accepted'}]}),getPeer:()=> 'bob'});
-  return {element,calls,sent,pcs};
+  const calls=sandbox.window.ChatCalls.create({command,notice:message=>notices.push(message),getState:()=>({online:true,username:'alice',contactStates:[{username:'bob',status:'accepted'}]}),getPeer:()=> 'bob'});
+  return {element,calls,sent,pcs,notices};
 }
 
 test('WebRTC queues remote ICE until SDP and sends local ICE after offer or answer',async()=>{
   const incoming=uiFixture(),id=crypto.randomUUID();
   await incoming.calls.onEvent({type:'call',event:{from:'bob',callId:id,mode:'audio',action:'offer',payload:JSON.stringify({type:'offer',sdp:'remote'})}});
   await incoming.calls.onEvent({type:'call',event:{from:'bob',callId:id,mode:'audio',action:'ice',payload:JSON.stringify({candidate:'early-remote'})}});
+  await incoming.calls.onEvent({type:'call',event:{from:'bob',callId:id,mode:'audio',action:'ice',payload:JSON.stringify({candidate:'early-remote'})}});
   await incoming.element('acceptCall').onclick();
   assert.equal(incoming.pcs[0].added[0].candidate,'early-remote');
+  assert.equal(incoming.pcs[0].added.length,1);
   assert.deepEqual(incoming.sent.map(item=>item.action),['answer','ice']);
   incoming.calls.close();
 
@@ -98,4 +113,34 @@ test('WebRTC queues remote ICE until SDP and sends local ICE after offer or answ
   await outgoing.element('startAudioCall').onclick();
   assert.deepEqual(outgoing.sent.map(item=>item.action),['offer','ice']);
   outgoing.calls.close();
+});
+
+test('late call end and duplicate answer do not stop the current call',async()=>{
+  const f=uiFixture();
+  f.calls.snapshot();
+  assert.equal(f.element('startAudioCall').disabled,false,'accepted offline contacts remain callable');
+  await f.element('startAudioCall').onclick();
+  const first=f.sent.find(item=>item.action==='offer').callId;
+  f.calls.close();
+  await f.element('startAudioCall').onclick();
+  const second=f.sent.filter(item=>item.action==='offer').at(-1).callId;
+  assert.notEqual(first,second);
+  await f.calls.onEvent({type:'call_end',callId:first,reason:'旧通话已结束'});
+  assert.equal(f.element('callPanel').hidden,false);
+  const answer={type:'call',event:{from:'bob',callId:second,mode:'audio',action:'answer',payload:JSON.stringify({type:'answer',sdp:'remote'})}};
+  await f.calls.onEvent(answer);
+  await f.calls.onEvent(answer);
+  assert.equal(f.pcs.at(-1).remoteSetCount,1);
+  f.pcs.at(-1).connectionState='connected';f.pcs.at(-1).onconnectionstatechange();
+  assert.match(f.element('callStatus').textContent,/通话中 · 00:00:00/);
+  f.element('muteCall').onclick();
+  assert.equal(f.element('muteCall').textContent,'取消静音');
+  f.calls.close();
+});
+
+test('missing microphone reports an actionable error and releases the call',async()=>{
+  const f=uiFixture({mediaError:Object.assign(new Error('device unavailable'),{name:'NotFoundError'})});
+  await f.element('startAudioCall').onclick();
+  assert.equal(f.element('callPanel').hidden,true);
+  assert.match(f.notices.at(-1),/未找到可用的麦克风/);
 });

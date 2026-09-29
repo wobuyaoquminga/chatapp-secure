@@ -250,7 +250,7 @@ class Controller {
     if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(accountId||''))throw new Error('联系人账号信息未就绪，请刷新联系人');
     return accountId;
   }
-  endCall(reason) {if(this.call){this.call=null;this.notify({type:'call_end',reason});}}
+  endCall(reason) {if(this.call){const {callId}=this.call;this.call=null;this.notify({type:'call_end',callId,reason});}}
   cancelCall({callId}) {if(this.call?.callId===callId)this.endCall('通话已结束');return true;}
   async callIce() {
     if(!this.online)throw new Error('离线时不能通话');
@@ -278,7 +278,10 @@ class Controller {
     let accountId;try{accountId=this.callPeer(event.from);}catch{return;}
     if(event.fromAccountId!==accountId)return;
     if(event.action==='offer'){
-      if(this.call){this.wire({type:'call',to:event.from,toAccountId:accountId,callId:event.callId,action:'busy',mode:event.mode});return;}
+      if(this.call){
+        if(this.call.peer===event.from&&this.call.callId===event.callId&&this.call.mode===event.mode&&this.call.accountId===accountId)return;
+        this.wire({type:'call',to:event.from,toAccountId:accountId,callId:event.callId,action:'busy',mode:event.mode});return;
+      }
       this.call={peer:event.from,callId:event.callId,mode:event.mode,accountId,generation:this.generation,userApproved:false};
     }else if(!this.call||this.call.peer!==event.from||this.call.callId!==event.callId||this.call.mode!==event.mode||this.call.accountId!==accountId)return;
     this.notify({type:'call',event:{type:'call',from:event.from,fromAccountId:accountId,callId:event.callId,action:event.action,mode:event.mode,...(typeof event.payload==='string'?{payload:event.payload}:{})}});

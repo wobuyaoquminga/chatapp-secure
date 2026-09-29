@@ -12,6 +12,7 @@
       $('callVideos').hidden=item.mode!=='video';$('acceptCall').hidden=item.direction!=='incoming'||item.accepted;
       $('rejectCall').hidden=item.direction!=='incoming'||item.accepted;$('muteCall').hidden=!item.stream;
       $('hangupCall').hidden=item.direction==='incoming'&&!item.accepted;
+      $('muteCall').textContent=item.muted?'取消静音':'静音';
     }
     async function iceServers() {try{const servers=await command('callIce');return Array.isArray(servers)&&servers.length?servers:fallbackIce;}catch{return fallbackIce;}}
     function same(item) {return current===item;}
@@ -21,7 +22,7 @@
     }
     function close(reason='',sendAction='') {
       const item=current;if(!item)return;
-      current=null;clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);
+      current=null;clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);clearInterval(item.durationTimer);
       item.pc?.close();item.stream?.getTracks().forEach(track=>track.stop());
       $('localVideo').srcObject=null;$('remoteVideo').srcObject=null;$('remoteAudio').srcObject=null;
       $('callPanel').hidden=true;actions(false);updateButtons();
@@ -38,13 +39,26 @@
       pc.ontrack=event=>{if(!same(item))return;const stream=event.streams[0]||new MediaStream([event.track]);$(item.mode==='video'?'remoteVideo':'remoteAudio').srcObject=stream;};
       pc.onconnectionstatechange=()=>{
         if(!same(item))return;
-        if(pc.connectionState==='connected'){clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);$('callStatus').textContent='通话中';}
-        if(pc.connectionState==='disconnected'){clearTimeout(item.disconnectTimer);item.disconnectTimer=setTimeout(()=>{if(same(item)&&pc.connectionState==='disconnected')close('通话连接已断开','hangup');},15000);}
+        if(pc.connectionState==='connected'){
+          clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);
+          if(!item.connectedAt)item.connectedAt=Date.now();
+          clearInterval(item.durationTimer);
+          const elapsed=()=>{if(same(item)){$('callStatus').textContent='通话中 · '+new Date(Date.now()-item.connectedAt).toISOString().slice(11,19);}};
+          elapsed();item.durationTimer=setInterval(elapsed,1000);
+        }
+        if(pc.connectionState==='disconnected'){$('callStatus').textContent='连接中断，正在重连…';clearTimeout(item.disconnectTimer);item.disconnectTimer=setTimeout(()=>{if(same(item)&&pc.connectionState==='disconnected')close('通话连接已断开','hangup');},15000);}
         if(['failed','closed'].includes(pc.connectionState))close('通话连接已结束','hangup');
       };
       await command('callMediaPermission',{peer:item.peer,callId:item.id,mode:item.mode});
       if(!same(item))return;
-      try{item.stream=await navigator.mediaDevices.getUserMedia({audio:true,video:item.mode==='video'});}finally{command('revokeCallMediaPermission').catch(()=>{});}
+      try{
+        if(!navigator.mediaDevices?.getUserMedia)throw new Error('此设备无法使用麦克风或摄像头');
+        item.stream=await navigator.mediaDevices.getUserMedia({audio:true,video:item.mode==='video'});
+      }catch(error){
+        if(error.name==='NotFoundError'||error.name==='DevicesNotFoundError')throw new Error(item.mode==='video'?'未找到可用的麦克风或摄像头':'未找到可用的麦克风');
+        if(error.name==='NotAllowedError'||error.name==='PermissionDeniedError'||error.name==='SecurityError')throw new Error('麦克风或摄像头权限被拒绝，请检查 Windows 隐私设置');
+        throw error;
+      }finally{command('revokeCallMediaPermission').catch(()=>{});}
       if(!same(item)){item.stream?.getTracks().forEach(track=>track.stop());return;}
       for(const track of item.stream.getTracks())pc.addTrack(track,item.stream);
       if(item.mode==='video')$('localVideo').srcObject=item.stream;
@@ -81,10 +95,11 @@
       }catch(error){if(same(item))close(error.message,'reject');}
     }
     async function onEvent(message) {
-      if(message.type==='call_end'){close(message.reason);return;}
-      if(message.type==='call_error'){close(message.event?.error||'通话信令失败');return;}
+      if(message.type==='call_end'){if(current&&current.id===message.callId)close(message.reason);return;}
+      if(message.type==='call_error'){if(current&&current.id===message.event?.callId)close(message.event?.error||'通话信令失败');return;}
       const event=message.event;if(message.type!=='call'||!event)return;
       if(event.action==='offer'){
+        if(current?.id===event.callId&&current.peer===event.from&&current.mode===event.mode)return;
         if(current||!permitted(event.from)){command('sendCall',{peer:event.from,callId:event.callId,mode:event.mode,action:'busy'}).catch(()=>{});return;}
         if(typeof event.payload!=='string')return;
         const item={peer:event.from,mode:event.mode,id:event.callId,direction:'incoming',accepted:false,offer:event.payload,ice:[],pendingIce:[],descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
@@ -95,8 +110,12 @@
       try{
         if(event.action==='ice'){
           if(typeof event.payload!=='string')return;
-          const candidate=JSON.parse(event.payload);if(item.pc?.remoteDescription)await item.pc.addIceCandidate(candidate);else if(item.ice.length<256)item.ice.push(candidate);
-        }else if(event.action==='answer'&&item.direction==='outgoing'&&typeof event.payload==='string'&&item.pc){
+          item.remoteIce ||= new Set();
+          if(item.remoteIce.has(event.payload))return;
+          const candidate=JSON.parse(event.payload);if(item.remoteIce.size<512)item.remoteIce.add(event.payload);
+          if(item.pc?.remoteDescription)await item.pc.addIceCandidate(candidate);else if(item.ice.length<256)item.ice.push(candidate);
+        }else if(event.action==='answer'&&item.direction==='outgoing'&&typeof event.payload==='string'&&item.pc&&!item.answerReceived){
+          item.answerReceived=true;
           await item.pc.setRemoteDescription(JSON.parse(event.payload));await flushIce(item);
         }
       }catch(error){if(same(item))close(error.message,'hangup');}
@@ -106,7 +125,7 @@
     $('startAudioCall').onclick=()=>start('audio');$('startVideoCall').onclick=()=>start('video');
     $('acceptCall').onclick=accept;$('rejectCall').onclick=()=>close('已拒绝来电','reject');
     $('hangupCall').onclick=()=>close('通话已结束','hangup');
-    $('muteCall').onclick=()=>{const item=current;if(!item?.stream)return;const tracks=item.stream.getAudioTracks(),muted=tracks.some(track=>track.enabled);tracks.forEach(track=>track.enabled=!muted);$('muteCall').textContent=muted?'取消静音':'静音';};
+    $('muteCall').onclick=()=>{const item=current;if(!item?.stream)return;const tracks=item.stream.getAudioTracks();item.muted=tracks.some(track=>track.enabled);tracks.forEach(track=>track.enabled=!item.muted);$('muteCall').textContent=item.muted?'取消静音':'静音';};
     window.addEventListener('beforeunload',()=>close('', 'hangup'));
     return {onEvent,snapshot,close};
   }

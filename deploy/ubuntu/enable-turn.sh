@@ -32,8 +32,19 @@ fi
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y coturn openssl
+getent group turnserver >/dev/null || { echo 'coturn 安装后缺少 turnserver 组。' >&2; exit 1; }
 
-secret=$(openssl rand -base64 32 | tr -d '\n')
+# Keep the existing shared secret on repeat runs so issued TURN credentials
+# remain valid until their normal expiry.
+secret=''
+if [[ -f /etc/turnserver.conf ]]; then
+  secret=$(awk -F= '$1 == "static-auth-secret" { print substr($0, index($0, "=") + 1); exit }' /etc/turnserver.conf)
+fi
+if [[ -z $secret ]]; then secret=$(openssl rand -base64 32 | tr -d '\n'); fi
+if [[ ! $secret =~ ^[A-Za-z0-9+/=]+$ ]]; then
+  echo '现有 TURN 密钥格式无效，请先检查 /etc/turnserver.conf。' >&2
+  exit 1
+fi
 private_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit } }')
 external_ip=$public_ip
 if [[ -n ${private_ip:-} && $private_ip != "$public_ip" ]]; then
@@ -56,7 +67,6 @@ no-cli
 no-multicast-peers
 no-loopback-peers
 EOF
-getent group turnserver >/dev/null || { echo 'coturn 安装后缺少 turnserver 组。' >&2; exit 1; }
 chown root:turnserver /etc/turnserver.conf
 chmod 0640 /etc/turnserver.conf
 sed -i 's/^#\?TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/' /etc/default/coturn

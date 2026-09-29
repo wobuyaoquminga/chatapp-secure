@@ -82,12 +82,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private MessageIndex messageIndex = new MessageIndex();
     private volatile long snapshotGeneration;
     private volatile boolean destroyed;
+    private boolean foreground;
     private HistoryWindow historyWindow = HistoryWindow.latest(0);
     private int revealedHistoryIndex = -1;
     private LinearLayout conversationStream, messageResults, contactResults;
     private TextView conversationStatus;
     private final Map<String, View> messageViews = new HashMap<>();
     private final Map<String, String> drafts = new HashMap<>();
+    private final Map<String, Long> draftRevisions = new HashMap<>();
+    private long nextDraftRevision;
     private String composerDraftKey = "";
     private String renderedScreen = "";
     private LinearLayout shell;
@@ -135,11 +138,13 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     @Override protected void onResume() {
         super.onResume();
+        foreground = true;
         main.removeCallbacks(expiryRefresh);
         main.post(expiryRefresh);
     }
 
     @Override protected void onStop() {
+        foreground = false;
         main.removeCallbacks(expiryRefresh);
         if (locationSharing != null) locationSharing.stopLive();
         pendingLocationPeer = pendingLocationAction = "";
@@ -249,7 +254,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (view instanceof EditText && view.getTag() instanceof String) {
             EditText field = (EditText) view;
             String tag = (String) view.getTag();
-            if (values.containsKey(tag)) field.setText(values.get(tag));
+            if (values.containsKey(tag) && !field.getText().toString().equals(values.get(tag)))
+                field.setText(values.get(tag));
             if (tag.equals(focusTag)) {
                 field.requestFocus();
                 field.setSelection(Math.min(Math.max(0, cursor), field.length()));
@@ -539,6 +545,14 @@ public final class MainActivity extends Activity implements ChatController.Liste
         composer = field("发送消息", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         composerDraftKey = draftKey(detailPeer);
         composer.setText(draft);
+        String editingKey = composerDraftKey;
+        composer.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                draftRevisions.put(editingKey, ++nextDraftRevision);
+            }
+            @Override public void afterTextChanged(Editable s) { }
+        });
         composer.setMaxLines(5);
         composer.setMinHeight(dp(44));
         boolean canSend = !deleted && !identityChanged(detailPeer) && !relation.startsWith("pending_");
@@ -549,7 +563,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
             String message = composer.getText().toString();
             if (message.trim().isEmpty()) return;
             draft = message;
-            controller.send(detailPeer, message);
+            String key = composerDraftKey;
+            controller.send(detailPeer, message, key, draftRevisions.getOrDefault(key, 0L));
         });
         sendButton.setEnabled(canSend);
         bar.addView(sendButton, new LinearLayout.LayoutParams(dp(62), dp(44)));
@@ -1043,7 +1058,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     @Override public void onCallReady(CallSession session, JSONArray iceServers, long context) {
         callPreparing = false;
-        if (destroyed || call == null) return;
+        if (destroyed || !foreground || call == null) return;
         if (session.outgoing && call.busy()) return;
         if (!session.outgoing && call.session() != session) return;
         call.start(session, iceServers, context);
@@ -1057,7 +1072,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             try {
                 CallSession incoming = new CallSession(frame.getString("callId"), frame.getString("from"),
                         frame.getString("fromAccountId"), frame.getString("mode"), false);
-                if (call.busy() || callPreparing) controller.sendCall(incoming, "busy", null, context);
+                if (!foreground || call.busy() || callPreparing) controller.sendCall(incoming, "busy", null, context);
                 else call.ring(incoming, CallSession.parseSdpPayload("offer", frame.getString("payload")), context);
             } catch (Exception ignored) { }
         } else call.signal(frame);
@@ -1341,10 +1356,14 @@ public final class MainActivity extends Activity implements ChatController.Liste
         safetyDialog = dialog.show();
     }
 
-    @Override public void onSent() {
-        draft = "";
-        drafts.remove(composerDraftKey);
-        if (composer != null) composer.setText("");
+    @Override public void onSent(String draftKey, String body, long draftRevision) {
+        if (draftRevisions.getOrDefault(draftKey, 0L) != draftRevision) return;
+        if (body.equals(drafts.get(draftKey))) drafts.remove(draftKey);
+        if (composer != null && draftKey.equals(composerDraftKey)
+                && body.equals(composer.getText().toString())) {
+            draft = "";
+            composer.setText("");
+        }
     }
 
     private void saveDraft() {

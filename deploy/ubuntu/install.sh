@@ -21,9 +21,6 @@ if ! id chat >/dev/null 2>&1; then useradd --system --home-dir /var/lib/chat --s
 install -d -m 0755 /opt/chat
 install -d -o chat -g chat -m 0700 /var/lib/chat /var/lib/chat/data
 install -d -o root -g root -m 0700 /etc/chat
-# Stop before replacing the jar; the persistent data and existing secrets remain intact.
-systemctl stop chat.service 2>/dev/null || true
-install -o root -g root -m 0644 "$base/chat-server.jar" /opt/chat/chat-server.jar
 if [[ ! -f /etc/chat/chat.env ]]; then
   jwt=$(openssl rand -hex 32)
   dbpass=$(openssl rand -hex 32)
@@ -39,11 +36,55 @@ CHAT_ALLOWED_ORIGINS=http://localhost:8082,http://127.0.0.1:8082,http://127.0.0.
 EOF
   unset jwt dbpass
 fi
+backup=$(mktemp -d /opt/chat/.install-backup.XXXXXX)
+had_jar=0
+had_service=0
+had_env=0
+was_active=0
+if [[ -f /opt/chat/chat-server.jar ]]; then
+  cp -p /opt/chat/chat-server.jar "$backup/chat-server.jar"
+  had_jar=1
+fi
+if [[ -f /etc/systemd/system/chat.service ]]; then
+  cp -p /etc/systemd/system/chat.service "$backup/chat.service"
+  had_service=1
+fi
+if [[ -f /etc/chat/chat.env ]]; then
+  cp -p /etc/chat/chat.env "$backup/chat.env"
+  had_env=1
+fi
+if systemctl is-active --quiet chat.service; then was_active=1; fi
+rollback() {
+  local status=$?
+  trap - EXIT
+  set +e
+  if (( status != 0 )); then
+    echo '安装未通过检查，正在恢复原有服务。' >&2
+    systemctl stop chat.service || true
+    if (( had_jar )); then cp -p "$backup/chat-server.jar" /opt/chat/chat-server.jar; else rm -f /opt/chat/chat-server.jar; fi
+    if (( had_service )); then cp -p "$backup/chat.service" /etc/systemd/system/chat.service; else rm -f /etc/systemd/system/chat.service; fi
+    if (( had_env )); then cp -p "$backup/chat.env" /etc/chat/chat.env; fi
+    systemctl daemon-reload || true
+    if (( was_active )); then systemctl restart chat.service || true; fi
+  fi
+  rm -rf -- "$backup"
+  exit "$status"
+}
+trap rollback EXIT
 if [[ -n "$origin" ]]; then
   sed -i "s|^CHAT_ALLOWED_ORIGINS=.*|CHAT_ALLOWED_ORIGINS=$origin|" /etc/chat/chat.env
 fi
 chown root:root /etc/chat/chat.env
 chmod 0600 /etc/chat/chat.env
+# Replace the binary only after the old process has stopped. Keep a local copy
+# until the HTTP readiness check has passed.
+systemctl stop chat.service 2>/dev/null || true
+if systemctl is-active --quiet chat.service; then
+  echo '旧服务未能停止，安装已中止。' >&2
+  exit 1
+fi
+install -o root -g root -m 0644 "$base/chat-server.jar" "$backup/new-chat-server.jar"
+mv -f "$backup/new-chat-server.jar" /opt/chat/chat-server.jar
 cat > /etc/systemd/system/chat.service <<'EOF'
 [Unit]
 Description=Secure Chat Java Server

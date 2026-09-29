@@ -37,7 +37,7 @@ final class ChatController {
     interface Listener {
         void onState(JSONObject snapshot, String error);
         void onSafety(String peer, JSONObject result);
-        void onSent();
+        void onSent(String draftKey, String body, long draftRevision);
         void onCall(JSONObject frame, long context);
         void onCallReady(CallSession session, JSONArray iceServers, long context);
         void onCallContextLost();
@@ -326,9 +326,16 @@ final class ChatController {
         });
     }
 
-    void send(String peer, String body) { execute(() -> sendBody(peer, body, false)); }
+    void send(String peer, String body, String draftKey, long draftRevision) {
+        execute(() -> sendBody(peer, body, false, draftKey, draftRevision));
+    }
 
     private void sendBody(String peer, String body, boolean transientLocation) throws Exception {
+        sendBody(peer, body, transientLocation, null, 0);
+    }
+
+    private void sendBody(String peer, String body, boolean transientLocation,
+                          String draftKey, long draftRevision) throws Exception {
             requirePeer(peer);
             if (!online) throw new Exception("请等待连接恢复");
             if (engine.isDeleted(peer)) throw new Exception("该用户已销户，无法向不存在的账号发送消息");
@@ -361,7 +368,7 @@ final class ChatController {
                     .put("username", peer).put("status", "pending_outgoing").put("online", false));
             if (!body.startsWith(LocationPayload.PREFIX)) selectedPeer = peer;
             wire(envelope);
-            if (!body.startsWith(LocationPayload.PREFIX)) main.post(listener::onSent);
+            if (draftKey != null) main.post(() -> listener.onSent(draftKey, body, draftRevision));
             publish("");
     }
 
@@ -432,17 +439,22 @@ final class ChatController {
 
     private void refreshContacts() throws Exception {
         JSONArray found = requestArray("/api/contacts");
-        for (java.util.Iterator<String> keys = relationships.keys(); keys.hasNext();) {
-            keys.next(); keys.remove();
-        }
+        JSONObject updated = new JSONObject();
         for (int i = 0; i < found.length(); i++) {
             JSONObject item = found.optJSONObject(i);
             if (item != null && validUser(item.optString("username"))) {
                 String peer = item.getString("username");
                 prepareContact(peer, item);
-                if (!engine.isDeleted(peer)) relationships.put(peer, item);
+                if (!engine.isDeleted(peer)) updated.put(peer, item);
                 clearHiddenContact(peer);
             }
+        }
+        for (java.util.Iterator<String> keys = relationships.keys(); keys.hasNext();) {
+            keys.next(); keys.remove();
+        }
+        for (java.util.Iterator<String> keys = updated.keys(); keys.hasNext();) {
+            String peer = keys.next();
+            relationships.put(peer, updated.getJSONObject(peer));
         }
     }
 

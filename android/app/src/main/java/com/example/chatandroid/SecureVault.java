@@ -24,6 +24,7 @@ import javax.crypto.spec.GCMParameterSpec;
 final class SecureVault {
     private static final byte[] MAGIC = { 'C', 'H', 'A', 'T', 1 };
     private static final String KEYSTORE = "AndroidKeyStore";
+    private static final int MAX_FILE_BYTES = 16 * 1024 * 1024;
     private final AtomicFile file;
     private final String alias;
 
@@ -51,8 +52,8 @@ final class SecureVault {
             byte[] chunk = new byte[8192];
             int count;
             while ((count = input.read(chunk)) != -1) {
+                if (bytes.size() + count > MAX_FILE_BYTES) throw new Exception("本地数据异常大");
                 bytes.write(chunk, 0, count);
-                if (bytes.size() > 16 * 1024 * 1024) throw new Exception("本地数据异常大");
             }
             byte[] data = bytes.toByteArray();
             if (data.length < MAGIC.length + 12 + 16) throw new Exception("本地数据不完整");
@@ -91,6 +92,8 @@ final class SecureVault {
         byte[] encrypted = cipher.doFinal(plain);
         ByteBuffer output = ByteBuffer.allocate(MAGIC.length + nonce.length + encrypted.length);
         output.put(MAGIC).put(nonce).put(encrypted);
+        if (output.capacity() > MAX_FILE_BYTES)
+            throw new Exception("本地聊天记录已达到存储上限，拒绝写入无法重新读取的数据");
         FileOutputStream stream = null;
         try {
             stream = file.startWrite();
@@ -113,7 +116,8 @@ final class SecureVault {
 
     private boolean vaultFileExists() {
         File base = file.getBaseFile();
-        return base.exists() || new File(base.getPath() + ".bak").exists();
+        return base.exists() || new File(base.getPath() + ".bak").exists()
+                || new File(base.getPath() + ".new").exists();
     }
 
     private SecretKey newKey() throws Exception {

@@ -2,14 +2,14 @@ const $=id=>document.getElementById(id);
 const F=window.ChatFeatures;let locationEpoch=0,live=null,watch=null,liveTimer=null,expiryTimer=null,searchTimer=null,searchPage=0,visibleEnd=null,historicalSnapshot=null,renderPeer='',messageNodes=new Map();
 let state={accounts:[],servers:[],contacts:[],sessions:[],contactStates:[],messages:[]};
 let indexedSnapshot=null,messageIndex=null;
-let selected=null,activePeer='',tab='sessions',settingsOpen=false,safetyResult=null,safetyPeer='',context='';
+let selected=null,activePeer='',tab='sessions',settingsOpen=false,safetyResult=null,safetyPeer='',context='',draftRevision=0;
 const notice=message=>{$('notice').textContent=message||'';};
 async function command(action,payload){const result=await window.chat.command(action,payload);if(!result.ok)throw new Error(result.error);return result.value;}
 const accountKey=account=>account.server+'\0'+account.user;
 const server=()=>state.selectedServer||state.server||(state.servers||[])[0]||'';
 const accounts=()=>((state.accounts||[]).filter(account=>account.server===server()));
 function resetPanels(){ $('moreMenu').hidden=true;$('more').setAttribute('aria-expanded','false');$('locationPanel').hidden=true;$('searchPanel').hidden=true;$('historyQuery').value='';$('historyFrom').value='';$('historyTo').value='';searchPage=0;clearTimeout(searchTimer);clearInterval(expiryTimer);expiryTimer=null;visibleEnd=null;historicalSnapshot=null;renderPeer='';messageNodes.clear();}
-function clearConversation(){resetPanels();activePeer='';safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;calls.snapshot();}
+function clearConversation(){resetPanels();activePeer='';draftRevision++;safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;calls.snapshot();}
 function useAccount(account){selected=account;$('username').value=account.user;$('username').readOnly=true;$('register').hidden=true;$('usernameLabel').hidden=true;$('password').focus();renderAccountSelection();}
 function useNewAccount(){selected=null;$('username').value='';$('username').readOnly=false;$('usernameLabel').hidden=false;$('register').hidden=false;renderAccountSelection();$('username').focus();}
 function renderAccountSelection(){$('registrationWarning').hidden=$('register').hidden;for(const item of document.querySelectorAll('#accountList .account'))item.classList.toggle('active',!!selected&&item.dataset.key===accountKey(selected));}
@@ -75,7 +75,7 @@ function renderConversation(){
   renderMessages();if(!$('searchPanel').hidden)renderSearch();
 
 }
-async function openPeer(peer){try{if(activePeer!==peer)resetPanels();activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;if(!(state.sessions||[]).includes(peer))render(await command('openConversation',{peer}));else{renderPeers();renderConversation();}calls.snapshot();$('body').focus();}catch(error){notice(error.message);}}
+async function openPeer(peer){try{if(activePeer!==peer){resetPanels();draftRevision++;}activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;if(!(state.sessions||[]).includes(peer))render(await command('openConversation',{peer}));else{renderPeers();renderConversation();}calls.snapshot();$('body').focus();}catch(error){notice(error.message);}}
 function render(next){
   const oldIdentity=context;if(live&&(!next.online||next.server!==state.server||next.username!==state.username))stopLive();state=next;const current=(state.username?state.server+'\0'+state.username:'')+'|'+server();
   if(indexedSnapshot!==next||messageIndex?.user!==state.username||messageIndex?.server!==server()){messageIndex=F.messageIndex(state.messages||[],state.username,server());indexedSnapshot=next;}
@@ -103,7 +103,8 @@ $('contactForm').onsubmit=async event=>{event.preventDefault();try{const peer=$(
 $('acceptContact').onclick=async()=>{try{render(await command('acceptContact',{peer:activePeer}));notice('已接受聊天，现在可以回复。');}catch(error){notice(error.message);}};
 $('clearConversation').onclick=async()=>{try{const peer=activePeer;render(await command('clearConversation',{peer}));clearConversation();renderPeers();renderConversation();notice('会话已从列表清除，聊天记录仍保留；可从联系人重新打开。');}catch(error){notice(error.message);}};
 $('removeContact').onclick=async()=>{try{render(await command('removeContact',{peer:activePeer}));notice('联系人关系已解除，聊天记录仍保留。之后的新消息需要重新接受。');}catch(error){notice(error.message);}};
-$('sendForm').onsubmit=async event=>{event.preventDefault();if(!activePeer)return;try{render(await command('send',{peer:activePeer,body:$('body').value}));$('body').value='';notice('消息已在本机加密并加入待发队列。');}catch(error){notice(error.message);}};
+$('body').oninput=()=>{draftRevision++;};
+$('sendForm').onsubmit=async event=>{event.preventDefault();if(!activePeer)return;const peer=activePeer,body=$('body').value,revision=draftRevision;try{render(await command('send',{peer,body}));if(activePeer===peer&&draftRevision===revision)$('body').value='';notice('消息已在本机加密并加入待发队列。');}catch(error){notice(error.message);}};
 $('history').onclick=async()=>{try{render(await command('history',{peer:activePeer}));notice('已同步服务器回执；历史正文来自本机受保护的缓存。');}catch(error){notice(error.message);}};
 $('safety').onclick=async()=>{try{safetyPeer=activePeer;safetyResult=await command('safety',{peer:safetyPeer});$('safetyCode').textContent=safetyResult.code.match(/.{1,5}/g).join(' ');$('safetyPanel').hidden=false;$('verification').textContent=safetyResult.verified?'安全码已核对':'请通过可信渠道核对安全码';}catch(error){notice(error.message);}};
 $('confirmSafety').onclick=async()=>{try{if(!safetyResult||safetyPeer!==activePeer)throw new Error('请重新获取安全码');safetyResult=await command('safety',{peer:safetyPeer,confirm:true,expectedCode:safetyResult.code});$('verification').textContent='安全码已核对';notice('核对结果已在本机保存，身份密钥变化将被阻止。');}catch(error){notice(error.message);}};
