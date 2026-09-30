@@ -7,11 +7,19 @@ android {
         applicationId 'com.example.chatandroid'
         minSdk 26
         targetSdk 35
-        versionCode 12
-        versionName '0.4.6'
+        versionCode 13
+        versionName '0.4.7'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildFeatures { buildConfig true }
+    signingConfigs {
+        debug {
+            // Keep the same debug identity across sandboxed and ordinary builds.
+            // The key stays outside this repository; never replace it to fix an update.
+            def configuredKey = System.getenv('CHAT_ANDROID_DEBUG_KEYSTORE')
+            if (configuredKey) storeFile file(configuredKey)
+        }
+    }
     compileOptions {
         coreLibraryDesugaringEnabled true
         sourceCompatibility JavaVersion.VERSION_17

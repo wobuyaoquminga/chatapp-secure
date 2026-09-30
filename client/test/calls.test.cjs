@@ -96,9 +96,9 @@ function uiFixture(options={}) {
   const element=id=>{
     if(!elements.has(id)){
       const classes=new Set(),listeners={};
-      elements.set(id,{hidden:false,disabled:false,textContent:'',srcObject:null,style:{},offsetWidth:280,offsetHeight:235,
+      elements.set(id,{id,hidden:false,disabled:false,textContent:'',srcObject:null,readyState:0,videoWidth:0,style:{},offsetWidth:280,offsetHeight:235,
         classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains:name=>classes.has(name)},
-        setAttribute(){},addEventListener(name,handler){listeners[name]=handler;},dispatch(name,event){listeners[name]?.(event);},
+        setAttribute(){},addEventListener(name,handler){listeners[name]=handler;},dispatch(name,event){listeners[name]?.({...event,currentTarget:this});},
         setPointerCapture(){},getBoundingClientRect:()=>({left:20,top:20})});
     }
     return elements.get(id);
@@ -114,7 +114,13 @@ function uiFixture(options={}) {
     async addIceCandidate(candidate){this.added.push(candidate);}
     close(){}
   }
-  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,...timers,innerWidth:1000,innerHeight:800};
+  class FakeStream {
+    constructor(){this.tracks=[];}
+    getTracks(){return this.tracks;}
+    addTrack(track){this.tracks.push(track);}
+    getVideoTracks(){return this.tracks.filter(track=>track.kind==='video');}
+  }
+  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:FakeStream,crypto,...timers,innerWidth:1000,innerHeight:800};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../ui/calls.js'),'utf8'),sandbox);
   const command=async(action,payload)=>{if(action==='callIce')return [{urls:'stun:test'}];if(action==='sendCall')sent.push(payload);return true;};
   const calls=sandbox.window.ChatCalls.create({command,notice:message=>notices.push(message),getState:()=>({online:true,username:'alice',contactStates:[{username:'bob',status:'accepted'}]}),getPeer:()=> 'bob'});
@@ -216,6 +222,9 @@ test('video call starts at phone size, shows self until connected, and switches 
   f.pcs[0].ontrack({track:{kind:'video'},streams:[{getVideoTracks:()=>[{}]}]});
   assert.equal(f.element('callVideos').classList.contains('showRemote'),false);
   f.pcs[0].connectionState='connected';f.pcs[0].onconnectionstatechange();
+  assert.equal(f.element('callVideos').classList.contains('showRemote'),false,'a track without a decoded frame does not hide self');
+  f.element('remoteVideo').readyState=2;f.element('remoteVideo').videoWidth=640;
+  f.element('remoteVideo').dispatch('loadeddata',{});
   assert.equal(f.element('callVideos').classList.contains('showRemote'),true);
   f.element('minimizeCall').onclick();
   assert.equal(f.element('callPanel').classList.contains('modeVideo'),true);
@@ -244,4 +253,68 @@ test('call minimizes to a draggable overlay and restores to its initial layout',
   assert.equal(f.element('callCard').style.left,'');
   assert.equal(f.element('callCard').style.top,'');
   f.calls.close();
+});
+
+test('separate streamless audio/video tracks preserve remote picture and preview swapping',async()=>{
+  const f=uiFixture();
+  try {
+    await f.element('startVideoCall').onclick();
+    const pc=f.pcs[0],video={kind:'video'},audio={kind:'audio'};
+    pc.ontrack({track:video,streams:[]});
+    const remote=f.element('remoteVideo').srcObject;
+    pc.ontrack({track:audio,streams:[]});
+    pc.ontrack({track:video,streams:[]});
+    assert.equal(f.element('remoteVideo').srcObject,remote,'audio does not replace video');
+    assert.equal(remote.getTracks().length,2,'duplicate callback does not duplicate tracks');
+    assert.equal(f.element('remoteAudio').srcObject,remote,'audio remains bound independently');
+    pc.connectionState='connected';pc.onconnectionstatechange();
+    assert.equal(f.element('callVideos').classList.contains('showRemote'),false,'keep self preview while waiting for frames');
+    f.element('remoteVideo').readyState=2;f.element('remoteVideo').videoWidth=640;
+    f.element('remoteVideo').dispatch('loadeddata',{});
+    assert.equal(f.element('callVideos').classList.contains('showRemote'),true);
+    assert.equal(f.element('callVideos').classList.contains('selfPrimary'),false);
+    const local=f.element('localVideo').srcObject;
+    f.element('localVideo').onclick();
+    assert.equal(f.element('callVideos').classList.contains('selfPrimary'),true);
+    f.element('localVideo').onclick();
+    assert.equal(f.element('callVideos').classList.contains('selfPrimary'),true,'main view does not swap');
+    f.element('minimizeCall').onclick();
+    f.element('remoteVideo').onclick();
+    assert.equal(f.element('callVideos').classList.contains('selfPrimary'),false);
+    assert.equal(f.element('localVideo').srcObject,local,'preview still uses local camera');
+    assert.equal(f.element('remoteVideo').srcObject,remote,'remote video still uses peer tracks');
+  } finally { f.calls.close(); }
+  pcLateCheck(f);
+});
+
+function pcLateCheck(f) {
+  f.pcs[0].ontrack({track:{kind:'video'},streams:[]});
+  assert.equal(f.element('remoteVideo').srcObject,null,'late track after hangup cannot restore video');
+}
+
+test('video preview drags within its container without swapping and transfers position on swap',async()=>{
+  const f=uiFixture();
+  try {
+    await f.element('startVideoCall').onclick();
+    const pc=f.pcs[0];pc.ontrack({track:{kind:'video'},streams:[]});
+    pc.connectionState='connected';pc.onconnectionstatechange();
+    const remote=f.element('remoteVideo');remote.readyState=2;remote.videoWidth=640;remote.dispatch('loadeddata',{});
+    const local=f.element('localVideo'),area=f.element('callVideos');
+    local.offsetWidth=100;local.offsetHeight=80;area.offsetWidth=400;area.offsetHeight=500;
+    local.dispatch('pointerdown',{pointerId:1,clientX:30,clientY:30,target:{closest:()=>null}});
+    local.dispatch('pointermove',{pointerId:1,clientX:1000,clientY:1000});
+    local.dispatch('pointerup',{pointerId:1});local.onclick();
+    assert.equal(local.style.left,'300px');assert.equal(local.style.top,'420px');
+    assert.equal(area.classList.contains('selfPrimary'),false,'drag release does not swap');
+    local.dispatch('pointerdown',{pointerId:2,clientX:35,clientY:35,target:{closest:()=>null}});
+    local.dispatch('pointerup',{pointerId:2});local.onclick();
+    assert.equal(area.classList.contains('selfPrimary'),true,'stationary click still swaps');
+    assert.equal(local.style.left,'','main video must not inherit preview offsets');
+    assert.equal(remote.style.left,'120px','new preview position clamps to its own width');
+    f.element('minimizeCall').onclick();
+    const card=f.element('callCard');card.dispatch('pointerdown',{pointerId:3,clientX:30,clientY:30,target:{closest:()=>null}});
+    card.dispatch('pointermove',{pointerId:3,clientX:-100,clientY:1000});card.dispatch('pointerup',{pointerId:3});
+    assert.equal(card.style.left,'0px');assert.equal(card.style.top,'565px');
+    assert.equal(pc.connectionState,'connected','drag keeps the call alive');
+  } finally {f.calls.close();}
 });

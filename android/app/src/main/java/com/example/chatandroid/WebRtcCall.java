@@ -15,6 +15,7 @@ import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -27,6 +28,8 @@ import org.webrtc.AudioSource;
 import org.webrtc.AudioTrack;
 import org.webrtc.Camera2Enumerator;
 import org.webrtc.CameraVideoCapturer;
+import org.webrtc.DefaultVideoDecoderFactory;
+import org.webrtc.DefaultVideoEncoderFactory;
 import org.webrtc.EglBase;
 import org.webrtc.IceCandidate;
 import org.webrtc.MediaConstraints;
@@ -37,6 +40,7 @@ import org.webrtc.RtpReceiver;
 import org.webrtc.SdpObserver;
 import org.webrtc.SessionDescription;
 import org.webrtc.SurfaceTextureHelper;
+import org.webrtc.VideoCodecInfo;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 import java.util.ArrayList;
@@ -63,6 +67,7 @@ final class WebRtcCall {
     private AudioTrack audioTrack;
     private VideoSource videoSource;
     private VideoTrack videoTrack;
+    private VideoTrack remoteVideoTrack;
     private CameraVideoCapturer camera;
     private SurfaceTextureHelper textureHelper;
     private final List<IceCandidate> earlyIce = new ArrayList<>();
@@ -87,12 +92,16 @@ final class WebRtcCall {
     private Runnable timeout;
     private Runnable disconnectTimeout;
     private long connectedAt;
-    private boolean minimized, incomingAccepted;
+    private boolean minimized, incomingAccepted, videoSwapped, remoteVideoReady;
     private View activityContent;
     private int miniX = -1, miniY = -1;
     private float dragX, dragY;
     private int dragStartX, dragStartY;
     private boolean dragged;
+    private int insetX = -1, insetY = -1;
+    private float insetDownX, insetDownY;
+    private int insetStartX, insetStartY;
+    private boolean insetDragged, insetMultiTouch;
     private final Runnable durationTick = new Runnable() {
         @Override public void run() {
             if (session == null) return;
@@ -157,8 +166,6 @@ final class WebRtcCall {
                 : "通话连接超时", true, "hangup");
         main.postDelayed(timeout, 45000);
         try {
-            CallKeepAliveService.start(activity, ready.mode);
-            CallKeepAliveService.setOnTaskRemoved(() -> main.post(() -> finish("", true, "hangup")));
             CallNotifier.cancel(activity);
             showDialog();
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(activity).createInitializationOptions());
@@ -166,7 +173,16 @@ final class WebRtcCall {
             localView.init(egl.getEglBaseContext());
             remoteView.init(egl.getEglBaseContext());
             localView.setMirror(true);
-            factory = PeerConnectionFactory.builder().createPeerConnectionFactory();
+            PeerConnectionFactory.Builder factoryBuilder = PeerConnectionFactory.builder();
+            if (ready.mode.equals("video")) {
+                DefaultVideoEncoderFactory encoder = new DefaultVideoEncoderFactory(
+                        egl.getEglBaseContext(), true, false);
+                DefaultVideoDecoderFactory decoder = new DefaultVideoDecoderFactory(egl.getEglBaseContext());
+                if (!supportsVp8(encoder.getSupportedCodecs()) || !supportsVp8(decoder.getSupportedCodecs()))
+                    throw new IllegalStateException("此设备缺少 VP8 视频编解码器");
+                factoryBuilder.setVideoEncoderFactory(encoder).setVideoDecoderFactory(decoder);
+            }
+            factory = factoryBuilder.createPeerConnectionFactory();
             List<PeerConnection.IceServer> servers = parseIce(iceServers);
             PeerConnection.RTCConfiguration config = new PeerConnection.RTCConfiguration(servers);
             config.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
@@ -184,6 +200,10 @@ final class WebRtcCall {
             audioTrack = factory.createAudioTrack("audio", audioSource);
             peer.addTrack(audioTrack, List.of("chat"));
             if (ready.mode.equals("video")) startCamera();
+            // Starting the service before camera/WebRTC setup can starve its main-thread
+            // onStartCommand long enough for Android to kill the process.
+            CallKeepAliveService.start(activity, ready.mode);
+            CallKeepAliveService.setOnTaskRemoved(() -> main.post(() -> finish("", true, "hangup")));
             if (ready.outgoing) createOffer();
             else {
                 if (remoteOffer == null) throw new IllegalStateException("来电信令缺失");
@@ -210,6 +230,11 @@ final class WebRtcCall {
         return result;
     }
 
+    private static boolean supportsVp8(VideoCodecInfo[] codecs) {
+        for (VideoCodecInfo codec : codecs) if ("VP8".equalsIgnoreCase(codec.name)) return true;
+        return false;
+    }
+
     private void startCamera() throws Exception {
         Camera2Enumerator enumerator = new Camera2Enumerator(activity);
         String[] names = enumerator.getDeviceNames();
@@ -234,9 +259,13 @@ final class WebRtcCall {
         videoFrame = new FrameLayout(activity);
         remoteView = new CallVideoView(activity);
         localView = new CallVideoView(activity);
-        remoteView.setVisibility(View.GONE);
         videoFrame.addView(remoteView, new FrameLayout.LayoutParams(-1, -1));
         videoFrame.addView(localView, new FrameLayout.LayoutParams(-1, -1));
+        videoFrame.addOnLayoutChangeListener((view, left, top, right, bottom,
+                oldLeft, oldTop, oldRight, oldBottom) -> {
+            if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop)
+                positionInset();
+        });
         videoFrame.setVisibility(session.mode.equals("video") ? View.VISIBLE : View.GONE);
         callRoot.addView(videoFrame, new FrameLayout.LayoutParams(-1, -1));
 
@@ -303,6 +332,11 @@ final class WebRtcCall {
         miniTouch.setVisibility(View.GONE);
         miniTouch.setOnTouchListener(this::onMiniTouch);
         callRoot.addView(miniTouch, new FrameLayout.LayoutParams(-1, -1));
+        callRoot.addOnLayoutChangeListener((view, left, top, right, bottom,
+                oldLeft, oldTop, oldRight, oldBottom) -> {
+            if (minimized && (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop))
+                clampMiniWindow();
+        });
 
         dialog.setContentView(callRoot);
         dialog.setCanceledOnTouchOutside(false);
@@ -350,18 +384,7 @@ final class WebRtcCall {
         duration.setVisibility(value ? View.GONE : (session.mode.equals("audio") ? View.VISIBLE : View.GONE));
         miniLabel.setVisibility(value && session.mode.equals("audio") ? View.VISIBLE : View.GONE);
         miniTouch.setVisibility(value ? View.VISIBLE : View.GONE);
-        if (session.mode.equals("video")) {
-            remoteView.setRounded(value);
-            localView.setRounded(value);
-            localView.setVisibility(value && connectedAt != 0 ? View.GONE : View.VISIBLE);
-            remoteView.setVisibility(connectedAt != 0 ? View.VISIBLE : View.GONE);
-            FrameLayout.LayoutParams localParams = new FrameLayout.LayoutParams(
-                    value || connectedAt == 0 ? -1 : dp(110), value || connectedAt == 0 ? -1 : dp(150),
-                    Gravity.TOP | Gravity.END);
-            localParams.topMargin = value || connectedAt == 0 ? 0 : dp(24);
-            localParams.rightMargin = value || connectedAt == 0 ? 0 : dp(16);
-            localView.setLayoutParams(localParams);
-        }
+        if (session.mode.equals("video")) updateVideoLayout();
         if (value) {
             window.setBackgroundDrawableResource(android.R.color.transparent);
             callRoot.setBackground(roundBackground(Color.rgb(20, 26, 29), dp(18)));
@@ -377,6 +400,8 @@ final class WebRtcCall {
             params.height = dp(session.mode.equals("video") ? 142 : 126);
             if (miniX < 0) miniX = Math.max(0, activity.getResources().getDisplayMetrics().widthPixels - params.width - dp(16));
             if (miniY < 0) miniY = dp(72);
+            miniX = clamp(miniX, activity.getResources().getDisplayMetrics().widthPixels - params.width);
+            miniY = clamp(miniY, activity.getResources().getDisplayMetrics().heightPixels - params.height);
             params.x = miniX; params.y = miniY;
             window.setAttributes(params);
         } else {
@@ -396,6 +421,109 @@ final class WebRtcCall {
             params.width = params.height = -1;
             window.setAttributes(params);
         }
+    }
+
+    private void swapVideo() {
+        if (session == null || minimized || !remoteVideoReady || !"video".equals(session.mode)) return;
+        videoSwapped = !videoSwapped;
+        updateVideoLayout();
+    }
+
+    private void updateVideoLayout() {
+        if (localView == null || remoteView == null) return;
+        // Keep the local preview full size until an actual peer frame arrives.
+        // A track can exist well before ICE connects and would otherwise show black.
+        boolean localMain = !remoteVideoReady || (!minimized && videoSwapped);
+        CallVideoView mainView = localMain ? localView : remoteView;
+        CallVideoView insetView = localMain ? remoteView : localView;
+        mainView.setVisibility(View.VISIBLE);
+        mainView.setRounded(minimized);
+        mainView.setLayoutParams(new FrameLayout.LayoutParams(-1, -1));
+        mainView.setOnClickListener(null);
+        mainView.setOnTouchListener(null);
+        insetView.setVisibility(minimized || !remoteVideoReady ? View.GONE : View.VISIBLE);
+        insetView.setRounded(!minimized);
+        insetView.setOnClickListener(v -> swapVideo());
+        insetView.setOnTouchListener(this::onInsetTouch);
+        FrameLayout.LayoutParams inset = new FrameLayout.LayoutParams(dp(110), dp(150),
+                Gravity.TOP | Gravity.START);
+        inset.leftMargin = insetX < 0
+                ? Math.max(0, activity.getResources().getDisplayMetrics().widthPixels - dp(126)) : insetX;
+        inset.topMargin = insetY < 0 ? dp(24) : insetY;
+        insetView.setLayoutParams(inset);
+        mainView.bringToFront();
+        insetView.bringToFront();
+        if (!minimized) videoFrame.post(this::positionInset);
+    }
+
+    private boolean onInsetTouch(View view, MotionEvent event) {
+        if (minimized || !remoteVideoReady) return false;
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                positionInset();
+                insetDownX = event.getRawX(); insetDownY = event.getRawY();
+                insetStartX = Math.max(0, insetX); insetStartY = Math.max(0, insetY);
+                insetDragged = insetMultiTouch = false;
+                return true;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                insetMultiTouch = true;
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                if (insetMultiTouch) return true;
+                int dx = Math.round(event.getRawX() - insetDownX);
+                int dy = Math.round(event.getRawY() - insetDownY);
+                int slop = ViewConfiguration.get(activity).getScaledTouchSlop();
+                if (Math.abs(dx) > slop || Math.abs(dy) > slop) insetDragged = true;
+                if (insetDragged) {
+                    insetX = clamp(insetStartX + dx, videoFrame.getWidth() - view.getWidth());
+                    insetY = clamp(insetStartY + dy, videoFrame.getHeight() - view.getHeight());
+                    FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) view.getLayoutParams();
+                    params.leftMargin = insetX; params.topMargin = insetY;
+                    view.setLayoutParams(params);
+                }
+                return true;
+            case MotionEvent.ACTION_UP:
+                if (!insetDragged && !insetMultiTouch) view.performClick();
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private void positionInset() {
+        if (minimized || !remoteVideoReady || videoFrame == null || videoFrame.getWidth() <= dp(190)
+                || videoFrame.getHeight() <= dp(150))
+            return;
+        CallVideoView inset = videoSwapped ? remoteView : localView;
+        if (inset == null || inset.getVisibility() != View.VISIBLE) return;
+        int width = dp(110);
+        int height = dp(150);
+        insetX = clamp(insetX < 0 ? videoFrame.getWidth() - width - dp(16) : insetX,
+                videoFrame.getWidth() - width);
+        insetY = clamp(insetY < 0 ? dp(24) : insetY, videoFrame.getHeight() - height);
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) inset.getLayoutParams();
+        if (params.leftMargin != insetX || params.topMargin != insetY) {
+            params.leftMargin = insetX; params.topMargin = insetY;
+            inset.setLayoutParams(params);
+        }
+    }
+
+    private void clampMiniWindow() {
+        if (dialog == null || dialog.getWindow() == null) return;
+        Window window = dialog.getWindow();
+        WindowManager.LayoutParams params = window.getAttributes();
+        miniX = clamp(miniX, activity.getResources().getDisplayMetrics().widthPixels - params.width);
+        miniY = clamp(miniY, activity.getResources().getDisplayMetrics().heightPixels - params.height);
+        if (params.x != miniX || params.y != miniY) {
+            params.x = miniX; params.y = miniY;
+            window.setAttributes(params);
+        }
+    }
+
+    private static int clamp(int value, int maximum) {
+        return Math.max(0, Math.min(value, Math.max(0, maximum)));
     }
 
     private boolean onMiniTouch(View view, MotionEvent event) {
@@ -496,9 +624,23 @@ final class WebRtcCall {
             @Override public void onDataChannel(org.webrtc.DataChannel channel) { }
             @Override public void onRenegotiationNeeded() { }
             @Override public void onAddTrack(RtpReceiver receiver, MediaStream[] streams) {
+                // Read the receiver on WebRTC's callback thread. Its native handle can
+                // be invalid by the time a posted UI callback runs.
+                org.webrtc.MediaStreamTrack track = receiver.track();
+                if (!(track instanceof VideoTrack)) return;
+                VideoTrack incoming = (VideoTrack) track;
                 main.post(() -> {
-                    if (session == owner && receiver.track() instanceof VideoTrack && remoteView != null)
-                        ((VideoTrack) receiver.track()).addSink(remoteView);
+                    if (session != owner || remoteView == null || remoteVideoTrack == incoming) return;
+                    if (remoteVideoTrack != null) remoteVideoTrack.removeSink(remoteView);
+                    remoteVideoTrack = incoming;
+                    remoteVideoReady = false;
+                    remoteView.onFirstFrame(() -> main.post(() -> {
+                        if (session != owner || remoteVideoTrack != incoming) return;
+                        remoteVideoReady = true;
+                        updateVideoLayout();
+                    }));
+                    incoming.addSink(remoteView);
+                    updateVideoLayout();
                 });
             }
         };
@@ -582,14 +724,21 @@ final class WebRtcCall {
         status = miniLabel = duration = null;
         connectedAt = 0;
         minimized = false;
+        videoSwapped = false;
+        remoteVideoReady = false;
         incomingAccepted = false;
         miniX = miniY = -1;
+        insetX = insetY = -1;
         if (camera != null) { try { camera.stopCapture(); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } camera.dispose(); camera = null; }
         if (videoTrack != null) { videoTrack.dispose(); videoTrack = null; }
         if (videoSource != null) { videoSource.dispose(); videoSource = null; }
         if (textureHelper != null) { textureHelper.dispose(); textureHelper = null; }
         if (audioTrack != null) { audioTrack.dispose(); audioTrack = null; }
         if (audioSource != null) { audioSource.dispose(); audioSource = null; }
+        if (remoteVideoTrack != null) {
+            if (remoteView != null) remoteVideoTrack.removeSink(remoteView);
+            remoteVideoTrack = null;
+        }
         if (peer != null) { peer.close(); peer.dispose(); peer = null; }
         if (factory != null) { factory.dispose(); factory = null; }
         if (localView != null) { localView.release(); localView = null; }

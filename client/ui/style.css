@@ -9,3 +9,11 @@
 .callPanel.isMinimized.modeAudio .callCard{width:min(190px,calc(100vw - 24px));height:min(190px,calc(100vh - 24px));border-radius:22px}
 .callPanel.isMinimized.modeVideo .callCard{width:min(280px,calc(100vw - 24px));height:min(200px,calc(100vh - 24px));border-radius:18px}
 .callActions{flex-wrap:nowrap;overflow-x:auto}.callActions button{flex:1 0 110px;white-space:nowrap}
+/* Swap presentation only: remote audio stays on its separate audio element. */
+.callVideos.showRemote video { cursor:pointer; }
+.callVideos.showRemote video{touch-action:none;user-select:none}
+.callPanel.isMinimized .callCard{touch-action:none}
+.callVideos.showRemote.selfPrimary #localVideo{inset:0;width:100%;height:100%;max-height:none;border:0;border-radius:0;object-fit:cover}
+.callVideos.showRemote.selfPrimary #remoteVideo{inset:auto 12px 12px auto;width:27%;height:22%;max-height:150px;border:2px solid #fff;border-radius:10px;z-index:1;object-fit:cover;background:#25392e}
+.callPanel.isMinimized .callVideos.showRemote.selfPrimary #localVideo{inset:0;width:100%;height:100%;border:0;border-radius:0}
+.callPanel.isMinimized .callVideos.showRemote.selfPrimary #remoteVideo{width:28%;height:42%;right:6px;bottom:6px}

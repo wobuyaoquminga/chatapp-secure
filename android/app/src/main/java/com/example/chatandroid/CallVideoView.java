@@ -11,10 +11,14 @@ import org.webrtc.EglRenderer;
 import org.webrtc.GlRectDrawer;
 import org.webrtc.VideoFrame;
 import org.webrtc.VideoSink;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** WebRTC video in a TextureView so Android can actually clip live pixels to rounded corners. */
 final class CallVideoView extends TextureView implements VideoSink, TextureView.SurfaceTextureListener {
-    private EglRenderer renderer;
+    private volatile EglRenderer renderer;
+    private volatile Runnable firstFrameListener;
+    private final AtomicBoolean firstFrameSeen = new AtomicBoolean();
     private boolean mirror;
 
     CallVideoView(Context context) {
@@ -45,9 +49,20 @@ final class CallVideoView extends TextureView implements VideoSink, TextureView.
         if (renderer != null) renderer.setMirror(value);
     }
 
+    void onFirstFrame(Runnable listener) {
+        firstFrameListener = listener;
+        firstFrameSeen.set(false);
+    }
+
     @Override public void onFrame(VideoFrame frame) {
         EglRenderer active = renderer;
-        if (active != null) active.onFrame(frame);
+        if (active != null) {
+            active.onFrame(frame);
+            if (firstFrameSeen.compareAndSet(false, true)) {
+                Runnable callback = firstFrameListener;
+                if (callback != null) callback.run();
+            }
+        }
     }
 
     @Override public void onSurfaceTextureAvailable(SurfaceTexture texture, int width, int height) {
@@ -57,7 +72,17 @@ final class CallVideoView extends TextureView implements VideoSink, TextureView.
     @Override public void onSurfaceTextureSizeChanged(SurfaceTexture texture, int width, int height) { }
 
     @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture texture) {
-        if (renderer != null) renderer.releaseEglSurface(() -> { });
+        EglRenderer active = renderer;
+        if (active != null) {
+            CountDownLatch released = new CountDownLatch(1);
+            active.releaseEglSurface(released::countDown);
+            boolean interrupted = false;
+            while (true) {
+                try { released.await(); break; }
+                catch (InterruptedException ignored) { interrupted = true; }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
+        }
         return true;
     }
 
@@ -66,6 +91,7 @@ final class CallVideoView extends TextureView implements VideoSink, TextureView.
     void release() {
         EglRenderer active = renderer;
         renderer = null;
+        firstFrameListener = null;
         if (active != null) active.release();
     }
 }

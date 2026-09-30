@@ -1,4 +1,11 @@
 const {app,BrowserWindow,Notification,ipcMain,safeStorage,session,shell}=require('electron');
+// Some Windows composite camera drivers deliver black frames through Media Foundation.
+// Use Chromium's DirectShow capture path; rendering and video encoding stay accelerated.
+if(process.platform==='win32'){
+  const disabled=app.commandLine.getSwitchValue('disable-features').split(',').filter(Boolean);
+  if(!disabled.includes('MediaFoundationVideoCapture'))disabled.push('MediaFoundationVideoCapture');
+  app.commandLine.appendSwitch('disable-features',disabled.join(','));
+}
 const fs=require('node:fs');
 const path=require('node:path');
 const {pathToFileURL}=require('node:url');

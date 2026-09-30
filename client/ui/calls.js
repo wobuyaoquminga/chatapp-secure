@@ -11,7 +11,18 @@
     function updateVideo(item) {
       if(!same(item))return;
       $('callVideos').classList.toggle('hasLocalVideo',!!item.stream);
-      $('callVideos').classList.toggle('showRemote',!!(item.connectedAt&&item.remoteReady));
+      $('callVideos').classList.toggle('showRemote',!!(item.connectedAt&&item.remoteReady&&item.remoteFrameReady));
+      $('callVideos').classList.toggle('selfPrimary',!!(item.remoteFrameReady&&item.selfPrimary));
+      for(const id of ['localVideo','remoteVideo']){
+        const style=$(id).style;
+        style.left=style.top=style.right=style.bottom='';
+      }
+      if(item.previewPosition&&!$('callPanel').classList.contains('isMinimized')){
+        const preview=$(item.selfPrimary?'remoteVideo':'localVideo'),area=$('callVideos');
+        preview.style.left=Math.max(0,Math.min(area.offsetWidth-preview.offsetWidth,item.previewPosition.x))+'px';
+        preview.style.top=Math.max(0,Math.min(area.offsetHeight-preview.offsetHeight,item.previewPosition.y))+'px';
+        preview.style.right=preview.style.bottom='auto';
+      }
     }
     function minimize(minimized) {
       $('callPanel').classList.toggle('isMinimized',minimized);
@@ -19,6 +30,7 @@
       $('minimizeCall').hidden=minimized;
       $('restoreCall').hidden=!minimized;
       if(!minimized){const card=$('callCard');card.style.left=card.style.top=card.style.right=card.style.bottom='';}
+      if(current)updateVideo(current);
     }
     function actions(open) {actionsOpen=open;$('callActions').hidden=!open;$('toggleCallActions').setAttribute('aria-expanded',String(open));}
     function permitted(peer) {const s=getState(),contact=(s.contactStates||[]).find(item=>item.username===peer);return !!(s.online&&s.username&&contact?.status==='accepted'&&!s.deletedPeers?.[peer]&&!s.identityChanges?.[peer]);}
@@ -66,7 +78,20 @@
       const servers=await iceServers();if(!same(item))return;
       const pc=new RTCPeerConnection({iceServers:servers});item.pc=pc;
       pc.onicecandidate=event=>{if(!event.candidate||!same(item))return;const payload=JSON.stringify(event.candidate.toJSON());if(!item.descriptionSent)item.pendingIce.push(payload);else queueIce(item,payload);};
-      pc.ontrack=event=>{if(!same(item))return;const stream=event.streams[0]||new MediaStream([event.track]);$(item.mode==='video'?'remoteVideo':'remoteAudio').srcObject=stream;if(item.mode==='video'){item.remoteReady=stream.getVideoTracks().length>0;updateVideo(item);}};
+      // Unified Plan emits separate audio/video events, sometimes without a stream.
+      // Keep both tracks: a later audio event must never replace the video stream.
+      item.remoteStream=new MediaStream();
+      pc.ontrack=event=>{
+        if(!same(item))return;
+        const stream=item.remoteStream;
+        if(!stream.getTracks().includes(event.track))stream.addTrack(event.track);
+        $('remoteAudio').srcObject=stream;
+        if(item.mode==='video'){
+          $('remoteVideo').srcObject=stream;
+          item.remoteReady=stream.getVideoTracks().some(track=>track.readyState!=='ended');
+          updateVideo(item);
+        }
+      };
       pc.onconnectionstatechange=()=>{
         if(!same(item))return;
         if(pc.connectionState==='connected'){
@@ -159,21 +184,52 @@
     $('hangupCall').onclick=()=>close('通话已结束','hangup');
     $('minimizeCall').onclick=()=>minimize(true);
     $('restoreCall').onclick=()=>minimize(false);
-    let drag=null;
-    $('callHeading').addEventListener('pointerdown',event=>{
-      if(!$('callPanel').classList.contains('isMinimized')||event.target.closest('button'))return;
-      const card=$('callCard'),rect=card.getBoundingClientRect();
-      drag={pointerId:event.pointerId,offsetX:event.clientX-rect.left,offsetY:event.clientY-rect.top};
-      $('callHeading').setPointerCapture(event.pointerId);
+    function swapVideo(source) {
+      const item=current;
+      if(!item||item.mode!=='video'||!item.connectedAt||!item.remoteReady||!item.remoteFrameReady)return;
+      // Only the small preview swaps the views. Media/audio bindings stay unchanged.
+      if(source===(item.selfPrimary?'remoteVideo':'localVideo')){
+        item.selfPrimary=!item.selfPrimary;updateVideo(item);
+      }
+    }
+    for(const id of ['localVideo','remoteVideo']){
+      $(id).onclick=event=>{if(suppressClick){suppressClick=false;event?.preventDefault();return;}swapVideo(id);};
+      $(id).addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();swapVideo(id);}});
+    }
+    for(const name of ['loadeddata','playing'])$('remoteVideo').addEventListener(name,()=>{
+      const item=current,video=$('remoteVideo');
+      if(!item||video.srcObject!==item.remoteStream||video.readyState<2||!video.videoWidth)return;
+      item.remoteFrameReady=true;updateVideo(item);
     });
-    $('callHeading').addEventListener('pointermove',event=>{
+    let drag=null,suppressClick=false;
+    function beginDrag(event,preview=false){
+      if(event.button!==undefined&&event.button!==0)return;
+      if(!current||event.target.closest('button'))return;
+      const mini=$('callPanel').classList.contains('isMinimized');
+      if(!mini&&(!preview||!current.remoteFrameReady||event.currentTarget.id!==(current.selfPrimary?'remoteVideo':'localVideo')))return;
+      const target=mini?$('callCard'):event.currentTarget,rect=target.getBoundingClientRect();
+      drag={pointerId:event.pointerId,target,mini,startX:event.clientX,startY:event.clientY,offsetX:event.clientX-rect.left,offsetY:event.clientY-rect.top,moved:false};
+      suppressClick=false;event.currentTarget.setPointerCapture(event.pointerId);event.stopPropagation?.();
+    }
+    function moveDrag(event){
       if(!drag||drag.pointerId!==event.pointerId)return;
-      const card=$('callCard');
-      card.style.left=Math.max(0,Math.min(innerWidth-card.offsetWidth,event.clientX-drag.offsetX))+'px';
-      card.style.top=Math.max(0,Math.min(innerHeight-card.offsetHeight,event.clientY-drag.offsetY))+'px';
-      card.style.right=card.style.bottom='auto';
-    });
-    for(const name of ['pointerup','pointercancel'])$('callHeading').addEventListener(name,event=>{if(drag?.pointerId===event.pointerId)drag=null;});
+      if(Math.hypot(event.clientX-drag.startX,event.clientY-drag.startY)<6&&!drag.moved)return;
+      drag.moved=true;
+      const target=drag.target,area=$('callVideos'),rect=drag.mini?{left:0,top:0}:area.getBoundingClientRect();
+      const x=Math.max(0,Math.min((drag.mini?innerWidth:area.offsetWidth)-target.offsetWidth,event.clientX-rect.left-drag.offsetX));
+      const y=Math.max(0,Math.min((drag.mini?innerHeight:area.offsetHeight)-target.offsetHeight,event.clientY-rect.top-drag.offsetY));
+      target.style.left=x+'px';target.style.top=y+'px';target.style.right=target.style.bottom='auto';
+      if(!drag.mini)current.previewPosition={x,y};
+      event.preventDefault?.();
+    }
+    for(const id of ['callHeading','callCard','localVideo','remoteVideo']){
+      $(id).addEventListener('pointerdown',event=>beginDrag(event,id.endsWith('Video')));
+      $(id).addEventListener('pointermove',moveDrag);
+      for(const name of ['pointerup','pointercancel'])$(id).addEventListener(name,event=>{
+        if(drag?.pointerId===event.pointerId){suppressClick=drag.moved;drag=null;}
+      });
+    }
+    window.addEventListener('resize',()=>{if(current)updateVideo(current);});
     $('muteCall').onclick=()=>{const item=current;if(!item?.stream)return;const tracks=item.stream.getAudioTracks();item.muted=tracks.some(track=>track.enabled);tracks.forEach(track=>track.enabled=!item.muted);$('muteCall').textContent=item.muted?'取消静音':'静音';};
     window.addEventListener('beforeunload',()=>close('', 'hangup'));
     return {onEvent,snapshot,close,closeActions:()=>actions(false)};
