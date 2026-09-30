@@ -11,6 +11,8 @@ public class LocationPayloadTest {
         LocationPayload item = LocationPayload.parse(body("pin",0,now+3600000),now);
         assertNotNull(item); assertEquals(31.2,item.latitude,0.001); assertEquals(121.5,item.longitude,0.001);
         assertTrue(item.recordedAt.endsWith("Z")); assertTrue(item.mapsUrl().startsWith("https://www.openstreetmap.org/"));
+        assertEquals("geo:31.2,121.5?q=31.2,121.5", item.geoUri());
+        assertEquals("androidamap://viewMap?sourceApplication=Chat&poiname=Chat&lat=31.2&lon=121.5&dev=1", item.amapUri());
     }
     @Test public void expiredIsHistoricalButNeverActive() throws Exception {
         String text = body("live",0,now+1000);

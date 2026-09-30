@@ -455,7 +455,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         for (String peer : peers) {
             if (!matches(peer, messageQuery)) continue;
             JSONObject message = last.get(peer);
-            String preview = message == null ? "点击开始聊天" : message.optString("body", "消息");
+            String preview = message == null ? "点击开始聊天" : HistorySearch.preview(message);
             LinearLayout line = row();
             line.setBackgroundColor(Color.WHITE);
             line.addView(rowItem(peer, peerStatus(peer) + " · " + preview,
@@ -772,15 +772,27 @@ public final class MainActivity extends Activity implements ChatController.Liste
             bubble.addView(preview, new LinearLayout.LayoutParams(dp(235), dp(116)));
             bubble.addView(text(String.format(java.util.Locale.ROOT, "纬度 %.6f · 经度 %.6f", point.latitude, point.longitude), 12, false, INK));
             bubble.addView(text((point.accuracy > 0 ? "精度约 " + Math.round(point.accuracy) + " 米" : "精度未提供") + " · " + MessageTime.format(point.recordedAt), 12, false, MUTED));
-            TextView open = button("点击在地图中查看", 13, GREEN, v -> {
-                new AlertDialog.Builder(this).setTitle("打开外部地图")
-                        .setMessage("将向 OpenStreetMap 打开此坐标。只有此次点击才会把坐标提供给地图网站。")
-                        .setNegativeButton("取消", null).setPositiveButton("打开地图", (d, w) -> {
-                            try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(point.mapsUrl()))); }
-                            catch (Exception unavailable) { Toast.makeText(this, "没有可打开地图的浏览器", Toast.LENGTH_LONG).show(); }
-                        }).show();
-            }); bubble.addView(open);
+            TextView open = button("用地图应用打开", 13, GREEN, v -> openLocationInMap(point));
+            bubble.addView(open);
         } else bubble.addView(text("位置共享已结束", 13, false, MUTED));
+    }
+
+    private void openLocationInMap(LocationPayload point) {
+        new AlertDialog.Builder(this).setTitle("选择地图 · 坐标将提供给外部地图")
+                .setItems(new String[]{"高德地图", "选择其他地图应用", "浏览器打开 OpenStreetMap"}, (dialog, selected) -> {
+                    try {
+                        if (selected == 0) {
+                            Intent amap = new Intent(Intent.ACTION_VIEW, Uri.parse(point.amapUri()));
+                            amap.setPackage("com.autonavi.minimap");
+                            startActivity(amap);
+                        } else if (selected == 1) {
+                            Intent map = new Intent(Intent.ACTION_VIEW, Uri.parse(point.geoUri()));
+                            startActivity(Intent.createChooser(map, "选择地图应用"));
+                        } else startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(point.mapsUrl())));
+                    } catch (Exception unavailable) {
+                        Toast.makeText(this, selected == 0 ? "未安装高德地图，请选择其他地图应用" : "没有可用的地图应用", Toast.LENGTH_LONG).show();
+                    }
+                }).setNegativeButton("取消", null).show();
     }
 
     private void showChatMenu() {

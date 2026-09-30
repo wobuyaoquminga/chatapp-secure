@@ -1,4 +1,4 @@
-const {app,BrowserWindow,Notification,ipcMain,safeStorage,session}=require('electron');
+const {app,BrowserWindow,Notification,ipcMain,safeStorage,session,shell}=require('electron');
 const fs=require('node:fs');
 const path=require('node:path');
 const {pathToFileURL}=require('node:url');
@@ -67,6 +67,17 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
     window.removeMenu();window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
     window.on('focus',()=>window.flashFrame(false));
     window.webContents.on('will-navigate',event=>event.preventDefault());
+    ipcMain.handle('chat:open-map',async(event,latitude,longitude)=>{
+      if(event.sender!==window.webContents||event.senderFrame.url.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
+      if(typeof latitude!=='number'||!Number.isFinite(latitude)||Math.abs(latitude)>90||
+         typeof longitude!=='number'||!Number.isFinite(longitude)||Math.abs(longitude)>180)throw new Error('位置坐标无效');
+      // Only numeric coordinates reach this fixed HTTPS endpoint; renderer text is never a URL.
+      const url=new URL('https://uri.amap.com/marker');
+      url.searchParams.set('position',`${longitude},${latitude}`);
+      url.searchParams.set('coordinate','wgs84');
+      url.searchParams.set('src','Chat');
+      await shell.openExternal(url.href);
+    });
     const geoAllowed=(contents,permission,details)=>['geolocation','geolocation-approximate'].includes(permission)&&contents===window.webContents&&Date.now()<geoUntil&&window.isFocused()&&details?.isMainFrame===true&&details.requestingUrl?.toLowerCase()===entryUrl;
     const mediaAllowed=(contents,permission,details)=>permission==='media'&&contents===window.webContents&&window.isFocused()&&mediaLease.allows({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame,mediaTypes:details?.mediaTypes||(details?.mediaType?[details.mediaType]:null),server:controller.server,generation:controller.generation,call:controller.call});
     session.defaultSession.setPermissionRequestHandler((contents,permission,callback,details)=>callback(geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details)));

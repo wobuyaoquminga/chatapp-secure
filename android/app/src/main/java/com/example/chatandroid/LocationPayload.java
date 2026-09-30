@@ -74,6 +74,10 @@ public final class LocationPayload {
         double result = ((Number)value).doubleValue(); if (!Double.isFinite(result) || result < low || result > high) throw new Exception("Number range"); return result;
     }
     public String mapsUrl() { return "https://www.openstreetmap.org/?mlat=" + latitude + "&mlon=" + longitude + "#map=16/" + latitude + "/" + longitude; }
+    public String geoUri() { return "geo:" + latitude + "," + longitude + "?q=" + latitude + "," + longitude; }
+    // Android location coordinates are WGS84; Amap's dev=1 requests conversion to its map coordinates.
+    public String amapUri() { return "androidamap://viewMap?sourceApplication=Chat&poiname=Chat&lat="
+            + latitude + "&lon=" + longitude + "&dev=1"; }
     /** Session stop is irrevocable; late/out-of-order packets cannot restart it. */
     public static final class Tracker {
         private final Map<String, LocationPayload> latest = new HashMap<>();
