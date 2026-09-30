@@ -45,6 +45,11 @@ test('fresh registration communicates after deletion while duplicate and late ol
     await f.controller.applyAccountDeletion(f.event);
     await f.controller.transaction(()=>f.controller.bindPeerIdentity('bob',{...bundle,accountId:'new-bob'}));
     assert(!f.alice.state.deletedPeers.bob);
+    assert(f.alice.state.identityChanges.bob,'a new registration needs explicit safety verification');
+    await assert.rejects(f.alice.encrypt('bob','blocked before verification'),/核对/);
+    f.controller.request=async()=>({...bundle,accountId:'new-bob'});
+    const safety=await f.controller.safety({peer:'bob'});
+    await f.controller.safety({peer:'bob',confirm:true,expectedCode:safety.code});
     await f.alice.establish('bob',{...bundle,username:'bob',preKey:bundle.preKeys[0]});
     const sent=await f.alice.encrypt('bob','新身份双向通信');
     await reborn.decrypt({...sent,sender:'alice',recipient:'bob',id:'10'});
@@ -101,6 +106,9 @@ test('offline deletion followed by a fresh pending request restores only the new
     assert.equal(f.controller.contactState.bob.status,'pending_incoming');
     assert(!f.alice.state.deletedPeers.bob);
     assert.equal(f.alice.state.peerAccountIds.bob,'new-bob');
+    await assert.rejects(f.controller.send({peer:'bob',body:'必须先核对'}),/核对/);
+    const safety=await f.controller.safety({peer:'bob'});
+    await f.controller.safety({peer:'bob',confirm:true,expectedCode:safety.code});
     await assert.rejects(f.controller.send({peer:'bob',body:'必须先接受'}),/先接受/);
   }finally{f.close();}
 });

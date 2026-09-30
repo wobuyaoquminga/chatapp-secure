@@ -64,7 +64,9 @@ function renderConversation(){
   if(changed&&safetyResult&&safetyResult.publicKey!==changed.identityKey){safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;}
   if(deleted){safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;}
   $('verification').textContent=deleted?'旧身份与安全码已清除，聊天记录保留':(state.verifiedPeers||[]).includes(activePeer)?'安全码已核对':'安全码尚未核对';
-  $('safety').disabled=deleted;
+  // A retired username may be registered again. Keep the safety-code action
+  // available so the user can fetch and explicitly verify the new identity.
+  $('safety').disabled=false;
   const relation=contact(activePeer)?.status;
   const canSend=state.online&&!deleted&&!changed&&(relation==='accepted'||!relation);
   $('send').disabled=!canSend;$('body').disabled=!canSend;

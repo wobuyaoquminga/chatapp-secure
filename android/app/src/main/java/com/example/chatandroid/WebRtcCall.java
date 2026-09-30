@@ -5,11 +5,18 @@ import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Context;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -30,7 +37,6 @@ import org.webrtc.RtpReceiver;
 import org.webrtc.SdpObserver;
 import org.webrtc.SessionDescription;
 import org.webrtc.SurfaceTextureHelper;
-import org.webrtc.SurfaceViewRenderer;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 import java.util.ArrayList;
@@ -46,8 +52,10 @@ final class WebRtcCall {
     private String remoteOffer;
     private Dialog dialog;
     private AlertDialog ringDialog;
-    private TextView status;
-    private SurfaceViewRenderer localView, remoteView;
+    private TextView status, miniLabel, duration;
+    private FrameLayout callRoot, videoFrame, miniTouch;
+    private LinearLayout controls, audioInfo;
+    private CallVideoView localView, remoteView;
     private EglBase egl;
     private PeerConnectionFactory factory;
     private PeerConnection peer;
@@ -65,25 +73,65 @@ final class WebRtcCall {
     private boolean previousSpeaker, previousMicMute;
     private Runnable timeout;
     private Runnable disconnectTimeout;
+    private long connectedAt;
+    private boolean minimized, incomingAccepted;
+    private View activityContent;
+    private int miniX = -1, miniY = -1;
+    private float dragX, dragY;
+    private int dragStartX, dragStartY;
+    private boolean dragged;
+    private final Runnable durationTick = new Runnable() {
+        @Override public void run() {
+            if (session == null) return;
+            String value = elapsedLabel();
+            if (duration != null) duration.setText(value);
+            if (miniLabel != null) miniLabel.setText(session.peer + "\n" + value);
+            main.postDelayed(this, 1000);
+        }
+    };
 
     WebRtcCall(Activity activity, ChatController controller) { this.activity = activity; this.controller = controller; }
     boolean busy() { return session != null; }
     CallSession session() { return session; }
     long context() { return context; }
 
-    void ring(CallSession incoming, String offer, long epoch) {
+    void ring(CallSession incoming, String offer, long epoch, boolean visible) {
         if (busy()) return;
         session = incoming; context = epoch; remoteOffer = offer;
+        incomingAccepted = false;
         timeout = () -> finish("来电已超时", true, "reject");
         main.postDelayed(timeout, 30000);
+        if (!visible) {
+            CallNotifier.showIncoming(activity, incoming);
+            return;
+        }
+        showPendingIncoming();
+    }
+
+    void showPendingIncoming() {
+        if (session == null || session.outgoing || incomingAccepted || ringDialog != null || dialog != null) return;
+        CallNotifier.cancel(activity);
+        CallSession incoming = session;
         ringDialog = new AlertDialog.Builder(activity).setTitle(incoming.peer + " 邀请你" + (incoming.mode.equals("video") ? "视频" : "语音") + "通话")
                 .setMessage("通话媒体由 WebRTC 加密传输。")
                 .setNegativeButton("拒绝", (d, w) -> finish("", true, "reject"))
                 .setPositiveButton("接听", (d, w) -> {
                     if (session != incoming) return;
+                    incomingAccepted = true;
                     ((MainActivity) activity).requestCallPermissions(incoming.mode);
                 })
                 .setOnCancelListener(d -> finish("", true, "reject")).show();
+    }
+
+    void onBackgrounded() {
+        if (session == null || session.outgoing || incomingAccepted || dialog != null) return;
+        if (ringDialog != null) {
+            AlertDialog previous = ringDialog;
+            ringDialog = null;
+            previous.setOnCancelListener(null);
+            previous.dismiss();
+        }
+        CallNotifier.showIncoming(activity, session);
     }
 
     void start(CallSession ready, JSONArray iceServers, long epoch) {
@@ -94,11 +142,14 @@ final class WebRtcCall {
         timeout = () -> finish("通话连接超时", true, "hangup");
         main.postDelayed(timeout, 45000);
         try {
+            CallKeepAliveService.start(activity, ready.mode);
+            CallKeepAliveService.setOnTaskRemoved(() -> main.post(() -> finish("", true, "hangup")));
+            CallNotifier.cancel(activity);
             showDialog();
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(activity).createInitializationOptions());
             egl = EglBase.create();
-            localView.init(egl.getEglBaseContext(), null);
-            remoteView.init(egl.getEglBaseContext(), null);
+            localView.init(egl.getEglBaseContext());
+            remoteView.init(egl.getEglBaseContext());
             localView.setMirror(true);
             factory = PeerConnectionFactory.builder().createPeerConnectionFactory();
             List<PeerConnection.IceServer> servers = parseIce(iceServers);
@@ -162,36 +213,205 @@ final class WebRtcCall {
     }
 
     private void showDialog() {
-        dialog = new Dialog(activity);
-        LinearLayout root = new LinearLayout(activity);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(16, 16, 16, 16);
-        root.setBackgroundColor(Color.rgb(20, 26, 29));
+        dialog = new Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        callRoot = new FrameLayout(activity);
+        callRoot.setBackgroundColor(Color.rgb(20, 26, 29));
+        videoFrame = new FrameLayout(activity);
+        remoteView = new CallVideoView(activity);
+        localView = new CallVideoView(activity);
+        remoteView.setVisibility(View.GONE);
+        videoFrame.addView(remoteView, new FrameLayout.LayoutParams(-1, -1));
+        videoFrame.addView(localView, new FrameLayout.LayoutParams(-1, -1));
+        videoFrame.setVisibility(session.mode.equals("video") ? View.VISIBLE : View.GONE);
+        callRoot.addView(videoFrame, new FrameLayout.LayoutParams(-1, -1));
+
+        audioInfo = new LinearLayout(activity);
+        audioInfo.setOrientation(LinearLayout.VERTICAL);
+        audioInfo.setGravity(Gravity.CENTER);
+        TextView avatar = new TextView(activity);
+        avatar.setText(session.peer.isEmpty() ? "?" : session.peer.substring(0, 1));
+        avatar.setTextSize(42);
+        avatar.setTextColor(Color.WHITE);
+        avatar.setGravity(Gravity.CENTER);
+        avatar.setBackground(roundBackground(Color.rgb(39, 91, 79), dp(48)));
+        audioInfo.addView(avatar, new LinearLayout.LayoutParams(dp(96), dp(96)));
+        TextView peerName = new TextView(activity);
+        peerName.setText(session.peer);
+        peerName.setTextColor(Color.WHITE);
+        peerName.setTextSize(28);
+        peerName.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
+        nameParams.topMargin = dp(24);
+        audioInfo.addView(peerName, nameParams);
+        audioInfo.setVisibility(session.mode.equals("audio") ? View.VISIBLE : View.GONE);
+        callRoot.addView(audioInfo, new FrameLayout.LayoutParams(-1, -1));
+
         status = new TextView(activity);
         status.setText(session.peer + " · " + (session.mode.equals("video") ? "视频" : "语音") + "通话连接中");
-        status.setTextColor(Color.WHITE); status.setTextSize(18);
-        root.addView(status);
-        FrameLayout video = new FrameLayout(activity);
-        remoteView = new SurfaceViewRenderer(activity);
-        localView = new SurfaceViewRenderer(activity);
-        localView.setZOrderMediaOverlay(true);
-        video.addView(remoteView, new FrameLayout.LayoutParams(-1, -1));
-        FrameLayout.LayoutParams thumbnail = new FrameLayout.LayoutParams(dp(110), dp(150), Gravity.TOP | Gravity.RIGHT);
-        video.addView(localView, thumbnail);
-        video.setVisibility(session.mode.equals("video") ? View.VISIBLE : View.GONE);
-        root.addView(video, new LinearLayout.LayoutParams(-1, 0, 1));
-        LinearLayout controls = new LinearLayout(activity);
+        status.setTextColor(Color.WHITE); status.setTextSize(17);
+        status.setGravity(Gravity.CENTER);
+        status.setBackgroundColor(Color.argb(190, 20, 26, 29));
+        status.setPadding(dp(16), dp(24), dp(16), dp(12));
+        callRoot.addView(status, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+
+        duration = new TextView(activity);
+        duration.setTextColor(Color.WHITE);
+        duration.setTextSize(20);
+        duration.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams durationParams = new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER);
+        durationParams.topMargin = dp(160);
+        callRoot.addView(duration, durationParams);
+        duration.setVisibility(session.mode.equals("audio") ? View.VISIBLE : View.GONE);
+
+        controls = new LinearLayout(activity);
+        controls.setGravity(Gravity.CENTER);
+        controls.setBackgroundColor(Color.argb(190, 20, 26, 29));
+        controls.setPadding(dp(8), dp(16), dp(8), dp(28));
+        addButton(controls, "最小化", () -> setMinimized(true));
         addButton(controls, "挂断", () -> finish("", true, "hangup"));
         addButton(controls, "静音", () -> { muted = !muted; if (audioTrack != null) audioTrack.setEnabled(!muted); });
         if (session.mode.equals("video")) {
             addButton(controls, "摄像头", () -> { cameraEnabled = !cameraEnabled; if (videoTrack != null) videoTrack.setEnabled(cameraEnabled); });
             addButton(controls, "切换", () -> { if (camera != null) camera.switchCamera(null); });
         }
-        root.addView(controls);
-        dialog.setContentView(root);
-        dialog.setOnCancelListener(d -> finish("", true, "hangup"));
+        callRoot.addView(controls, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+
+        miniLabel = new TextView(activity);
+        miniLabel.setTextColor(Color.WHITE);
+        miniLabel.setTextSize(14);
+        miniLabel.setGravity(Gravity.CENTER);
+        miniLabel.setVisibility(View.GONE);
+        miniLabel.setBackground(roundBackground(Color.rgb(29, 46, 49), dp(16)));
+        callRoot.addView(miniLabel, new FrameLayout.LayoutParams(-1, -1));
+        miniTouch = new FrameLayout(activity);
+        miniTouch.setContentDescription("拖动通话小窗，点击返回全屏");
+        miniTouch.setVisibility(View.GONE);
+        miniTouch.setOnTouchListener(this::onMiniTouch);
+        callRoot.addView(miniTouch, new FrameLayout.LayoutParams(-1, -1));
+
+        dialog.setContentView(callRoot);
+        dialog.setCanceledOnTouchOutside(false);
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            if (keyCode != KeyEvent.KEYCODE_BACK) return false;
+            if (event.getAction() == KeyEvent.ACTION_UP) setMinimized(true);
+            return true;
+        });
         dialog.show();
-        if (dialog.getWindow() != null) dialog.getWindow().setLayout(-1, -1);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawableResource(android.R.color.transparent);
+            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL);
+            setMinimized(false);
+        }
+        main.post(durationTick);
+    }
+
+    private GradientDrawable roundBackground(int color, int radius) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(color);
+        shape.setCornerRadius(radius);
+        return shape;
+    }
+
+    private String elapsedLabel() {
+        if (connectedAt == 0) return "连接中";
+        long seconds = (SystemClock.elapsedRealtime() - connectedAt) / 1000;
+        if (seconds >= 3600) return String.format(java.util.Locale.ROOT, "%02d:%02d:%02d",
+                seconds / 3600, (seconds / 60) % 60, seconds % 60);
+        return String.format(java.util.Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60);
+    }
+
+    private void setMinimized(boolean value) {
+        if (dialog == null || dialog.getWindow() == null) return;
+        minimized = value;
+        Window window = dialog.getWindow();
+        if (activityContent == null) activityContent = activity.findViewById(android.R.id.content);
+        if (activityContent != null) activityContent.setVisibility(value ? View.VISIBLE : View.INVISIBLE);
+        activity.getWindow().getDecorView().setBackgroundColor(value ? Color.WHITE : Color.rgb(20, 26, 29));
+        status.setVisibility(value ? View.GONE : View.VISIBLE);
+        controls.setVisibility(value ? View.GONE : View.VISIBLE);
+        audioInfo.setVisibility(value ? View.GONE : (session.mode.equals("audio") ? View.VISIBLE : View.GONE));
+        duration.setVisibility(value ? View.GONE : (session.mode.equals("audio") ? View.VISIBLE : View.GONE));
+        miniLabel.setVisibility(value && session.mode.equals("audio") ? View.VISIBLE : View.GONE);
+        miniTouch.setVisibility(value ? View.VISIBLE : View.GONE);
+        if (session.mode.equals("video")) {
+            remoteView.setRounded(value);
+            localView.setRounded(value);
+            localView.setVisibility(value && connectedAt != 0 ? View.GONE : View.VISIBLE);
+            remoteView.setVisibility(connectedAt != 0 ? View.VISIBLE : View.GONE);
+            FrameLayout.LayoutParams localParams = new FrameLayout.LayoutParams(
+                    value || connectedAt == 0 ? -1 : dp(110), value || connectedAt == 0 ? -1 : dp(150),
+                    Gravity.TOP | Gravity.END);
+            localParams.topMargin = value || connectedAt == 0 ? 0 : dp(24);
+            localParams.rightMargin = value || connectedAt == 0 ? 0 : dp(16);
+            localView.setLayoutParams(localParams);
+        }
+        if (value) {
+            window.setBackgroundDrawableResource(android.R.color.transparent);
+            callRoot.setBackground(roundBackground(Color.rgb(20, 26, 29), dp(18)));
+            callRoot.setClipToOutline(true);
+            window.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            window.clearFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL);
+            window.getDecorView().setSystemUiVisibility(0);
+            WindowManager.LayoutParams params = window.getAttributes();
+            params.gravity = Gravity.TOP | Gravity.START;
+            params.width = dp(session.mode.equals("video") ? 190 : 126);
+            params.height = dp(session.mode.equals("video") ? 142 : 126);
+            if (miniX < 0) miniX = Math.max(0, activity.getResources().getDisplayMetrics().widthPixels - params.width - dp(16));
+            if (miniY < 0) miniY = dp(72);
+            params.x = miniX; params.y = miniY;
+            window.setAttributes(params);
+        } else {
+            window.setBackgroundDrawable(new ColorDrawable(Color.rgb(20, 26, 29)));
+            callRoot.setBackgroundColor(Color.rgb(20, 26, 29));
+            callRoot.setClipToOutline(false);
+            window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+            window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            WindowManager.LayoutParams params = window.getAttributes();
+            params.gravity = Gravity.CENTER;
+            params.x = params.y = 0;
+            params.width = params.height = -1;
+            window.setAttributes(params);
+        }
+    }
+
+    private boolean onMiniTouch(View view, MotionEvent event) {
+        if (!minimized || dialog == null || dialog.getWindow() == null) return false;
+        Window window = dialog.getWindow();
+        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            dragX = event.getRawX(); dragY = event.getRawY();
+            dragStartX = miniX; dragStartY = miniY;
+            dragged = false;
+            return true;
+        }
+        if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+            int x = Math.round(event.getRawX() - dragX);
+            int y = Math.round(event.getRawY() - dragY);
+            if (Math.abs(x) > dp(4) || Math.abs(y) > dp(4)) dragged = true;
+            if (dragged) {
+                WindowManager.LayoutParams params = window.getAttributes();
+                miniX = Math.max(0, Math.min(dragStartX + x,
+                        activity.getResources().getDisplayMetrics().widthPixels - params.width));
+                miniY = Math.max(0, Math.min(dragStartY + y,
+                        activity.getResources().getDisplayMetrics().heightPixels - params.height));
+                params.x = miniX; params.y = miniY;
+                window.setAttributes(params);
+            }
+            return true;
+        }
+        if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+            if (!dragged) setMinimized(false);
+            return true;
+        }
+        return true;
     }
 
     private void addButton(LinearLayout row, String label, Runnable action) {
@@ -213,9 +433,11 @@ final class WebRtcCall {
                     if (session != owner) return;
                     if (state == PeerConnection.IceConnectionState.CONNECTED || state == PeerConnection.IceConnectionState.COMPLETED) {
                         session.connected();
+                        if (connectedAt == 0) connectedAt = SystemClock.elapsedRealtime();
                         cancelTimeout();
                         cancelDisconnectTimeout();
                         if (status != null) status.setText(session.peer + " · 通话中");
+                        setMinimized(minimized);
                     } else if (state == PeerConnection.IceConnectionState.DISCONNECTED) {
                         session.disconnected();
                         if (status != null) status.setText(session.peer + " · 连接中断，正在恢复");
@@ -320,12 +542,24 @@ final class WebRtcCall {
         old.state = CallSession.State.ENDED;
         cancelTimeout();
         cancelDisconnectTimeout();
+        main.removeCallbacks(durationTick);
         if (notify && action != null) controller.sendCall(old, action, null, context);
+        CallNotifier.cancel(activity);
+        CallKeepAliveService.stop(activity);
         if (ringDialog != null) {
             AlertDialog previous = ringDialog; ringDialog = null;
             previous.setOnCancelListener(null); previous.dismiss();
         }
         if (dialog != null) { Dialog previous = dialog; dialog = null; previous.setOnCancelListener(null); previous.dismiss(); }
+        if (activityContent != null) { activityContent.setVisibility(View.VISIBLE); activityContent = null; }
+        activity.getWindow().getDecorView().setBackgroundColor(Color.WHITE);
+        callRoot = videoFrame = miniTouch = null;
+        controls = audioInfo = null;
+        status = miniLabel = duration = null;
+        connectedAt = 0;
+        minimized = false;
+        incomingAccepted = false;
+        miniX = miniY = -1;
         if (camera != null) { try { camera.stopCapture(); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } camera.dispose(); camera = null; }
         if (videoTrack != null) { videoTrack.dispose(); videoTrack = null; }
         if (videoSource != null) { videoSource.dispose(); videoSource = null; }

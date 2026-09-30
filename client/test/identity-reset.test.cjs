@@ -38,3 +38,20 @@ test('verified peer reset retains contact/history, requires new safety confirmat
   assert(!c.engine.state.identityChanges.cd,'deletion must clear the obsolete verification requirement');
  }finally{close();}
 });
+test('a missed reset notice still requires manual safety verification before sending',async()=>{
+ const {c,close}=await fixture();try{
+  const old=await SignalEngine.create('cd'),oldBundle=await old.publicBundle(1);
+  await c.engine.establish('cd',{...oldBundle,username:'cd',preKey:oldBundle.preKeys[0]});
+  c.engine.state.peerAccountIds={cd:'old-account'};
+  c.engine.state.verified.cd=oldBundle.identityKey;
+  c.contactState.cd={username:'cd',status:'accepted'};
+  const replacement=await SignalEngine.create('cd'),newBundle=await replacement.publicBundle(1);
+  c.request=async()=>({...newBundle,accountId:'new-account'});
+  const safety=await c.safety({peer:'cd'});
+  assert.equal(c.engine.state.peerAccountIds.cd,'new-account');
+  assert(c.engine.state.identityChanges.cd);
+  await assert.rejects(c.send({peer:'cd',body:'blocked'}),/核对/);
+  await c.safety({peer:'cd',confirm:true,expectedCode:safety.code});
+  assert(!c.engine.state.identityChanges.cd);
+ }finally{close();}
+});

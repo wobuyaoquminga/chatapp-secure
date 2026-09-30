@@ -4,12 +4,26 @@
   function create({command,notice,getState,getPeer}) {
     const $=id=>document.getElementById(id);
     let current=null,actionsOpen=false;
+    function updateVideo(item) {
+      if(!same(item))return;
+      $('callVideos').classList.toggle('hasLocalVideo',!!item.stream);
+      $('callVideos').classList.toggle('showRemote',!!(item.connectedAt&&item.remoteReady));
+    }
+    function minimize(minimized) {
+      $('callPanel').classList.toggle('isMinimized',minimized);
+      $('callPanel').setAttribute('aria-modal',String(!minimized));
+      $('minimizeCall').hidden=minimized;
+      $('restoreCall').hidden=!minimized;
+      if(!minimized){const card=$('callCard');card.style.left=card.style.top=card.style.right=card.style.bottom='';}
+    }
     function actions(open) {actionsOpen=open;$('callActions').hidden=!open;$('toggleCallActions').setAttribute('aria-expanded',String(open));}
     function permitted(peer) {const s=getState(),contact=(s.contactStates||[]).find(item=>item.username===peer);return !!(s.online&&s.username&&contact?.status==='accepted'&&!s.deletedPeers?.[peer]&&!s.identityChanges?.[peer]);}
     function updateButtons() {const allowed=permitted(getPeer())&&!current;$('toggleCallActions').disabled=!allowed;$('startAudioCall').disabled=$('startVideoCall').disabled=!allowed;if(!allowed)actions(false);}
     function view(item,status) {
-      $('callPanel').hidden=false;$('callPeer').textContent=item.peer;$('callStatus').textContent=status;
-      $('callVideos').hidden=item.mode!=='video';$('acceptCall').hidden=item.direction!=='incoming'||item.accepted;
+      $('callPanel').hidden=false;$('callPanel').classList.toggle('modeAudio',item.mode==='audio');$('callPanel').classList.toggle('modeVideo',item.mode==='video');
+      $('callPeer').textContent=item.peer;$('callStatus').textContent=status;
+      $('callVideos').hidden=item.mode!=='video';$('callAudioAvatar').hidden=item.mode==='video';updateVideo(item);
+      $('acceptCall').hidden=item.direction!=='incoming'||item.accepted;
       $('rejectCall').hidden=item.direction!=='incoming'||item.accepted;$('muteCall').hidden=!item.stream;
       $('hangupCall').hidden=item.direction==='incoming'&&!item.accepted;
       $('muteCall').textContent=item.muted?'取消静音':'静音';
@@ -25,7 +39,7 @@
       current=null;clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);clearInterval(item.durationTimer);
       item.pc?.close();item.stream?.getTracks().forEach(track=>track.stop());
       $('localVideo').srcObject=null;$('remoteVideo').srcObject=null;$('remoteAudio').srcObject=null;
-      $('callPanel').hidden=true;actions(false);updateButtons();
+      minimize(false);$('callPanel').hidden=true;actions(false);updateButtons();
       command('revokeCallMediaPermission').catch(()=>{});
       if(sendAction)command('sendCall',{peer:item.peer,callId:item.id,mode:item.mode,action:sendAction}).catch(()=>command('cancelCall',{callId:item.id}).catch(()=>{}));
       else command('cancelCall',{callId:item.id}).catch(()=>{});
@@ -36,12 +50,12 @@
       const servers=await iceServers();if(!same(item))return;
       const pc=new RTCPeerConnection({iceServers:servers});item.pc=pc;
       pc.onicecandidate=event=>{if(!event.candidate||!same(item))return;const payload=JSON.stringify(event.candidate.toJSON());if(!item.descriptionSent)item.pendingIce.push(payload);else signal(item,'ice',payload).catch(error=>close(error.message));};
-      pc.ontrack=event=>{if(!same(item))return;const stream=event.streams[0]||new MediaStream([event.track]);$(item.mode==='video'?'remoteVideo':'remoteAudio').srcObject=stream;};
+      pc.ontrack=event=>{if(!same(item))return;const stream=event.streams[0]||new MediaStream([event.track]);$(item.mode==='video'?'remoteVideo':'remoteAudio').srcObject=stream;if(item.mode==='video'){item.remoteReady=stream.getVideoTracks().length>0;updateVideo(item);}};
       pc.onconnectionstatechange=()=>{
         if(!same(item))return;
         if(pc.connectionState==='connected'){
           clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);
-          if(!item.connectedAt)item.connectedAt=Date.now();
+          if(!item.connectedAt)item.connectedAt=Date.now();updateVideo(item);
           clearInterval(item.durationTimer);
           const elapsed=()=>{if(same(item)){$('callStatus').textContent='通话中 · '+new Date(Date.now()-item.connectedAt).toISOString().slice(11,19);}};
           elapsed();item.durationTimer=setInterval(elapsed,1000);
@@ -62,6 +76,7 @@
       if(!same(item)){item.stream?.getTracks().forEach(track=>track.stop());return;}
       for(const track of item.stream.getTracks())pc.addTrack(track,item.stream);
       if(item.mode==='video')$('localVideo').srcObject=item.stream;
+      updateVideo(item);
       view(item,item.direction==='incoming'?'正在接通…':'正在呼叫…');
     }
     async function flushIce(item) {
@@ -75,7 +90,7 @@
     async function start(mode) {
       const peer=getPeer();if(current||!permitted(peer))return;
       actions(false);const item={peer,mode,id:crypto.randomUUID(),direction:'outgoing',accepted:true,ice:[],pendingIce:[],descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
-      current=item;view(item,'准备通话…');armTimeout(item);updateButtons();
+      current=item;minimize(false);view(item,'准备通话…');armTimeout(item);updateButtons();
       try{
         await command('beginCall',{peer,callId:item.id,mode});if(!same(item))return;
         await setup(item);if(!same(item))return;
@@ -103,7 +118,7 @@
         if(current||!permitted(event.from)){command('sendCall',{peer:event.from,callId:event.callId,mode:event.mode,action:'busy'}).catch(()=>{});return;}
         if(typeof event.payload!=='string')return;
         const item={peer:event.from,mode:event.mode,id:event.callId,direction:'incoming',accepted:false,offer:event.payload,ice:[],pendingIce:[],descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
-        current=item;actions(false);view(item,'来电 · '+(item.mode==='video'?'视频':'语音'));armTimeout(item);updateButtons();return;
+        current=item;minimize(false);actions(false);view(item,'来电 · '+(item.mode==='video'?'视频':'语音'));armTimeout(item);updateButtons();return;
       }
       const item=current;if(!item||item.id!==event.callId||item.peer!==event.from||item.mode!==event.mode)return;
       if(['reject','busy','hangup'].includes(event.action)){close(event.action==='busy'?'对方正在通话':'对方已结束通话');return;}
@@ -125,6 +140,23 @@
     $('startAudioCall').onclick=()=>start('audio');$('startVideoCall').onclick=()=>start('video');
     $('acceptCall').onclick=accept;$('rejectCall').onclick=()=>close('已拒绝来电','reject');
     $('hangupCall').onclick=()=>close('通话已结束','hangup');
+    $('minimizeCall').onclick=()=>minimize(true);
+    $('restoreCall').onclick=()=>minimize(false);
+    let drag=null;
+    $('callHeading').addEventListener('pointerdown',event=>{
+      if(!$('callPanel').classList.contains('isMinimized')||event.target.closest('button'))return;
+      const card=$('callCard'),rect=card.getBoundingClientRect();
+      drag={pointerId:event.pointerId,offsetX:event.clientX-rect.left,offsetY:event.clientY-rect.top};
+      $('callHeading').setPointerCapture(event.pointerId);
+    });
+    $('callHeading').addEventListener('pointermove',event=>{
+      if(!drag||drag.pointerId!==event.pointerId)return;
+      const card=$('callCard');
+      card.style.left=Math.max(0,Math.min(innerWidth-card.offsetWidth,event.clientX-drag.offsetX))+'px';
+      card.style.top=Math.max(0,Math.min(innerHeight-card.offsetHeight,event.clientY-drag.offsetY))+'px';
+      card.style.right=card.style.bottom='auto';
+    });
+    for(const name of ['pointerup','pointercancel'])$('callHeading').addEventListener(name,event=>{if(drag?.pointerId===event.pointerId)drag=null;});
     $('muteCall').onclick=()=>{const item=current;if(!item?.stream)return;const tracks=item.stream.getAudioTracks();item.muted=tracks.some(track=>track.enabled);tracks.forEach(track=>track.enabled=!item.muted);$('muteCall').textContent=item.muted?'取消静音':'静音';};
     window.addEventListener('beforeunload',()=>close('', 'hangup'));
     return {onEvent,snapshot,close};

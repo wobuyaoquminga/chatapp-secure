@@ -297,6 +297,7 @@ class Controller {
     if(!retired&&known&&info.accountId&&known!==info.accountId)throw new Error('对方设备身份已更新，请等待服务器身份通知后重试');
     const result=await this.engine.safety(peer,info.identityKey);
     if(info.accountId)(this.engine.state.peerAccountIds ||= {})[peer]=info.accountId;
+    if(retired)(this.engine.state.identityChanges ||= {})[peer]={identityKey:info.identityKey,accountId:info.accountId,message:'对方账号已重新注册，请核对新的安全码'};
     return result;
   }
   async applyAccountDeletion(event) {
@@ -470,7 +471,15 @@ class Controller {
     if(!this.engine||!validUser(peer)||peer===this.user)throw new Error('先选择另一位用户');
     const info=await this.request('/api/keys/'+encodeURIComponent(peer));
     const result=await this.transaction(async()=>{
-      const result=await this.bindPeerIdentity(peer,info);
+      const state=this.engine.state,known=state.peerAccountIds?.[peer],trusted=state.trusted?.[peer+'.1'];
+      const changed=!state.deletedPeers?.[peer]&&((known&&info.accountId&&known!==info.accountId)||(trusted&&trusted!==info.identityKey));
+      let result;
+      if(changed){
+        await this.engine.retirePeer(peer,'对方设备身份已更新，旧消息未发送');
+        result=await this.engine.safety(peer,info.identityKey);
+        if(info.accountId)(state.peerAccountIds ||= {})[peer]=info.accountId;
+        (state.identityChanges ||= {})[peer]={identityKey:info.identityKey,accountId:info.accountId,message:'对方设备身份已更新，请重新核对安全码'};
+      }else result=await this.bindPeerIdentity(peer,info);
       if(confirm) {
         if(expectedCode!==result.code)throw new Error('安全码已改变，请重新核对');
         this.engine.state.verified[peer]=info.identityKey;if(this.engine.state.identityChanges)delete this.engine.state.identityChanges[peer];result.verified=true;

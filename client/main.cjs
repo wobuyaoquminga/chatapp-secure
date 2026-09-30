@@ -1,4 +1,4 @@
-const {app,BrowserWindow,ipcMain,safeStorage,session}=require('electron');
+const {app,BrowserWindow,Notification,ipcMain,safeStorage,session}=require('electron');
 const fs=require('node:fs');
 const path=require('node:path');
 const {pathToFileURL}=require('node:url');
@@ -35,18 +35,37 @@ const testAppData=profile.startsWith('qa-migrate-')&&process.argv.includes('--te
 app.setPath('userData',userDataRoot(testAppData||app.getPath('appData')));
 if(!app.requestSingleInstanceLock()){app.quit();}else{
   let window,controller,geoUntil=0,geoPeer='',geoGeneration=-1;
+  let incomingNotice;
   const mediaLease=new MediaLease();
+  if(process.platform==='win32')app.setAppUserModelId('Chat');
   app.on('second-instance',()=>{window?.show();window?.focus();});
   app.whenReady().then(()=>{
     const entry=path.join(__dirname,'ui','index.html');
     // Chromium upper-cases the drive letter of a file: URL while Node keeps the case it was
     // launched with, so both sides are folded before comparing, exactly as Windows paths are.
     const entryUrl=pathToFileURL(entry).href.toLowerCase();
-    controller=new Controller(app.getPath('userData'),safeStorage,event=>{if(window&&!window.isDestroyed())window.webContents.send(event?.type?.startsWith('call')?'chat:call':'chat:event',event);});
+    controller=new Controller(app.getPath('userData'),safeStorage,event=>{
+      if(!window||window.isDestroyed())return;
+      window.webContents.send(event?.type?.startsWith('call')?'chat:call':'chat:event',event);
+      if(event?.type==='call'&&event.event?.action==='offer'){
+        window.flashFrame(true);
+        try{
+          incomingNotice?.close();
+          if(Notification.isSupported()){
+            incomingNotice=new Notification({title:'Chat 来电',body:`${event.event.from} 邀请你${event.event.mode==='video'?'视频':'语音'}通话`,silent:false});
+            incomingNotice.on('click',()=>{if(window.isMinimized())window.restore();window.show();window.focus();});
+            incomingNotice.show();
+          }
+        }catch{ /* Taskbar flash remains available if system notifications are blocked. */ }
+      }else if(event?.type==='call_end'||event?.type==='call_error'){
+        incomingNotice?.close();incomingNotice=undefined;window.flashFrame(false);
+      }
+    });
     window=new BrowserWindow({width:1040,height:900,minWidth:560,minHeight:650,show:false,title:'Chat',
       icon:path.join(__dirname,'assets','icon.ico'),
       webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,devTools:!app.isPackaged}});
     window.removeMenu();window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+    window.on('focus',()=>window.flashFrame(false));
     window.webContents.on('will-navigate',event=>event.preventDefault());
     const geoAllowed=(contents,permission,details)=>['geolocation','geolocation-approximate'].includes(permission)&&contents===window.webContents&&Date.now()<geoUntil&&window.isFocused()&&details?.isMainFrame===true&&details.requestingUrl?.toLowerCase()===entryUrl;
     const mediaAllowed=(contents,permission,details)=>permission==='media'&&contents===window.webContents&&window.isFocused()&&mediaLease.allows({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame,mediaTypes:details?.mediaTypes||(details?.mediaType?[details.mediaType]:null),server:controller.server,generation:controller.generation,call:controller.call});

@@ -79,8 +79,17 @@ test('media permission requires matching foreground document, server, call and m
 
 function uiFixture(options={}) {
   const elements=new Map(),sent=[],pcs=[],notices=[];
-  const element=id=>{if(!elements.has(id))elements.set(id,{hidden:false,disabled:false,textContent:'',srcObject:null,setAttribute(){}});return elements.get(id);};
-  const stream={getTracks:()=>[{stop(){},enabled:true}],getAudioTracks:()=>[{enabled:true}]};
+  const element=id=>{
+    if(!elements.has(id)){
+      const classes=new Set(),listeners={};
+      elements.set(id,{hidden:false,disabled:false,textContent:'',srcObject:null,style:{},offsetWidth:280,offsetHeight:235,
+        classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains:name=>classes.has(name)},
+        setAttribute(){},addEventListener(name,handler){listeners[name]=handler;},dispatch(name,event){listeners[name]?.(event);},
+        setPointerCapture(){},getBoundingClientRect:()=>({left:20,top:20})});
+    }
+    return elements.get(id);
+  };
+  const stream={getTracks:()=>[{stop(){},enabled:true}],getAudioTracks:()=>[{enabled:true}],getVideoTracks:()=>[{enabled:true}]};
   class FakePeer {
     constructor(){pcs.push(this);this.added=[];this.connectionState='new';}
     addTrack(){}
@@ -91,7 +100,7 @@ function uiFixture(options={}) {
     async addIceCandidate(candidate){this.added.push(candidate);}
     close(){}
   }
-  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,setTimeout,clearTimeout,setInterval,clearInterval};
+  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,setTimeout,clearTimeout,setInterval,clearInterval,innerWidth:1000,innerHeight:800};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../ui/calls.js'),'utf8'),sandbox);
   const command=async(action,payload)=>{if(action==='callIce')return [{urls:'stun:test'}];if(action==='sendCall')sent.push(payload);return true;};
   const calls=sandbox.window.ChatCalls.create({command,notice:message=>notices.push(message),getState:()=>({online:true,username:'alice',contactStates:[{username:'bob',status:'accepted'}]}),getPeer:()=> 'bob'});
@@ -143,4 +152,48 @@ test('missing microphone reports an actionable error and releases the call',asyn
   await f.element('startAudioCall').onclick();
   assert.equal(f.element('callPanel').hidden,true);
   assert.match(f.notices.at(-1),/未找到可用的麦克风/);
+});
+
+test('video call starts at phone size, shows self until connected, and switches to remote video',async()=>{
+  const css=fs.readFileSync(path.join(__dirname,'../ui/style.css'),'utf8');
+  assert.match(css,/\.callCard\{width:min\(390px,100%\);height:min\(844px,calc\(100dvh - 32px\)\)/);
+  assert.match(css,/\.callPanel\.isMinimized\.modeVideo \.callCard\{width:min\(280px,calc\(100vw - 24px\)\);height:min\(200px,calc\(100vh - 24px\)\)/);
+  const f=uiFixture();
+  await f.element('startVideoCall').onclick();
+  assert.equal(f.element('callPanel').hidden,false);
+  assert.equal(f.element('callPanel').classList.contains('isMinimized'),false);
+  assert.equal(f.element('callPanel').classList.contains('modeVideo'),true);
+  assert.equal(f.element('callVideos').classList.contains('hasLocalVideo'),true);
+  assert.equal(f.element('callVideos').classList.contains('showRemote'),false);
+  f.pcs[0].ontrack({track:{kind:'video'},streams:[{getVideoTracks:()=>[{}]}]});
+  assert.equal(f.element('callVideos').classList.contains('showRemote'),false);
+  f.pcs[0].connectionState='connected';f.pcs[0].onconnectionstatechange();
+  assert.equal(f.element('callVideos').classList.contains('showRemote'),true);
+  f.element('minimizeCall').onclick();
+  assert.equal(f.element('callPanel').classList.contains('modeVideo'),true);
+  assert.equal(f.element('callPanel').classList.contains('isMinimized'),true);
+  f.calls.close();
+});
+
+test('call minimizes to a draggable overlay and restores to its initial layout',async()=>{
+  const css=fs.readFileSync(path.join(__dirname,'../ui/style.css'),'utf8');
+  assert.match(css,/\.callPanel\.isMinimized\.modeAudio \.callCard\{width:min\(190px,calc\(100vw - 24px\)\);height:min\(190px,calc\(100vh - 24px\)\)/);
+  const f=uiFixture();
+  await f.element('startAudioCall').onclick();
+  f.element('minimizeCall').onclick();
+  assert.equal(f.element('callPanel').classList.contains('isMinimized'),true);
+  assert.equal(f.element('callPanel').classList.contains('modeAudio'),true);
+  assert.equal(f.element('restoreCall').hidden,false);
+  const heading=f.element('callHeading');
+  heading.dispatch('pointerdown',{pointerId:1,clientX:30,clientY:30,target:{closest:()=>null}});
+  heading.dispatch('pointermove',{pointerId:1,clientX:140,clientY:120});
+  heading.dispatch('pointerup',{pointerId:1});
+  assert.equal(f.element('callCard').style.left,'130px');
+  assert.equal(f.element('callCard').style.top,'110px');
+  f.element('restoreCall').onclick();
+  assert.equal(f.element('callPanel').classList.contains('isMinimized'),false);
+  assert.equal(f.element('callPanel').classList.contains('modeAudio'),true);
+  assert.equal(f.element('callCard').style.left,'');
+  assert.equal(f.element('callCard').style.top,'');
+  f.calls.close();
 });

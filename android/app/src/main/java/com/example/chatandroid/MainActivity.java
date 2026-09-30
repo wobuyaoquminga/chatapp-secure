@@ -54,6 +54,9 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private static final int CALL_PERMISSION = 502;
     private String pendingCallMode = "", pendingCallPeer = "";
     private long pendingCallContext;
+    private CallSession pendingReadyCall;
+    private JSONArray pendingReadyIce;
+    private long pendingReadyContext;
     private boolean callToolsExpanded, callPreparing;
     private LinearLayout callActions;
     private LocationSharing locationSharing;
@@ -139,18 +142,27 @@ public final class MainActivity extends Activity implements ChatController.Liste
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        if (signedIn()) CallNotifier.ensurePermission(this);
+        if (call != null) call.showPendingIncoming();
+        if (pendingReadyCall != null) {
+            CallSession ready = pendingReadyCall;
+            JSONArray ice = pendingReadyIce;
+            long context = pendingReadyContext;
+            pendingReadyCall = null;
+            pendingReadyIce = null;
+            if (context == controller.locationContext() && ready.state != CallSession.State.ENDED
+                    && (ready.outgoing || call.session() == ready)) call.start(ready, ice, context);
+        }
         main.removeCallbacks(expiryRefresh);
         main.post(expiryRefresh);
     }
 
     @Override protected void onStop() {
         foreground = false;
+        if (call != null) call.onBackgrounded();
         main.removeCallbacks(expiryRefresh);
         if (locationSharing != null) locationSharing.stopLive();
         pendingLocationPeer = pendingLocationAction = "";
-        callPreparing = false;
-        pendingCallPeer = pendingCallMode = "";
-        if (call != null && call.busy()) call.finish("应用进入后台，通话结束", true, "hangup");
         super.onStop();
     }
 
@@ -1058,9 +1070,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     @Override public void onCallReady(CallSession session, JSONArray iceServers, long context) {
         callPreparing = false;
-        if (destroyed || !foreground || call == null) return;
+        if (destroyed || call == null) return;
         if (session.outgoing && call.busy()) return;
         if (!session.outgoing && call.session() != session) return;
+        if (!foreground) {
+            pendingReadyCall = session;
+            pendingReadyIce = iceServers;
+            pendingReadyContext = context;
+            return;
+        }
         call.start(session, iceServers, context);
     }
 
@@ -1072,8 +1090,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
             try {
                 CallSession incoming = new CallSession(frame.getString("callId"), frame.getString("from"),
                         frame.getString("fromAccountId"), frame.getString("mode"), false);
-                if (!foreground || call.busy() || callPreparing) controller.sendCall(incoming, "busy", null, context);
-                else call.ring(incoming, CallSession.parseSdpPayload("offer", frame.getString("payload")), context);
+                if (call.busy() || callPreparing || pendingReadyCall != null) controller.sendCall(incoming, "busy", null, context);
+                else call.ring(incoming, CallSession.parseSdpPayload("offer", frame.getString("payload")), context, foreground);
             } catch (Exception ignored) { }
         } else call.signal(frame);
     }
@@ -1081,6 +1099,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
     @Override public void onCallContextLost() {
         callPreparing = false;
         pendingCallPeer = pendingCallMode = "";
+        pendingReadyCall = null;
+        pendingReadyIce = null;
         if (call != null) call.finish("连接已断开，通话结束", false, null);
     }
 
@@ -1275,6 +1295,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         JSONObject oldChanges = state.optJSONObject("identityChanges");
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
+        if (foreground && !wasSigned && signedIn()) CallNotifier.ensurePermission(this);
         if (call != null && call.busy()) {
             CallSession active = call.session();
             JSONObject relations = state.optJSONObject("relationships");
