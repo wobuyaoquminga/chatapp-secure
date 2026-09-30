@@ -67,6 +67,19 @@ final class WebRtcCall {
     private SurfaceTextureHelper textureHelper;
     private final List<IceCandidate> earlyIce = new ArrayList<>();
     private final List<String> pendingLocalIce = new ArrayList<>();
+    // Local candidates are trickled: a phone with Wi-Fi, mobile data and a mirroring link can
+    // gather enough candidates to trip the server's call-signal budget in a single burst.
+    private final CallSignalPacer outboundIce = new CallSignalPacer();
+    private boolean icePumpScheduled;
+    private final Runnable icePump = new Runnable() {
+        @Override public void run() {
+            icePumpScheduled = false;
+            if (session == null) { outboundIce.clear(); return; }
+            String next = outboundIce.poll(SystemClock.elapsedRealtime());
+            if (next != null) controller.sendCall(session, "ice", next, context);
+            if (outboundIce.size() > 0) scheduleIcePump();
+        }
+    };
     private boolean remoteDescriptionSet, descriptionSent, muted, cameraEnabled = true;
     private AudioManager audioManager;
     private int previousMode;
@@ -139,7 +152,9 @@ final class WebRtcCall {
         if (epoch != controller.locationContext()) { finish("连接已改变", false, null); return; }
         session = ready; context = epoch;
         cancelTimeout();
-        timeout = () -> finish("通话连接超时", true, "hangup");
+        timeout = () -> finish(connectedAt == 0
+                ? "通话连接超时：双方网络可能无法直连，需要 TURN 中继"
+                : "通话连接超时", true, "hangup");
         main.postDelayed(timeout, 45000);
         try {
             CallKeepAliveService.start(activity, ready.mode);
@@ -424,6 +439,13 @@ final class WebRtcCall {
 
     private int dp(int size) { return Math.round(size * activity.getResources().getDisplayMetrics().density); }
 
+    private void scheduleIcePump() {
+        if (icePumpScheduled || session == null) return;
+        icePumpScheduled = true;
+        main.postDelayed(icePump, CallSignalPacer.INTERVAL_MS);
+    }
+    private void queueIce(String payload) { if (outboundIce.enqueue(payload)) scheduleIcePump(); }
+
     private PeerConnection.Observer observer() {
         CallSession owner = session;
         return new PeerConnection.Observer() {
@@ -450,7 +472,9 @@ final class WebRtcCall {
                             main.postDelayed(disconnectTimeout, 15000);
                         }
                     } else if (state == PeerConnection.IceConnectionState.FAILED || state == PeerConnection.IceConnectionState.CLOSED)
-                        finish("通话已断开", true, "hangup");
+                        finish(connectedAt == 0
+                                ? "通话无法建立：双方网络无法直连，可能需要配置 TURN 中继"
+                                : "通话已断开", true, "hangup");
                 });
             }
             @Override public void onIceConnectionReceivingChange(boolean receiving) { }
@@ -462,7 +486,7 @@ final class WebRtcCall {
                     try { data.put("sdpMid", candidate.sdpMid).put("sdpMLineIndex", candidate.sdpMLineIndex)
                             .put("candidate", candidate.sdp); }
                     catch (Exception ignored) { return; }
-                    if (descriptionSent) controller.sendCall(session, "ice", data.toString(), context);
+                    if (descriptionSent) queueIce(data.toString());
                     else if (pendingLocalIce.size() < 128) pendingLocalIce.add(data.toString());
                 });
             }
@@ -489,7 +513,7 @@ final class WebRtcCall {
                 peer.setLocalDescription(sdp(() -> {
                     controller.sendCall(owner, action, CallSession.sdpPayload(action, description.description), context);
                     descriptionSent = true;
-                    for (String candidate : pendingLocalIce) controller.sendCall(owner, "ice", candidate, context);
+                    for (String candidate : pendingLocalIce) queueIce(candidate);
                     pendingLocalIce.clear();
                 }), description);
             }); }
@@ -577,7 +601,9 @@ final class WebRtcCall {
             audioManager.setMode(previousMode);
             audioManager = null;
         }
-        earlyIce.clear(); pendingLocalIce.clear(); remoteOffer = null;
+        earlyIce.clear(); pendingLocalIce.clear(); outboundIce.clear();
+        main.removeCallbacks(icePump); icePumpScheduled = false;
+        remoteOffer = null;
         remoteDescriptionSet = false; descriptionSent = false;
         if (!message.isEmpty()) Toast.makeText(activity, message, Toast.LENGTH_SHORT).show();
     }

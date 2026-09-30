@@ -637,6 +637,35 @@ class ChatIntegrationTest {
             assertThat(a.await("call_error").path("error").asText()).contains("联系人");
         }
     }
+    @Test void callSignalBurstFromMultiHomedClientIsForwarded() throws Exception {
+        var caller = account(); var callee = account();
+        store.save(caller.name(), callee.name(), UUID.randomUUID().toString(), wire("invite"));
+        accept(callee, caller);
+        String callId = UUID.randomUUID().toString();
+        try (var a = new Client(caller); var b = new Client(callee)) {
+            a.send(Map.of("type", "call", "to", callee.name(), "toAccountId", accountId(callee),
+                "callId", callId, "action", "offer", "mode", "video", "payload", "test-sdp"));
+            assertThat(b.await("call").path("action").asText()).isEqualTo("offer");
+            // A multi-homed Windows host gathers ~30 ICE candidates; the whole burst is legitimate.
+            for (int i = 0; i < 40; i++)
+                a.send(Map.of("type", "call", "to", callee.name(), "toAccountId", accountId(callee),
+                    "callId", callId, "action", "ice", "mode", "video", "payload", "candidate-" + i));
+            for (int i = 0; i < 40; i++)
+                assertThat(b.await("call").path("payload").asText()).isEqualTo("candidate-" + i);
+        }
+    }
+    @Test void callSignalFloodIsStillRejected() throws Exception {
+        var caller = account(); var callee = account();
+        store.save(caller.name(), callee.name(), UUID.randomUUID().toString(), wire("invite"));
+        accept(callee, caller);
+        String callId = UUID.randomUUID().toString();
+        try (var a = new Client(caller); var b = new Client(callee)) {
+            for (int i = 0; i < 100; i++)
+                a.send(Map.of("type", "call", "to", callee.name(), "toAccountId", accountId(callee),
+                    "callId", callId, "action", "ice", "mode", "audio", "payload", "flood-" + i));
+            assertThat(a.await("call_error").path("error").asText()).contains("频繁");
+        }
+    }
     @Test void iceEndpointRequiresJwtAndUsesConfiguredStun() {
         assertThat(rest.getForEntity("/api/calls/ice", String.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         var a = account();

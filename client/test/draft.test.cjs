@@ -12,7 +12,7 @@ function fixture(){
   };
   const sandbox={
     document:{getElementById:element,addEventListener(){}},
-    window:{addEventListener(){},ChatFeatures:{},ChatCalls:{create:()=>({snapshot(){}})},chat:{
+    window:{addEventListener(){},ChatFeatures:{},ChatCalls:{create:()=>({snapshot(){},closeActions(){}})},chat:{
       onCall(){},onLocationStop(){},subscribe(){},
       command:(action,payload)=>action==='send'
         ?new Promise(resolve=>pending.push({payload,resolve}))

@@ -584,15 +584,19 @@ public final class MainActivity extends Activity implements ChatController.Liste
             callToolsExpanded = !callToolsExpanded;
             if (callActions != null) callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
         });
-        callToggle.setContentDescription("展开通话选项");
+        callToggle.setContentDescription("展开聊天功能");
         bar.addView(callToggle, new LinearLayout.LayoutParams(dp(44), dp(44)));
         body.addView(bar);
         callActions = row();
         callActions.setBackgroundColor(Color.WHITE);
         callActions.setPadding(dp(12), dp(4), dp(12), dp(12));
-        callActions.addView(button("语音通话", 16, GREEN, v -> requestCallPermissions("audio")),
+        callActions.addView(button("语音通话", 13, GREEN, v -> requestCallPermissions("audio")),
                 new LinearLayout.LayoutParams(0, dp(48), 1));
-        callActions.addView(button("视频通话", 16, GREEN, v -> requestCallPermissions("video")),
+        callActions.addView(button("视频通话", 13, GREEN, v -> requestCallPermissions("video")),
+                new LinearLayout.LayoutParams(0, dp(48), 1));
+        callActions.addView(button("发送位置", 13, GREEN, v -> requestLocation(detailPeer, "pin")),
+                new LinearLayout.LayoutParams(0, dp(48), 1));
+        callActions.addView(button("共享位置", 13, GREEN, v -> promptLiveLocation()),
                 new LinearLayout.LayoutParams(0, dp(48), 1));
         callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
         body.addView(callActions);
@@ -797,9 +801,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private void showChatMenu() {
         new AlertDialog.Builder(this).setTitle("聊天菜单")
-                .setItems(new String[]{"位置", "查找聊天记录"}, (d, which) -> {
-                    if (which == 0) showLocationMenu(); else showHistorySearch();
-                }).show();
+                .setItems(new String[]{"查找聊天记录"}, (d, which) -> showHistorySearch()).show();
     }
 
     private boolean canSendLocation(String peer) {
@@ -807,24 +809,30 @@ public final class MainActivity extends Activity implements ChatController.Liste
                 && !identityChanged(peer) && "accepted".equals(relation(peer));
     }
 
-    private void showLocationMenu() {
-        if (!canSendLocation(detailPeer) && !locationSharing.isLive()) {
-            Toast.makeText(this, "位置需要在线且双方已同意聊天；历史记录仍可查找", Toast.LENGTH_LONG).show();
+    private void promptLiveLocation() {
+        if (locationSharing.isLive()) {
+            new AlertDialog.Builder(this).setTitle("实时位置共享中")
+                    .setMessage("正在与 " + locationSharing.peer() + " 共享位置。")
+                    .setNegativeButton("继续共享", null)
+                    .setPositiveButton("停止共享", (dialog, which) -> locationSharing.stopLive()).show();
+            return;
+        }
+        if (!canSendLocation(detailPeer)) {
+            Toast.makeText(this, "位置需要在线且双方已同意聊天", Toast.LENGTH_LONG).show();
             return;
         }
         String peer = detailPeer;
-        new AlertDialog.Builder(this).setTitle(locationSharing.isLive() ? "位置 · 正在与 " + locationSharing.peer() + " 共享" : "位置")
-                .setItems(new String[]{"发送当前位置", "共享实时位置（最多 1 小时）", "停止共享"}, (d, which) -> {
-                    if (which == 2) locationSharing.stopLive();
-                    else if (which == 1) new AlertDialog.Builder(this).setTitle("共享实时位置")
-                            .setMessage("仅在应用前台、在线时发送位置，最多 1 小时。离开应用或断线会停止，可随时点“停止共享”。")
-                            .setNegativeButton("取消", null).setPositiveButton("开始共享", (a, b) -> requestLocation(peer, "live")).show();
-                    else requestLocation(peer, "pin");
-                }).show();
+        new AlertDialog.Builder(this).setTitle("共享实时位置")
+                .setMessage("仅在应用前台、在线时发送位置，最多 1 小时。离开应用或断线会停止，可随时点“停止共享”。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("开始共享", (dialog, which) -> requestLocation(peer, "live")).show();
     }
 
     private void requestLocation(String peer, String action) {
-        if (!canSendLocation(peer)) return;
+        if (!canSendLocation(peer)) {
+            Toast.makeText(this, "位置需要在线且双方已同意聊天", Toast.LENGTH_LONG).show();
+            return;
+        }
         if (locationSharing.hasPermission()) { performLocation(peer, action); return; }
         pendingLocationPeer = peer;
         pendingLocationAction = action;

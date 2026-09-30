@@ -197,7 +197,10 @@ public class ChatSocket extends TextWebSocketHandler {
             if (now - sender.callWindowStarted >= 1_000_000_000L) {
                 sender.callWindowStarted = now; sender.callsInWindow = 0;
             }
-            if (++sender.callsInWindow > 30) throw new IllegalArgumentException("通话信令发送过于频繁");
+            // A multi-homed Windows host legitimately gathers ~30 ICE candidates before a call can
+            // start; clients pace their trickle at 20 signals per second, so this bound only stops
+            // abuse while leaving headroom for one unpaced candidate burst.
+            if (++sender.callsInWindow > 60) throw new IllegalArgumentException("通话信令发送过于频繁");
             if (!store.currentGeneration(peer, accountId)) throw new IllegalArgumentException("对方设备身份已更新");
             var contact = store.contact(sender.user, peer);
             if (contact == null || !"accepted".equals(contact.status())) throw new IllegalArgumentException("双方须先互相接受联系人请求");

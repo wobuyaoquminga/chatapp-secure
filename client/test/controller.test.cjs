@@ -74,6 +74,41 @@ test('old outgoing history does not block a new first message after revocation',
     await assert.rejects(controller.send({peer:'小红',body:'第二条'}),/等待对方接受/);
   }finally{close();}
 });
+test('accepting a chat request learns the peer account id so a call works immediately',async()=>{
+  const {controller,close}=fixture();
+  try{
+    const accountId='2f1c8d0e-6f1b-4a3c-9d2e-1b0a7c4f5e60',calls=[];
+    controller.contactState['小红']={username:'小红',status:'pending_incoming',online:true};
+    controller.engine.state.peerAccountIds={};
+    controller.engine.state.identityChanges={};
+    controller.engine.safety=async()=>{};
+    controller.request=async(endpoint,method)=>{
+      calls.push([endpoint,method]);
+      if(endpoint==='/api/contacts')return [{username:'小红',status:'accepted',online:true}];
+      if(endpoint.startsWith('/api/keys/'))return {accountId,identityKey:'identity'};
+      return {};
+    };
+    await controller.acceptContact({peer:'小红'});
+    assert.deepEqual(calls[0],['/api/contacts/accept','POST']);
+    assert.equal(controller.engine.state.peerAccountIds['小红'],accountId);
+    assert.equal(controller.contactState['小红'].status,'accepted');
+  }finally{close();}
+});
+test('a failed peer lookup does not undo an accepted request',async()=>{
+  const {controller,close}=fixture();
+  try{
+    controller.contactState['小红']={username:'小红',status:'pending_incoming',online:true};
+    controller.engine.state.peerAccountIds={};
+    controller.engine.state.identityChanges={};
+    controller.request=async(endpoint)=>{
+      if(endpoint.startsWith('/api/keys/'))throw new Error('服务器故障');
+      if(endpoint==='/api/contacts')return [{username:'小红',status:'accepted',online:true}];
+      return {};
+    };
+    await controller.acceptContact({peer:'小红'});
+    assert.equal(controller.contactState['小红'].status,'accepted');
+  }finally{close();}
+});
 test('pending request blocks a second outgoing message before consuming a prekey',async()=>{
   const {controller,close}=fixture();
   try{

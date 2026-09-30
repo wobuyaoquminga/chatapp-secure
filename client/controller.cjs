@@ -164,6 +164,13 @@ class Controller {
     if(!this.engine||!validUser(peer)||this.contactState[peer]?.status!=='pending_incoming')throw new Error('没有待接受的聊天请求');
     await this.request('/api/contacts/accept','POST',{peer});
     await this.transaction(()=>{if(this.engine.state.hiddenContacts)delete this.engine.state.hiddenContacts[peer];});
+    // Accepting is also the moment this peer becomes callable, so fetch its public bundle now:
+    // without the account id a call fails with "请刷新联系人" until the chat is reopened.
+    // A lookup failure must not undo the relation the server already accepted.
+    try {
+      const info=await this.request('/api/keys/'+encodeURIComponent(peer));
+      await this.transaction(()=>this.bindPeerIdentity(peer,info));
+    } catch { /* the next send or safety check retries the lookup */ }
     await this.refreshContacts();return this.snapshot();
   }
   async replenish(own) {

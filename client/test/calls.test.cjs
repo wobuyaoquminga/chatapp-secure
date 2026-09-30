@@ -77,8 +77,22 @@ test('media permission requires matching foreground document, server, call and m
   now+=20001;assert.equal(lease.allows(request),false);
 });
 
+// Deterministic clock so pacing can be asserted without sleeping.
+function fakeTimers(){
+  let now=0,id=0;const jobs=new Map();
+  return {
+    setTimeout(fn,ms){const t=++id;jobs.set(t,{fn,at:now+(ms||0),repeat:0});return t;},
+    clearTimeout(t){jobs.delete(t);},
+    setInterval(fn,ms){const t=++id;jobs.set(t,{fn,at:now+(ms||1),repeat:ms||1});return t;},
+    clearInterval(t){jobs.delete(t);},
+    tick(ms){const end=now+ms;for(;;){let best=-1,bestAt=Infinity;for(const[t,j]of jobs)if(j.at<=end&&j.at<bestAt){best=t;bestAt=j.at;}if(best<0)break;now=bestAt;const job=jobs.get(best);if(job.repeat)job.at=now+job.repeat;else jobs.delete(best);job.fn();}now=end;},
+    pending:()=>jobs.size,
+  };
+}
+
 function uiFixture(options={}) {
   const elements=new Map(),sent=[],pcs=[],notices=[];
+  const timers=options.timers||{setTimeout,clearTimeout,setInterval,clearInterval};
   const element=id=>{
     if(!elements.has(id)){
       const classes=new Set(),listeners={};
@@ -100,7 +114,7 @@ function uiFixture(options={}) {
     async addIceCandidate(candidate){this.added.push(candidate);}
     close(){}
   }
-  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,setTimeout,clearTimeout,setInterval,clearInterval,innerWidth:1000,innerHeight:800};
+  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:class {},crypto,...timers,innerWidth:1000,innerHeight:800};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../ui/calls.js'),'utf8'),sandbox);
   const command=async(action,payload)=>{if(action==='callIce')return [{urls:'stun:test'}];if(action==='sendCall')sent.push(payload);return true;};
   const calls=sandbox.window.ChatCalls.create({command,notice:message=>notices.push(message),getState:()=>({online:true,username:'alice',contactStates:[{username:'bob',status:'accepted'}]}),getPeer:()=> 'bob'});
@@ -122,6 +136,40 @@ test('WebRTC queues remote ICE until SDP and sends local ICE after offer or answ
   await outgoing.element('startAudioCall').onclick();
   assert.deepEqual(outgoing.sent.map(item=>item.action),['offer','ice']);
   outgoing.calls.close();
+});
+
+test('multi-homed ICE burst is paced below the server call-signal budget and never dropped',async()=>{
+  const timers=fakeTimers(),f=uiFixture({timers});
+  await f.element('startAudioCall').onclick();
+  const pc=f.pcs[0];
+  const iceSent=()=>f.sent.filter(item=>item.action==='ice').length;
+  assert.equal(iceSent(),1,'the buffered candidate leaves with the offer');
+  // A Windows host with virtual adapters gathers ~30 host/TCP candidates in one burst.
+  for(let i=0;i<30;i++)pc.onicecandidate({candidate:{toJSON:()=>({candidate:'host-'+i,sdpMid:'0',sdpMLineIndex:0})}});
+  assert.equal(iceSent(),1,'a burst waits for the pacing tick instead of flooding the socket');
+  timers.tick(50);
+  assert.equal(iceSent(),2);
+  timers.tick(1000);
+  assert.ok(iceSent()-2<=20, `at most 20 candidates per second, saw ${iceSent()-2}`);
+  timers.tick(5000);
+  assert.equal(iceSent(),31,'every gathered candidate is still delivered exactly once');
+  f.calls.close();
+  assert.equal(timers.pending(),0,'closing the call stops the pacer');
+});
+
+test('a call that never connects explains the network instead of reporting a normal end',async()=>{
+  const never=uiFixture();
+  await never.element('startAudioCall').onclick();
+  never.pcs[0].connectionState='failed';never.pcs[0].onconnectionstatechange();
+  assert.match(never.notices.at(-1),/TURN/);
+  never.calls.close();
+
+  const dropped=uiFixture();
+  await dropped.element('startAudioCall').onclick();
+  dropped.pcs[0].connectionState='connected';dropped.pcs[0].onconnectionstatechange();
+  dropped.pcs[0].connectionState='failed';dropped.pcs[0].onconnectionstatechange();
+  assert.equal(dropped.notices.at(-1),'通话连接已结束');
+  dropped.calls.close();
 });
 
 test('late call end and duplicate answer do not stop the current call',async()=>{

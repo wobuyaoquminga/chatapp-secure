@@ -1,6 +1,10 @@
 /* Ephemeral WebRTC calls. SDP, ICE and media are never written to the message vault. */
 (() => {
   const fallbackIce=[{urls:'stun:stun.l.google.com:19302'}];
+  // A multi-homed host can gather 30+ ICE candidates. Sending one WebSocket frame per candidate
+  // bursts past the server's per-second call-signal budget and kills the call, so local candidates
+  // are trickled one at a time with a fixed gap (20 messages/second).
+  const ICE_SIGNAL_MS=50;
   function create({command,notice,getState,getPeer}) {
     const $=id=>document.getElementById(id);
     let current=null,actionsOpen=false;
@@ -34,9 +38,21 @@
       if(!same(item))return;
       await command('sendCall',{peer:item.peer,callId:item.id,mode:item.mode,action,...(payload===undefined?{}:{payload})});
     }
+    function pumpIce(item) {
+      if(!same(item))return;
+      const next=item.outIce.shift();
+      if(next===undefined){clearInterval(item.paceTimer);item.paceTimer=null;return;}
+      signal(item,'ice',next).catch(error=>close(error.message));
+    }
+    function queueIce(item,payload) {
+      if(!same(item)||item.outIce.length>=128)return;
+      item.outIce.push(payload);
+      // The first candidate leaves immediately so a direct path is not delayed by the pacing gap.
+      if(!item.paceTimer){pumpIce(item);item.paceTimer=setInterval(()=>pumpIce(item),ICE_SIGNAL_MS);}
+    }
     function close(reason='',sendAction='') {
       const item=current;if(!item)return;
-      current=null;clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);clearInterval(item.durationTimer);
+      current=null;clearTimeout(item.timeout);clearTimeout(item.disconnectTimer);clearInterval(item.durationTimer);clearInterval(item.paceTimer);item.paceTimer=null;
       item.pc?.close();item.stream?.getTracks().forEach(track=>track.stop());
       $('localVideo').srcObject=null;$('remoteVideo').srcObject=null;$('remoteAudio').srcObject=null;
       minimize(false);$('callPanel').hidden=true;actions(false);updateButtons();
@@ -49,7 +65,7 @@
     async function setup(item) {
       const servers=await iceServers();if(!same(item))return;
       const pc=new RTCPeerConnection({iceServers:servers});item.pc=pc;
-      pc.onicecandidate=event=>{if(!event.candidate||!same(item))return;const payload=JSON.stringify(event.candidate.toJSON());if(!item.descriptionSent)item.pendingIce.push(payload);else signal(item,'ice',payload).catch(error=>close(error.message));};
+      pc.onicecandidate=event=>{if(!event.candidate||!same(item))return;const payload=JSON.stringify(event.candidate.toJSON());if(!item.descriptionSent)item.pendingIce.push(payload);else queueIce(item,payload);};
       pc.ontrack=event=>{if(!same(item))return;const stream=event.streams[0]||new MediaStream([event.track]);$(item.mode==='video'?'remoteVideo':'remoteAudio').srcObject=stream;if(item.mode==='video'){item.remoteReady=stream.getVideoTracks().length>0;updateVideo(item);}};
       pc.onconnectionstatechange=()=>{
         if(!same(item))return;
@@ -61,7 +77,8 @@
           elapsed();item.durationTimer=setInterval(elapsed,1000);
         }
         if(pc.connectionState==='disconnected'){$('callStatus').textContent='连接中断，正在重连…';clearTimeout(item.disconnectTimer);item.disconnectTimer=setTimeout(()=>{if(same(item)&&pc.connectionState==='disconnected')close('通话连接已断开','hangup');},15000);}
-        if(['failed','closed'].includes(pc.connectionState))close('通话连接已结束','hangup');
+        if(['failed','closed'].includes(pc.connectionState))
+          close(item.connectedAt?'通话连接已结束':'通话无法建立：双方网络无法直连，可能需要配置 TURN 中继','hangup');
       };
       await command('callMediaPermission',{peer:item.peer,callId:item.id,mode:item.mode});
       if(!same(item))return;
@@ -85,11 +102,11 @@
     }
     async function flushLocalIce(item) {
       item.descriptionSent=true;
-      while(item.pendingIce.length&&same(item))await signal(item,'ice',item.pendingIce.shift());
+      while(item.pendingIce.length&&same(item))queueIce(item,item.pendingIce.shift());
     }
     async function start(mode) {
       const peer=getPeer();if(current||!permitted(peer))return;
-      actions(false);const item={peer,mode,id:crypto.randomUUID(),direction:'outgoing',accepted:true,ice:[],pendingIce:[],descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
+      actions(false);const item={peer,mode,id:crypto.randomUUID(),direction:'outgoing',accepted:true,ice:[],pendingIce:[],outIce:[],paceTimer:null,descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
       current=item;minimize(false);view(item,'准备通话…');armTimeout(item);updateButtons();
       try{
         await command('beginCall',{peer,callId:item.id,mode});if(!same(item))return;
@@ -117,7 +134,7 @@
         if(current?.id===event.callId&&current.peer===event.from&&current.mode===event.mode)return;
         if(current||!permitted(event.from)){command('sendCall',{peer:event.from,callId:event.callId,mode:event.mode,action:'busy'}).catch(()=>{});return;}
         if(typeof event.payload!=='string')return;
-        const item={peer:event.from,mode:event.mode,id:event.callId,direction:'incoming',accepted:false,offer:event.payload,ice:[],pendingIce:[],descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
+        const item={peer:event.from,mode:event.mode,id:event.callId,direction:'incoming',accepted:false,offer:event.payload,ice:[],pendingIce:[],outIce:[],paceTimer:null,descriptionSent:false,pc:null,stream:null,timeout:null,disconnectTimer:null};
         current=item;minimize(false);actions(false);view(item,'来电 · '+(item.mode==='video'?'视频':'语音'));armTimeout(item);updateButtons();return;
       }
       const item=current;if(!item||item.id!==event.callId||item.peer!==event.from||item.mode!==event.mode)return;
@@ -159,7 +176,7 @@
     for(const name of ['pointerup','pointercancel'])$('callHeading').addEventListener(name,event=>{if(drag?.pointerId===event.pointerId)drag=null;});
     $('muteCall').onclick=()=>{const item=current;if(!item?.stream)return;const tracks=item.stream.getAudioTracks();item.muted=tracks.some(track=>track.enabled);tracks.forEach(track=>track.enabled=!item.muted);$('muteCall').textContent=item.muted?'取消静音':'静音';};
     window.addEventListener('beforeunload',()=>close('', 'hangup'));
-    return {onEvent,snapshot,close};
+    return {onEvent,snapshot,close,closeActions:()=>actions(false)};
   }
   window.ChatCalls={create};
 })();

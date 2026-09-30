@@ -403,8 +403,21 @@ final class ChatController {
             JSONObject contact = relationships.optJSONObject(peer);
             contact.put("status", "accepted");
             clearHiddenContact(peer);
+            bindAcceptedPeer(peer);
             publish("");
         });
+    }
+
+    /**
+     * Accepting the request is the moment the peer becomes callable, so learn its account id and
+     * safety number now. Without this a call fails with "请先在此会话发送消息" until the user
+     * happens to open the chat again. A lookup failure must not undo the accepted relation.
+     */
+    private void bindAcceptedPeer(String peer) {
+        try {
+            JSONObject identity = requestObject("/api/keys/" + Usernames.path(peer), "GET", null);
+            transaction(() -> { engine.bindPeer(peer, identity, false); return null; });
+        } catch (Exception ignored) { }
     }
 
     void removeContact(String peer) {
