@@ -30,6 +30,8 @@ jobs:
         working-directory: client
       - run: node test/ui-smoke.cjs
         working-directory: client
+        env:
+          CHAT_UI_QA_DIR: ${{ runner.temp }}/chat-ui-qa
       - run: npm run package
         working-directory: client
   android:
@@ -41,6 +43,9 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-35 build-tools;35.0.0
+          log-accepted-android-sdk-licenses: false
       - uses: gradle/actions/setup-gradle@v4
       - run: bash gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
         working-directory: android
