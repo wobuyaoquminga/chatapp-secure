@@ -28,6 +28,8 @@ jobs:
         working-directory: client
       - run: npm test
         working-directory: client
+      - run: node node_modules/electron/install.js
+        working-directory: client
       - run: node test/ui-smoke.cjs
         working-directory: client
         env:
