@@ -50,11 +50,12 @@ public final class CallKeepAliveService extends Service {
                 .setCategory(Notification.CATEGORY_CALL)
                 .build();
         boolean video = intent != null && "video".equals(intent.getStringExtra(MODE));
-        int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                | (video ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA : 0);
         try {
-            if (Build.VERSION.SDK_INT >= 29) startForeground(ACTIVE_ID, notification, types);
-            else startForeground(ACTIVE_ID, notification);
+            if (Build.VERSION.SDK_INT >= 30) {
+                int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                        | (video ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA : 0);
+                startForeground(ACTIVE_ID, notification, types);
+            } else startForeground(ACTIVE_ID, notification);
         } catch (RuntimeException denied) {
             stopSelf(startId);
             return START_NOT_STICKY;

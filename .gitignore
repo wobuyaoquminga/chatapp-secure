@@ -7,6 +7,9 @@ release/
 **/*.vault
 **/*.vault.tmp
 **/*.vault.compact
+**/*.vault.history
+**/*.vault.history.*
+**/*.vault.migrated*
 **/accounts.journal.compact
 **/*.mv.db
 **/*.trace.db

@@ -29,4 +29,13 @@ public final class AndroidManifestTest {
                 "android.permission.CAMERA"
         }) assertTrue("missing " + permission, permissions.contains(permission));
     }
+    @Test public void runtimeConfigurationChangesPreserveActivityAndLiveSession() throws Exception {
+        Path root = Path.of(System.getProperty("chat.root"));
+        Element activity = (Element) DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(root.resolve("android/app/src/main/AndroidManifest.xml").toFile())
+                .getElementsByTagName("activity").item(0);
+        Set<String> handled = new HashSet<>(java.util.Arrays.asList(activity.getAttribute("android:configChanges").split("\\|")));
+        for (String change : new String[]{"fontScale", "density", "uiMode", "locale", "layoutDirection", "orientation", "screenSize"})
+            assertTrue("Activity would recreate on " + change, handled.contains(change));
+    }
 }

@@ -87,9 +87,9 @@ class ChatIntegrationTest {
         try (var alice = new Client(a); var bob = new Client(b)) {
             String first = send(alice, b, "invitation", id);
             assertThat(send(alice, b, "invitation", id)).isEqualTo(first);
-            alice.send(Map.of("type", "send", "to", b.name(), "ciphertext", wire("second"), "clientId", UUID.randomUUID().toString()));
+            alice.send(Map.of("type", "send", "to", b.name(), "toAccountId", accountId(b), "ciphertext", wire("second"), "clientId", UUID.randomUUID().toString()));
             assertThat(alice.await("error").path("error").asText()).contains("接受");
-            bob.send(Map.of("type", "send", "to", a.name(), "ciphertext", wire("reverse"), "clientId", UUID.randomUUID().toString()));
+            bob.send(Map.of("type", "send", "to", a.name(), "toAccountId", accountId(a), "ciphertext", wire("reverse"), "clientId", UUID.randomUUID().toString()));
             assertThat(bob.await("error").path("error").asText()).contains("接受");
             assertThat(contacts(a).get(0).path("status").asText()).isEqualTo("pending_outgoing");
             assertThat(contacts(b).get(0).path("status").asText()).isEqualTo("pending_incoming");
@@ -131,9 +131,9 @@ class ChatIntegrationTest {
             assertThat(a.await("message").path("message").path("id").asText()).isEqualTo(fresh);
             assertThat(contacts(bob).get(0).path("status").asText()).isEqualTo("pending_outgoing");
             assertThat(contacts(alice).get(0).path("status").asText()).isEqualTo("pending_incoming");
-            b.send(Map.of("type", "send", "to", alice.name(), "ciphertext", wire("blocked sender"), "clientId", UUID.randomUUID().toString()));
+            b.send(Map.of("type", "send", "to", alice.name(), "toAccountId", accountId(alice), "ciphertext", wire("blocked sender"), "clientId", UUID.randomUUID().toString()));
             assertThat(b.await("error").path("error").asText()).contains("接受");
-            a.send(Map.of("type", "send", "to", bob.name(), "ciphertext", wire("blocked receiver"), "clientId", UUID.randomUUID().toString()));
+            a.send(Map.of("type", "send", "to", bob.name(), "toAccountId", accountId(bob), "ciphertext", wire("blocked receiver"), "clientId", UUID.randomUUID().toString()));
             assertThat(a.await("error").path("error").asText()).contains("接受");
             assertThat(rest.exchange("/api/contacts/accept", HttpMethod.POST,
                 new HttpEntity<>(Map.of("peer", alice.name()), bearer(bob)), String.class).getStatusCode())
@@ -199,7 +199,7 @@ class ChatIntegrationTest {
         try (var alice = new Client(a)) {
             String first = send(alice, b, "once", clientId);
             assertThat(send(alice, b, "once", clientId)).isEqualTo(first);
-            alice.send(Map.of("type", "send", "to", b.name(), "ciphertext", wire("changed"), "clientId", clientId));
+            alice.send(Map.of("type", "send", "to", b.name(), "toAccountId", accountId(b), "ciphertext", wire("changed"), "clientId", clientId));
             assertThat(alice.await("error").path("error").asText()).contains("clientId");
         }
         assertThat(history(a, b.name()).size()).isEqualTo(1);
@@ -207,7 +207,7 @@ class ChatIntegrationTest {
     @Test void thirdPartyCannotReadOrAckAndSenderCannotBeSpoofed() throws Exception {
         var a = account(); var b = account(); var c = account();
         try (var alice = new Client(a); var attacker = new Client(c)) {
-            alice.send(Map.of("type", "send", "to", b.name(), "ciphertext", wire("private"), "sender", c.name(), "clientId", UUID.randomUUID().toString()));
+            alice.send(Map.of("type", "send", "to", b.name(), "toAccountId", accountId(b), "ciphertext", wire("private"), "sender", c.name(), "clientId", UUID.randomUUID().toString()));
             var m = alice.await("accepted").path("message");
             assertThat(m.path("sender").asText()).isEqualTo(a.name());
             attacker.send(Map.of("type", "ack", "id", m.path("id").asText())); attacker.await("error");
@@ -249,7 +249,7 @@ class ChatIntegrationTest {
         try (var alice = new Client(a)) {
             alice.socket.sendText("not-json", true).join(); alice.await("error");
             for (String body : List.of(" ", "x".repeat(66000))) {
-                alice.send(Map.of("type", "send", "to", b.name(), "ciphertext", body, "clientId", UUID.randomUUID().toString())); alice.await("error");
+                alice.send(Map.of("type", "send", "to", b.name(), "toAccountId", accountId(b), "ciphertext", body, "clientId", UUID.randomUUID().toString())); alice.await("error");
             }
             alice.send(Map.of("type", "send", "to", "missing_user", "ciphertext", wire("test"), "clientId", UUID.randomUUID().toString())); alice.await("error");
             send(alice, b, "still connected", UUID.randomUUID().toString());
@@ -302,6 +302,112 @@ class ChatIntegrationTest {
             alice.await("error");
         }
         assertThat(history(a,b.name()).size()).isZero();
+    }
+
+    @Test void missingRecipientGenerationDoesNotStoreCiphertext() throws Exception {
+        var a = account(); var b = account();
+        try (var sender = new Client(a)) {
+            sender.send(Map.of("type", "send", "to", b.name(), "ciphertext", wire("legacy outbox"), "clientId", UUID.randomUUID().toString()));
+            assertThat(sender.await("error").path("error").asText()).contains("toAccountId");
+        }
+        assertThat(history(a, b.name())).isEmpty();
+    }
+
+    Map<String,Object> keyBatch(int count) {
+        String ec = Base64.getEncoder().encodeToString(new byte[33]);
+        String signature = Base64.getEncoder().encodeToString(new byte[64]);
+        String kyber = Base64.getEncoder().encodeToString(new byte[1569]);
+        List<Object> batch = new ArrayList<>();
+        for (int i=1; i<=count; i++) batch.add(Map.of("id", i, "publicKey", ec, "kyberPublicKey", kyber, "kyberSignature", signature));
+        return new HashMap<>(Map.of("identityKey", ec, "registrationId", 10,
+            "signedPreKey", Map.of("id", 1, "publicKey", ec, "signature", signature), "preKeys", batch));
+    }
+
+    @Test void validatesFullKyberBatchesAndRejectsDuplicateIdsTransactionally() {
+        var user = account();
+        var batch = keyBatch(100);
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(batch, bearer(user)), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM one_time_keys WHERE username=?", Integer.class, user.name())).isEqualTo(100);
+        var oversized = keyBatch(101);
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(oversized, bearer(user)), String.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var duplicate = keyBatch(1);
+        Object key = ((List<?>) duplicate.get("preKeys")).get(0);
+        duplicate.put("preKeys", List.of(key, key));
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(duplicate, bearer(user)), String.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        var malformed = keyBatch(1);
+        malformed.put("preKeys", List.of(Map.of("id", 101, "publicKey", Base64.getEncoder().encodeToString(new byte[33]),
+            "kyberPublicKey", Base64.getEncoder().encodeToString(new byte[1568]), "kyberSignature", Base64.getEncoder().encodeToString(new byte[64]))));
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(malformed, bearer(user)), String.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM one_time_keys WHERE username=?", Integer.class, user.name())).isEqualTo(100);
+    }
+
+    @Test void concurrentClaimsAreUniqueRateLimitedAndKeepOnlyTombstoneIds() throws Exception {
+        var requester = account(); var target = account();
+        var bundle = keyBatch(10);
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(bundle, bearer(target)), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        ExecutorService pool = Executors.newFixedThreadPool(6);
+        try {
+            List<Future<Integer>> claims = new ArrayList<>();
+            for (int i=0; i<6; i++) claims.add(pool.submit(() -> {
+                var response = rest.exchange("/api/keys/"+target.name()+"/claim", HttpMethod.POST, auth(requester), JsonNode.class);
+                assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                return response.getBody().path("preKey").path("id").asInt();
+            }));
+            Set<Integer> ids = new HashSet<>();
+            for (var claim : claims) ids.add(claim.get(10, TimeUnit.SECONDS));
+            assertThat(ids).hasSize(6);
+        } finally { pool.shutdownNow(); }
+        assertThat(rest.exchange("/api/keys/"+target.name()+"/claim", HttpMethod.POST, auth(requester), String.class).getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM consumed_prekeys WHERE username=?", Integer.class, target.name())).isEqualTo(6);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM one_time_keys WHERE username=?", Integer.class, target.name())).isEqualTo(4);
+        assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(bundle, bearer(target)), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM one_time_keys WHERE username=?", Integer.class, target.name())).isEqualTo(4);
+        Account reset = resetAccount(target, 97);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM consumed_prekeys WHERE username=?", Integer.class, target.name())).isZero();
+        assertThat(rest.exchange("/api/keys/"+target.name()+"/claim", HttpMethod.POST, auth(account()), JsonNode.class).getBody().path("preKey").path("id").asInt()).isEqualTo(1);
+    }
+
+    @Test void firstClaimSupportsInvitationsButAnIncomingRequestCannotConsumeReverseKeys() throws Exception {
+        var a = account(); var b = account();
+        for (var user : List.of(a, b)) assertThat(rest.exchange("/api/keys", HttpMethod.PUT,
+            new HttpEntity<>(keyBatch(1), bearer(user)), String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(rest.exchange("/api/keys/"+b.name()+"/claim", HttpMethod.POST, auth(a), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        try (var sender = new Client(a)) { send(sender, b, "first invitation", UUID.randomUUID().toString()); }
+        assertThat(rest.exchange("/api/keys/"+a.name()+"/claim", HttpMethod.POST, auth(b), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM one_time_keys WHERE username=?", Integer.class, a.name())).isEqualTo(1);
+        accept(b, a);
+        assertThat(rest.exchange("/api/keys/"+a.name()+"/claim", HttpMethod.POST, auth(b), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test void renewalKeepsAnAuthenticatedTransportOpenBeyondTheOldTokenExpiry() throws Exception {
+        var user = account();
+        try (var client = new Client(new Account(user.name(), token(user.name(), Instant.now().plusSeconds(2))))) {
+            client.send(Map.of("type", "auth", "token", user.token()));
+            client.await("reauthenticated");
+            assertThat(client.closed.isDone()).isFalse();
+            Thread.sleep(2200);
+            client.send(Map.of("type", "ping")); client.await("pong");
+            assertThat(client.closed.isDone()).isFalse();
+        }
+    }
+
+    @Test void oneHundredLargePendingMessagesDrainWithinTheByteBudgetWithoutDisconnecting() throws Exception {
+        var sender = account(); var recipient = account();
+        String ciphertext = json.writeValueAsString(Map.of("v", 1, "type", 2,
+            "data", Base64.getEncoder().encodeToString(new byte[44000])));
+        for (int i=0; i<100; i++) {
+            store.save(sender.name(), recipient.name(), UUID.randomUUID().toString(), ciphertext);
+            if (i==0) accept(recipient, sender);
+        }
+        try (var client = new Client(recipient)) {
+            long previous = 0;
+            for (int i=0; i<100; i++) {
+                long id = client.await("message").path("message").path("id").asLong();
+                assertThat(id).isGreaterThan(previous); previous = id;
+            }
+            assertThat(client.closed.isDone()).isFalse();
+            assertThat(db.queryForObject("SELECT COUNT(*) FROM messages WHERE recipient=? AND acknowledged=FALSE", Integer.class, recipient.name())).isEqualTo(100);
+        }
     }
     JsonNode accountEvents(Account account) {
         var response = rest.exchange("/api/account-events", HttpMethod.GET, auth(account), JsonNode.class);
@@ -547,6 +653,8 @@ class ChatIntegrationTest {
         assertThat(accountEvents(nextB).get(0).path("id").asText()).isEqualTo(oldEvent);
         assertThat(store.accountEvents(b.name(), oldBGeneration)).isEmpty();
         assertThat(rest.exchange("/api/keys", HttpMethod.PUT, new HttpEntity<>(resetBundle(44), bearer(a)), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(rest.exchange("/api/keys/" + latestA.name() + "/claim", HttpMethod.POST, auth(nextB), JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        accept(nextB, latestA);
         assertThat(rest.exchange("/api/keys/" + latestA.name() + "/claim", HttpMethod.POST, auth(nextB), JsonNode.class).getBody().path("accountId").asText()).isEqualTo(accountId(latestA));
     }
     @Test void resetNotifiesFormerHistoricalPeerWithoutRecreatingContact() throws Exception {

@@ -1,5 +1,8 @@
+param([string]$Version = '')
 $ErrorActionPreference = 'Stop'
 $project = $PSScriptRoot
+$projectItem = Get-Item -LiteralPath $project
+if ($projectItem.Target) { $project = [string](@($projectItem.Target)[0]) }
 $adbCandidates = @()
 if ($env:ANDROID_HOME) { $adbCandidates += Join-Path $env:ANDROID_HOME 'platform-tools/adb.exe' }
 if ($env:ANDROID_SDK_ROOT) { $adbCandidates += Join-Path $env:ANDROID_SDK_ROOT 'platform-tools/adb.exe' }
@@ -19,7 +22,19 @@ $serial = ($ready[0] -split '\s+')[0]
 $abi = (& $adb -s $serial shell getprop ro.product.cpu.abi).Trim()
 if ($abi -notmatch '^[a-z0-9_-]+$') { throw 'Could not identify phone CPU architecture.' }
 $apk = Join-Path $project "app/build/outputs/apk/debug/app-$abi-debug.apk"
-if (!(Test-Path -LiteralPath $apk) -and $abi -eq 'arm64-v8a') { $apk = Join-Path $project '../../Chat-Android-arm64-v8a-debug.apk' }
+if (!(Test-Path -LiteralPath $apk)) {
+    $outputs = [IO.Path]::GetFullPath((Join-Path $project '../..'))
+    if ($Version) {
+        if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must use a numeric form such as 0.5.8.' }
+        $release = Join-Path $outputs "Chat-v$Version"
+    } else {
+        $release = Get-ChildItem -LiteralPath $outputs -Directory -Filter 'Chat-v*' |
+            Where-Object { $_.Name -match '^Chat-v\d+\.\d+\.\d+$' } |
+            Sort-Object { [version]$_.Name.Substring(6) } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ($release) { $apk = Join-Path $release "Chat-Android-$abi-debug.apk" }
+}
 if (!(Test-Path -LiteralPath $apk)) { throw "No APK for $abi. Build first with gradlew.bat assembleDebug." }
 & $adb -s $serial install -r $apk
 if ($LASTEXITCODE -ne 0) { throw 'APK installation failed. Check the phone for an installation prompt.' }

@@ -11,12 +11,13 @@ class Controller {
   constructor(directory,safeStorage,notify,connectionOptions={}) {
     this.vaults=path.join(directory,'vaults');this.safeStorage=safeStorage;this.notify=notify;
     this.registry=new AccountRegistry(directory,safeStorage);this.queue=Promise.resolve();this.generation=0;
-    this.connectionOptions={...DEFAULT_CONNECTION_OPTIONS,...connectionOptions};this.retryAttempt=0;
+    this.connectionOptions={...DEFAULT_CONNECTION_OPTIONS,...connectionOptions};this.retryAttempt=0;this.authEpoch=0;this.refreshAttempts=0;
     this.status='未登录';this.online=false;this.contactState={};this.liveSessions=new Map();
-    this.call=null;
+    this.call=null;this.messageRevision=0;this.snapshotRevision=0;this.sessionPeers=new Set();this.messageChanges={};this.pendingMessageChanges={};this.serverMessageKeys=new Map();this.unread={};this.activePeer='';this.foreground=false;
   }
   serial(task) { const run=this.queue.then(task);this.queue=run.catch(()=>{});return run; }
-  snapshot() {
+  snapshot(includeMessages=true) {
+    if(includeMessages&&this.engine)this.rebuildMessageMetadata();
     let accounts=[],servers=[],selectedServer='';
     // Read/decrypt once per update so all three fields describe one committed index.
     // Do not cache across updates: corruption and changes on disk must remain visible.
@@ -28,35 +29,65 @@ class Controller {
     }
     catch(e){this.listError=e.message;}
     const contacts=Object.values(this.contactState).filter(item=>item.status==='accepted'&&!this.engine?.state.deletedPeers?.[item.username]&&!this.engine?.state.hiddenContacts?.[item.username]).map(item=>item.username);
-    const sessions=new Set();
-    if(this.engine)for(const message of Object.values(this.engine.state.messages)) {
-      const peer=message.sender===this.user?message.recipient:message.sender;
-      if(peer&&peer!==this.user&&!this.engine.state.hiddenSessions?.[peer])sessions.add(peer);
-    }
+    const sessions=new Set([...this.sessionPeers].filter(peer=>!this.engine?.state.hiddenSessions?.[peer]));
     for(const item of Object.values(this.contactState))if(item.status==='pending_incoming'&&!this.engine?.state.hiddenSessions?.[item.username])sessions.add(item.username);
     for(const peer of Object.keys(this.engine?.state.deletedPeers||{}))if(!this.engine.state.hiddenSessions?.[peer])sessions.add(peer);
-    return {username:this.user||'',server:this.server||'',status:this.status,online:this.online,
+    return {snapshotRevision:++this.snapshotRevision,username:this.user||'',server:this.server||'',status:this.status,online:this.online,
       accounts,servers,selectedServer,contacts:contacts.sort(),sessions:[...sessions].sort(),
       contactStates:Object.values(this.contactState),
       verifiedPeers:this.engine?Object.keys(this.engine.state.verified):[],
       deletedPeers:this.engine?.state.deletedPeers||{},
       identityChanges:this.engine?.state.identityChanges||{},
-      messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>m) : []};
+      messageRevision:this.messageRevision,unread:{...this.unread},
+      ...(includeMessages?{messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>m) : []}:{messageChanges:{...this.messageChanges,...this.pendingMessageChanges}})};
+  }
+  rebuildMessageMetadata(){
+    this.sessionPeers.clear();this.serverMessageKeys.clear();
+    for(const [key,message] of Object.entries(this.engine?.state.messages||{})){
+      const peer=message.sender===this.user?message.recipient:message.sender;if(peer&&peer!==this.user)this.sessionPeers.add(peer);
+      if(message.id)this.serverMessageKeys.set(message.id,key);
+    }
   }
   update(error) {
     if(this.call){try{if(this.call.accountId!==this.callPeer(this.call.peer))this.endCall('联系人身份已变化');}catch{this.endCall('联系人状态已变化');}}
-    this.notify({...this.snapshot(),error:error||this.listError||''});
+    this.messageChanges=this.pendingMessageChanges;this.pendingMessageChanges={};
+    this.notify({...this.snapshot(false),error:error||this.listError||''});
   }
   async transaction(task) {
     if(this.storageFailed)throw new Error('本地保存失败后已暂停加解密，请退出并重新登录');
-    const previous=structuredClone(this.engine.state);
+    const state=this.engine.state,messages=state.messages;
+    const {messages:ignored,...protocol}=state;
+    const previous=structuredClone(protocol),touched=new Map(),views=new Map();
+    const touch=key=>{if(!touched.has(key)){touched.set(key,messages[key]);messages[key]={...messages[key]};}};
+    const tracked=new Proxy(messages,{
+      get(target,key){if(typeof key!=='string'||!Object.hasOwn(target,key))return Reflect.get(target,key);
+        if(!views.has(key))views.set(key,new Proxy({}, {
+          get(_target,field){return messages[key]?.[field];},
+          ownKeys(){return Reflect.ownKeys(messages[key]);},
+          getOwnPropertyDescriptor(_target,field){const d=Object.getOwnPropertyDescriptor(messages[key],field);return d&&{...d,configurable:true};},
+          set(_target,field,value){touch(key);messages[key][field]=value;return true;},
+          deleteProperty(_target,field){touch(key);return Reflect.deleteProperty(messages[key],field);}
+        }));return views.get(key);},
+      set(target,key,value){if(typeof key==='string'&&!touched.has(key))touched.set(key,target[key]);return Reflect.set(target,key,value);},
+      deleteProperty(target,key){if(typeof key==='string'&&!touched.has(key))touched.set(key,target[key]);return Reflect.deleteProperty(target,key);}
+    });
+    state.messages=tracked;
     try {
       const result=await task();
-      try{this.vault.write(this.engine.state);}catch(e){this.storageFailed=true;throw e;}
+      state.messages=messages;
+      const changes={};for(const key of touched.keys())changes[key]=messages[key]||null;
+      try{this.vault.write(state,changes);}catch(e){this.storageFailed=true;throw e;}
+      Object.assign(this.pendingMessageChanges,Object.fromEntries(Object.entries(changes).map(([key,value])=>[key,value&&(({ciphertext,...message})=>message)(value)])));
+      for(const [key,value] of Object.entries(changes)){
+        const old=touched.get(key);if(old?.id)this.serverMessageKeys.delete(old.id);
+        if(value){const peer=value.sender===this.user?value.recipient:value.sender;if(peer&&peer!==this.user)this.sessionPeers.add(peer);if(value.id)this.serverMessageKeys.set(value.id,key);}
+      }
+      if(touched.size)this.messageRevision++;
       return result;
     }
     catch(e) {
-      this.engine.state=previous;
+      for(const [key,value] of touched)if(value===undefined)delete messages[key];else messages[key]=value;
+      this.engine.state={...previous,messages};
       if(this.storageFailed){
         this.online=false;this.status='本地保存失败，已暂停连接，请退出并重新登录';
         this.socket?.terminate();this.update();
@@ -66,9 +97,40 @@ class Controller {
   }
   async request(endpoint,method='GET',body) {
     const response=await fetch(this.server+endpoint,{method,redirect:'error',signal:AbortSignal.timeout(15000),
-      headers:{'Content-Type':'application/json',...(this.token?{Authorization:'Bearer '+this.token}:{})},body:body===undefined?undefined:JSON.stringify(body)});
+      headers:{'Content-Type':'application/json',...(this.token&&endpoint!=='/api/auth/refresh'?{Authorization:'Bearer '+this.token}:{})},body:body===undefined?undefined:JSON.stringify(body)});
     const data=await response.json().catch(()=>({}));
     if(!response.ok){const error=new Error(data.error||'服务器请求失败 ('+response.status+')');error.status=response.status;throw error;}return data;
+  }
+  adoptAuth(auth){
+    this.token=auth.token;this.accountId=auth.accountId;
+    this.refreshToken=typeof auth.refreshToken==='string'&&/^[A-Za-z0-9_-]{43}$/.test(auth.refreshToken)?auth.refreshToken:null;
+    this.accessExpiresAt=Date.parse(auth.expiresAt);this.refreshAttempts=0;this.scheduleRefresh();
+  }
+  scheduleRefresh(delay){
+    clearTimeout(this.refreshTimer);this.refreshTimer=null;
+    if(!this.refreshToken||!Number.isFinite(this.accessExpiresAt)||this.authFailed||this.storageFailed)return;
+    const remaining=this.accessExpiresAt-Date.now(),lead=Math.min(300000,Math.max(10,remaining*.2)),epoch=this.authEpoch;
+    this.refreshTimer=setTimeout(()=>this.serial(()=>this.refreshSession(epoch)).catch(error=>this.update(error.message)),delay??Math.max(1,remaining-lead));
+    this.refreshTimer.unref?.();
+  }
+  async refreshSession(epoch=this.authEpoch){
+    if(epoch!==this.authEpoch||!this.refreshToken||this.authFailed||this.storageFailed)return false;
+    const refreshToken=this.refreshToken,server=this.server,user=this.user,accountId=this.accountId;
+    try{
+      const auth=await this.request('/api/auth/refresh','POST',{refreshToken});
+      if(epoch!==this.authEpoch||server!==this.server||refreshToken!==this.refreshToken)return false;
+      if(auth.username!==user||auth.accountId!==accountId||typeof auth.token!=='string'||!auth.token||!Number.isFinite(Date.parse(auth.expiresAt))||Date.parse(auth.expiresAt)<=Date.now()||!/^[A-Za-z0-9_-]{43}$/.test(auth.refreshToken||''))throw Object.assign(Error('续期响应身份或有效期无效'),{status:401});
+      this.adoptAuth(auth);
+      if(this.socket?.readyState===WebSocket.OPEN)this.wire({type:'auth',token:this.token});
+      return true;
+    }catch(error){
+      if(epoch!==this.authEpoch||server!==this.server)return false;
+      if([400,401,403,404].includes(error.status)||++this.refreshAttempts>=3||Date.now()>=this.accessExpiresAt){
+        this.authFailed=true;clearTimeout(this.refreshTimer);this.refreshTimer=null;this.refreshToken=null;
+        this.online=false;this.status='认证续期失败，请退出后重新登录';this.socket?.terminate();this.update();
+      }else this.scheduleRefresh(Math.min(5000,1000*2**(this.refreshAttempts-1),Math.max(1,this.accessExpiresAt-Date.now())));
+      return false;
+    }
   }
   async login({server,username,password,register}) {
     this.logout();
@@ -79,10 +141,11 @@ class Controller {
     if(!validUser(username)) throw new Error('用户名限 2–32 位中文、小写字母、数字、下划线');
     this.server=url.origin;
     const auth=await this.request('/api/auth/'+(register?'register':'login'),'POST',{username,password});
-    this.token=auth.token;this.user=username;this.accountId=auth.accountId;
+    this.user=username;this.adoptAuth(auth);
     try {
       this.vault=new Vault(this.vaults,this.server,username,this.safeStorage);
-      const saved=this.vault.read();this.engine=saved ? new SignalEngine(saved) : await SignalEngine.create(username);
+      const saved=this.vault.read();this.engine=saved ? new SignalEngine(saved) : await SignalEngine.create(username);this.messageRevision++;
+      this.rebuildMessageMetadata();this.messageChanges={};this.pendingMessageChanges={};
       let own=await this.request('/api/keys/me');
       await this.recoverIdentity(own,password);
       own=await this.request('/api/keys/me');
@@ -91,8 +154,11 @@ class Controller {
       try{this.registry.remember(this.server,username);}catch(e){this.listError='账号列表保存失败：'+e.message;}
       await this.replenish(own);
       await this.syncAccountEvents();
+      // Publish the account's baseline before any newer status/delta frame can
+      // overtake the asynchronous login IPC reply in the renderer.
+      this.notify({...this.snapshot(true),error:this.listError||''});
       await this.refreshContacts();
-      this.connect();return this.snapshot();
+      this.connect();return this.snapshot(false);
     } catch(e) {this.logout();throw e;}
   }
   async promoteIdentity(candidate) {
@@ -105,7 +171,7 @@ class Controller {
     }
     candidate.state.identityChanges={};
     for(const peer of Object.keys(candidate.state.peerAccountIds))candidate.state.identityChanges[peer]={identityKey:candidate.state.trusted[peer+'.1'],accountId:candidate.state.peerAccountIds[peer],message:'本机身份已更新，请重新核对安全码'};
-    this.vault.write(candidate.state);this.engine=candidate;
+    this.vault.write(candidate.state);this.engine=candidate;this.rebuildMessageMetadata();this.messageRevision++;this.messageChanges={};this.pendingMessageChanges=Object.fromEntries(Object.entries(candidate.state.messages).map(([key,{ciphertext,...message}])=>[key,message]));
   }
   async recoverIdentity(own,password) {
     const state=this.engine.state;
@@ -120,7 +186,7 @@ class Controller {
       this.vault.write(state); // Persist candidate keys before remote commit; history is kept once.
     }
     const auth=await this.request('/api/keys/reset','POST',{password,bundle:await candidate.publicBundle()});
-    this.token=auth.token;this.accountId=auth.accountId;candidate.state.accountId=auth.accountId;
+    this.adoptAuth(auth);candidate.state.accountId=auth.accountId;
     await this.promoteIdentity(candidate);
   }
   normalizeServer(server) {
@@ -131,13 +197,13 @@ class Controller {
   }
   saveServer({server}) {
     const normalized=this.normalizeServer(server);
-    this.registry.saveServer(normalized);this.logout();return this.snapshot();
+    this.registry.saveServer(normalized);this.logout();return this.snapshot(false);
   }
   selectServer({server}) {
-    this.registry.selectServer(this.normalizeServer(server));this.logout();return this.snapshot();
+    this.registry.selectServer(this.normalizeServer(server));this.logout();return this.snapshot(false);
   }
   forgetServer({server}) {
-    this.registry.forgetServer(this.normalizeServer(server));this.logout();return this.snapshot();
+    this.registry.forgetServer(this.normalizeServer(server));this.logout();return this.snapshot(false);
   }
   async addContact({peer}) {
     if(!this.engine||!validUser(peer)||peer===this.user)throw new Error('请输入另一位有效用户');
@@ -147,7 +213,7 @@ class Controller {
       if(this.engine.state.hiddenContacts)delete this.engine.state.hiddenContacts[peer];
       if(this.engine.state.hiddenSessions)delete this.engine.state.hiddenSessions[peer];
     });
-    this.update();return this.snapshot();
+    this.update();return this.snapshot(false);
   }
   async refreshContacts() {
     const items=await this.request('/api/contacts');
@@ -158,7 +224,7 @@ class Controller {
         await this.transaction(()=>this.bindPeerIdentity(item.username,info));
     }
     this.contactState=Object.fromEntries(items.filter(item=>validUser(item.username)&&item.username!==this.user&&!this.engine?.state.deletedPeers?.[item.username]).map(item=>[item.username,item]));
-    this.update();return this.snapshot();
+    this.update();return this.snapshot(false);
   }
   async acceptContact({peer}) {
     if(!this.engine||!validUser(peer)||this.contactState[peer]?.status!=='pending_incoming')throw new Error('没有待接受的聊天请求');
@@ -171,7 +237,7 @@ class Controller {
       const info=await this.request('/api/keys/'+encodeURIComponent(peer));
       await this.transaction(()=>this.bindPeerIdentity(peer,info));
     } catch { /* the next send or safety check retries the lookup */ }
-    await this.refreshContacts();return this.snapshot();
+    await this.refreshContacts();return this.snapshot(false);
   }
   async replenish(own) {
     own ||= await this.request('/api/keys/me');
@@ -243,6 +309,7 @@ class Controller {
       this.clearConnectionTimers();this.socket=null;
       this.online=false;this.liveSessions.clear();this.endCall('连接已断开');
       if(this.storageFailed){this.status='本地保存失败，已暂停连接，请退出并重新登录';this.update();return;}
+      if(code===1008&&!this.authFailed&&this.refreshToken){if(await this.refreshSession()){this.connect();return;}}
       if(code===1008||this.authFailed){this.status='认证已失效，请退出后重新登录';this.update();return;}
       this.status='离线，正在重连';this.update();
       this.retry=setTimeout(()=>{if(epoch===this.generation&&!this.storageFailed&&!this.authFailed)this.connect();},this.retryDelay());
@@ -353,6 +420,7 @@ class Controller {
       await this.request('/api/account-events/ack','POST',{ids:events.slice(start,start+1000).map(event=>event.id)});
   }
   async event(event) {
+    if(event.type==='reauthenticated')return;
     if(event.type==='call'){this.receiveCall(event);return;}
     if(event.type==='call_error'){if(this.call&&event.callId===this.call.callId){this.notify({type:'call_error',event});this.endCall(event.error||'通话信令失败');}return;}
     if(event.type==='ready') {
@@ -366,17 +434,22 @@ class Controller {
       await this.request('/api/account-events/ack','POST',{ids:[event.event.id]});
     } else if(event.type==='message') {
       if(!this.online)return;
+      const cacheKey=event.message.sender+':'+event.message.clientId,already=Object.hasOwn(this.engine.state.messages,cacheKey);
       await this.transaction(async()=>{
         await this.engine.decrypt(event.message);
         if(this.engine.state.hiddenSessions)delete this.engine.state.hiddenSessions[event.message.sender];
       });
       this.wire({type:'ack',id:event.message.id});
+      if(!already&&Object.hasOwn(this.engine.state.messages,cacheKey)){
+        const peer=event.message.sender;if(!(this.foreground&&this.activePeer===peer))this.unread[peer]=(this.unread[peer]||0)+1;
+        this.notify({type:'message',peer,generation:this.generation,server:this.server,username:this.user});
+      }
     } else if(event.type==='accepted') {
       await this.transaction(()=>this.engine.accepted(event.message));
     } else if(event.type==='delivered') {
       await this.transaction(()=>{
-        for(const message of Object.values(this.engine.state.messages))
-          if(message.sender===this.user&&message.id===event.id)message.status='对方客户端已接收';
+        const key=this.serverMessageKeys.get(event.id),message=key&&this.engine.state.messages[key];
+        if(message?.sender===this.user)message.status='对方客户端已接收';
       });
     } else if(event.type==='contact' && validUser(event.contact?.username)) {
       if(event.contact.status==='removed')delete this.contactState[event.contact.username];
@@ -446,25 +519,28 @@ class Controller {
     });
     if(!status)this.contactState[peer]={username:peer,status:'pending_outgoing',online:false};
     if(this.engine.state.hiddenSessions?.[peer])await this.transaction(()=>{delete this.engine.state.hiddenSessions[peer];});
-    this.wire(envelope);this.update();return this.snapshot();
+    this.wire(envelope);this.update();return this.snapshot(false);
   }
   clearConversation({peer}) {
     if(!this.engine||!validUser(peer)||peer===this.user)throw new Error('先选择一个会话');
-    return this.transaction(()=>{(this.engine.state.hiddenSessions ||= {})[peer]=true;}).then(()=>{this.update();return this.snapshot();});
+    return this.transaction(()=>{(this.engine.state.hiddenSessions ||= {})[peer]=true;}).then(()=>{this.update();return this.snapshot(false);});
   }
   openConversation({peer}) {
     if(!this.engine||!validUser(peer)||peer===this.user)throw new Error('先选择一位用户');
-    return this.transaction(()=>{if(this.engine.state.hiddenSessions)delete this.engine.state.hiddenSessions[peer];}).then(()=>{this.update();return this.snapshot();});
+    this.activePeer=peer;delete this.unread[peer];
+    return this.transaction(()=>{if(this.engine.state.hiddenSessions)delete this.engine.state.hiddenSessions[peer];}).then(()=>{this.update();return this.snapshot(false);});
   }
+  setForeground(value){this.foreground=!!value;if(this.foreground&&this.activePeer){delete this.unread[this.activePeer];this.update();}}
   async removeContact({peer}) {
     if(!this.engine||!validUser(peer)||this.contactState[peer]?.status!=='accepted')throw new Error('先选择一位联系人');
     await this.request('/api/contacts/remove','POST',{peer});
     if(this.contactState[peer]?.status==='accepted')delete this.contactState[peer];
     await this.transaction(()=>{if(this.engine.state.hiddenContacts)delete this.engine.state.hiddenContacts[peer];});
-    this.update();return this.snapshot();
+    this.update();return this.snapshot(false);
   }
   async history({peer}) {
     if(!this.engine)throw new Error('请登录');
+    if(!validUser(peer)||peer===this.user)throw new Error('先选择另一位用户');
     const records=await this.request('/api/messages?peer='+encodeURIComponent(peer));
     for(const record of records.reverse()) {
       // ACKed older messages already exist in the DPAPI-protected cache.
@@ -472,7 +548,7 @@ class Controller {
       if(record.sender===this.user && this.engine.state.messages[this.user+':'+record.clientId])
         await this.transaction(()=>this.engine.accepted(record));
     }
-    this.update();return this.snapshot();
+    this.update();return this.snapshot(false);
   }
   async safety({peer,confirm,expectedCode}) {
     if(!this.engine||!validUser(peer)||peer===this.user)throw new Error('先选择另一位用户');
@@ -498,12 +574,14 @@ class Controller {
   forgetAccount({server,user}) {
     // Drops the saved entry only. The vault holding this account's keys stays on disk:
     // deleting it would permanently lose the history that only those keys can decrypt.
-    this.registry.forget(server,user);
-    this.update();return this.snapshot();
+    if(!validUser(user))throw new Error('用户名无效');
+    this.registry.forget(this.normalizeServer(server),user);
+    this.update();return this.snapshot(false);
   }
   logout() {
+    ++this.authEpoch;clearTimeout(this.refreshTimer);this.refreshTimer=null;this.refreshToken=null;this.accessExpiresAt=null;this.refreshAttempts=0;
     this.endCall('账号已退出');this.liveSessions.clear();++this.generation;this.clearConnectionTimers();this.socket?.close();this.socket=null;this.retryAttempt=0;this.authFailed=false;
-    this.user=null;this.accountId=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.update();
+    this.user=null;this.accountId=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.sessionPeers.clear();this.serverMessageKeys.clear();this.messageChanges={};this.pendingMessageChanges={};this.unread={};this.activePeer='';this.messageRevision++;this.update();
   }
 }
 module.exports={Controller,validUser};

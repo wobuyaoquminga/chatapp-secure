@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.*;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -24,6 +27,28 @@ public class KeyController {
     private final AuthController auth;
     private final MessageStore store;
     private final ChatSocket socket;
+    private final ConcurrentHashMap<String, ClaimRate> claimRates = new ConcurrentHashMap<>();
+    @Value("${chat.keys.claim-user-per-minute:60}") private int claimUserPerMinute = 60;
+    @Value("${chat.keys.claim-pair-per-minute:6}") private int claimPairPerMinute = 6;
+    private static class ClaimRate {
+        volatile long updated = System.nanoTime();
+        double tokens = -1;
+        synchronized boolean allow(int limit) {
+            long now = System.nanoTime();
+            if (tokens < 0) tokens = limit;
+            tokens = Math.min(limit, tokens + (now - updated) / (double) TimeUnit.MINUTES.toNanos(1) * limit);
+            updated = now;
+            if (tokens < 1) return false;
+            tokens--; return true;
+        }
+    }
+    private void limitClaim(String user, String peer) {
+        // Inactive callers cannot create entries indefinitely; keep this auxiliary map bounded.
+        if (claimRates.size() > 10000) claimRates.entrySet().removeIf(e -> System.nanoTime() - e.getValue().updated > TimeUnit.MINUTES.toNanos(5));
+        if (claimRates.size() > 20000 || !claimRates.computeIfAbsent(user, k -> new ClaimRate()).allow(Math.max(1, claimUserPerMinute))
+            || !claimRates.computeIfAbsent(user + ':' + peer, k -> new ClaimRate()).allow(Math.max(1, claimPairPerMinute)))
+            throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "预密钥请求过于频繁，请稍后重试");
+    }
     public KeyController(JdbcTemplate db, ObjectMapper json, PasswordEncoder passwords,
                          AuthController auth, MessageStore store, ChatSocket socket) {
         this.db=db; this.json=json; this.passwords=passwords; this.auth=auth; this.store=store; this.socket=socket;
@@ -67,6 +92,7 @@ public class KeyController {
     private String bytes(JsonNode node, String field, int size) {
         if (!node.path(field).isTextual()) throw bad("无效密钥字段: " + field);
         String value=node.path(field).asText();
+        if (value.length() > ((size + 2) / 3) * 4) throw bad("密钥长度无效");
         try { if (Base64.getDecoder().decode(value).length != size) throw bad("密钥长度无效"); }
         catch (IllegalArgumentException e) { throw bad("密钥 Base64 无效"); }
         return value;
@@ -95,13 +121,16 @@ public class KeyController {
         else if (!identity.equals(old.get(0).get("identity_key")) || registration!=((Number)old.get(0).get("registration_id")).intValue() || !json.readTree(signed).equals(json.readTree((String)old.get(0).get("signed_pre_key"))))
             throw new ResponseStatusException(HttpStatus.CONFLICT,"账号已绑定另一份本地密钥；请重新验证密码后更新设备身份");
         JsonNode batch=input.path("preKeys");
-        if (!batch.isArray() || batch.size()>50) throw bad("每批最多 50 组预密钥");
+        if (!batch.isArray() || batch.size()>100) throw bad("每批最多 100 组预密钥");
         Integer total=db.queryForObject("SELECT COUNT(*) FROM one_time_keys WHERE username=? AND claimed=FALSE",Integer.class,user);
-
+        Set<Integer> ids = new HashSet<>();
         for (JsonNode key:batch) {
             int keyId=id(key,"id");
+            if (!ids.add(keyId)) throw bad("预密钥编号不可重复");
             String ec=bytes(key,"publicKey",33), kyber=bytes(key,"kyberPublicKey",1569), sig=bytes(key,"kyberSignature",64);
             String bundle=json.writeValueAsString(Map.of("id",keyId,"publicKey",ec,"kyberPublicKey",kyber,"kyberSignature",sig));
+            // Publication retries may contain consumed IDs, but must never resurrect their keys.
+            if (Boolean.TRUE.equals(db.queryForObject("SELECT COUNT(*)>0 FROM consumed_prekeys WHERE username=? AND key_id=?", Boolean.class, user, keyId))) continue;
             var existing=db.queryForList("SELECT bundle FROM one_time_keys WHERE username=? AND key_id=?",String.class,user,keyId);
             if (existing.isEmpty()) {
                 if (++total > 100) throw bad("未使用预密钥数量已达上限");
@@ -130,16 +159,23 @@ public class KeyController {
     public Map<String,Object> claim(@AuthenticationPrincipal Jwt jwt,@PathVariable String user) throws Exception {
         if (!Username.valid(user)) throw bad("用户名无效");
         if (user.equals(jwt.getSubject())) throw bad("不能请求自己的会话预密钥");
+        limitClaim(jwt.getSubject(), user);
         var accounts = db.queryForList("SELECT username,account_id FROM app_users WHERE username IN (?,?) ORDER BY username FOR UPDATE", user, jwt.getSubject());
         if (accounts.stream().noneMatch(a -> jwt.getSubject().equals(a.get("username")) && jwt.getClaimAsString("account_id").equals(a.get("account_id"))))
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "设备身份已更新，请重新登录");
         if (accounts.stream().noneMatch(a -> user.equals(a.get("username"))))
             throw new ResponseStatusException(HttpStatus.NOT_FOUND,"用户不存在");
+        var relation = store.contact(jwt.getSubject(), user);
+        if (relation != null && "pending_incoming".equals(relation.status()))
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "请先接受对方的聊天请求");
+        // An unknown peer needs one key to encrypt the first approval request. Both account rows
+        // are locked above, so concurrent claims across server instances cannot return the same key.
         Map<String,Object> result=new HashMap<>(identity(user));
         var rows=db.queryForList("SELECT key_id,bundle FROM one_time_keys WHERE username=? AND claimed=FALSE ORDER BY key_id LIMIT 1",user);
         if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.CONFLICT,"对方预密钥不足，请让对方登录客户端补充");
         var row=rows.get(0);
-        db.update("UPDATE one_time_keys SET claimed=TRUE WHERE username=? AND key_id=?",user,row.get("key_id"));
+        db.update("INSERT INTO consumed_prekeys(username,key_id) VALUES (?,?)", user, row.get("key_id"));
+        db.update("DELETE FROM one_time_keys WHERE username=? AND key_id=?",user,row.get("key_id"));
         result.put("preKey",json.readTree((String)row.get("bundle")));
         return result;
     }

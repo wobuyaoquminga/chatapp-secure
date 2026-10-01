@@ -17,3 +17,118 @@
 .callVideos.showRemote.selfPrimary #remoteVideo{inset:auto 12px 12px auto;width:27%;height:22%;max-height:150px;border:2px solid #fff;border-radius:10px;z-index:1;object-fit:cover;background:#25392e}
 .callPanel.isMinimized .callVideos.showRemote.selfPrimary #localVideo{inset:0;width:100%;height:100%;border:0;border-radius:0}
 .callPanel.isMinimized .callVideos.showRemote.selfPrimary #remoteVideo{width:28%;height:42%;right:6px;bottom:6px}
+
+/* Desktop presentation */
+:root{color:#263b31;background:#eef1ee;font-size:14px}
+body{background:#eef1ee}
+button{background:#327a55;border-radius:8px;transition:background-color .15s ease,box-shadow .15s ease,transform .12s ease}
+button:hover{filter:none;background:#286a49}
+button:active:not(:disabled){transform:translateY(1px)}
+button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible,video:focus-visible{outline:2px solid #398d61;outline-offset:2px}
+button:disabled{opacity:.5}
+input,textarea{background:#fff;border-color:#d7e0d9;border-radius:8px;color:#263b31}
+input:focus,textarea:focus{border-color:#6fa987;box-shadow:0 0 0 3px #327a5522}
+.secondary{background:#e8f0ea;color:#2e704d}
+.secondary:hover{background:#dceadd}
+.textButton{color:#2d7650}
+.textButton:hover{background:transparent;color:#1f6240}
+.iconButton{color:#557461;border-radius:8px}
+.iconButton:hover{background:#e7efe9;color:#315d42}
+.brand{background:#39845d;border-radius:10px;width:38px;height:38px;font-size:20px}
+.brand span{font-size:18px;color:#304c3b;margin-left:8px;letter-spacing:-.025em}
+.entry,.settings{border:1px solid #dfe7df;border-radius:16px;box-shadow:0 14px 44px #203e2b13;margin-top:5vh}
+.entry{padding:36px 38px}
+.entry h1{margin-top:25px;letter-spacing:-.025em}
+.entryHeading h1{margin-top:25px}
+.entryHeading .textButton{margin-top:28px}
+.entry .actions{margin-top:6px}
+.entry .actions button{min-height:42px}
+.accountPick,.serverPick{background:#f3f6f3}
+.accountPick:hover,.serverPick:hover{background:#e8f1e9}
+.account.active .accountPick,.serverPick.active{background:#e1eee4;box-shadow:inset 0 0 0 1px #80ae90}
+.registrationNotice{border-radius:9px;background:#fffaf0;border-color:#ebd7ae;border-left-color:#b98233}
+.chatShell{height:calc(100vh - 42px);min-height:520px;background:#fff}
+.sidebar{width:298px;background:#f6f8f6;border-right-color:#dfe6df}
+.sidebarTop{padding:20px 19px 7px}
+.brand{position:relative;display:grid;place-items:center;flex:none}
+.brand span{position:absolute;left:calc(100% + 10px);top:50%;transform:translateY(-50%);margin-left:0;white-space:nowrap}
+.profile{padding:9px 19px 12px;gap:2px}
+.profile strong{font-size:15px;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.profile span{font-size:12px}
+.tabs{padding:0 14px;border-bottom-color:#dfe6df}
+.tabs button{padding:11px 8px;color:#6f8173}
+.tabs button:hover{background:#edf3ee}
+.tabs button.active{background:transparent;border-bottom:2px solid #39845d;color:#2d7450}
+.listSearch{padding:13px 15px 10px}
+.listSearch input{background:#ebf0ec;border:1px solid transparent;border-radius:8px;padding:10px 12px;font-size:13px}
+.listSearch input:focus{background:#fff;border-color:#88b59a}
+.peerList{padding:2px 8px 12px}
+.peerPick{position:relative;border-radius:9px;padding:12px 11px;gap:11px;color:#294234}
+.peerPick:hover{background:#edf2ee}
+.peerPick.active{background:#e2efe5}
+.peerPick.active:hover{background:#dcebdd}
+.peerPick:focus-visible{outline-offset:-2px}
+.avatar{width:43px;height:43px;border-radius:13px;background:#dce9df;color:#357651;font-size:18px;font-weight:600}
+.peerPick.active .avatar{background:#c9e3d0}
+.peerDetail{gap:3px}
+.peerDetail strong{font-size:14px;font-weight:650}
+.peerDetail small{line-height:1.35}
+.peerDetail small:last-child{color:#829288}
+.peerStatus.online{color:#2c8056}
+.listEmpty{padding:40px 15px;color:#8a9b8e;font-size:13px}
+.contactForm{padding:14px 15px 16px;border-top-color:#e0e7e0}
+.contactForm label{margin-bottom:7px;color:#687c6d}
+.contactForm input{padding:10px 11px}
+.contactForm button{min-width:39px;border-radius:8px}
+.conversation{background:#fff}
+.conversationContent{min-width:0;min-height:0;width:100%}
+.emptyConversation{color:#809487}
+.emptySymbol{display:grid;place-items:center;width:74px;height:74px;margin:auto;border-radius:19px;background:#edf3ee;color:#75a083;font-size:34px}
+.emptyConversation h2{margin:18px 0 6px;color:#3b5844;font-size:17px}
+.emptyConversation p{margin:0;font-size:13px}
+.conversationHeader{min-height:76px;padding:15px 25px;border-bottom-color:#e5ebe5}
+.conversationIdentity{min-width:0;flex:1}
+.conversationIdentity h2{margin:0 0 5px;font-size:17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conversationDetails{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap}
+#conversationStatus{display:inline;margin:0;color:#7b8e7d}
+#verification{color:#8a7756}
+.conversationDetails span{font-size:12px;line-height:1.25}
+.headerActions{flex:none;gap:8px;flex-wrap:nowrap;white-space:nowrap}
+.headerActions .secondary{padding:8px 13px;font-size:13px}
+.headerActions .iconButton{min-width:38px;height:36px;padding:0 7px;font-size:23px;line-height:1}
+.moreWrap{position:relative}
+.moreMenu{top:calc(100% + 7px);right:0;min-width:192px;padding:6px;border:1px solid #e1e7e1;border-radius:10px;box-shadow:0 12px 30px #1c3b292a}
+.moreMenu button{padding:10px 12px;background:transparent;border-radius:6px;color:#334b3b;font-size:13px}
+.moreMenu button:hover{background:#edf3ee}
+.moreMenu button:active{background:#e2eee4}
+.moreMenu .menuDivider{height:1px;background:#e7ece7;margin:5px 6px}
+#removeContact{color:#a14842}
+#removeContact:hover{background:#fbefec}
+#messages{background:#f9fbf9;padding:25px 30px}
+.bubble{background:#edf1ed;border-radius:12px 12px 12px 3px;margin-bottom:13px;box-shadow:0 1px 2px #1f392009}
+.bubble.mine{background:#dceee0;border-radius:12px 12px 3px 12px}
+.bubble p{line-height:1.55}
+.meta{color:#738679}
+.composer{padding:14px 24px 4px;align-items:end;gap:9px}
+.composer textarea{resize:vertical;min-height:45px;max-height:150px;padding:10px 12px;background:#f8faf8}
+.composer textarea:focus{background:#fff}
+.composer button{min-width:68px;height:43px;margin:0}
+.composer #toggleCallActions{min-width:43px;height:43px;padding:0;font-size:21px}
+.deliveryNote{margin:5px 24px 13px;color:#8b9e91;line-height:1.45}
+.callActions{padding:11px 24px;gap:8px;background:#fbfcfb;border-top-color:#e8ede8}
+.callActions button{min-width:0;flex:1 0 116px;padding:9px 10px;font-size:12px}
+.featurePanel{background:#f7faf7;border-bottom-color:#e3eae3}
+.featurePanel .panelHeading{margin-bottom:10px}
+.featurePanel input{background:#fff}
+#historyResults button{border:1px solid #e2e8e2;border-radius:7px}
+#historyResults button:hover{background:#eff5ef}
+#safetyPanel{background:#fcfaf1;border-bottom-color:#e9e3cc}
+.settings{padding:30px 36px}
+.settingsHeading{margin-bottom:24px}
+.settings h2{font-size:16px}
+.usageGuide{border-top-color:#e2e9e2}
+.usageGuide ul{color:#4c6252}
+#notice:not(:empty){border-top:1px solid #cfe5d3}
+@media(max-width:700px){.sidebar{width:235px}.conversationHeader{display:flex;padding:14px 16px}.headerActions{margin:0;white-space:nowrap}.headerActions button{font-size:13px}.composer{padding:12px 12px 4px}.deliveryNote{margin:4px 12px 12px}}
+@media(max-width:560px){.sidebar{width:165px}.sidebarTop{padding:13px 10px 5px}.profile{padding:8px 10px}.listSearch{padding:8px}.peerList{padding:2px 4px}.peerPick{padding:9px 6px;gap:6px}.avatar{width:29px;height:29px;border-radius:9px;font-size:13px}.contactForm{padding:8px}.conversationHeader{padding:11px 9px}.conversationIdentity h2{font-size:14px}.conversationDetails{gap:3px}.conversationDetails span{font-size:10px}.headerActions .secondary{padding:7px;font-size:11px}.headerActions .iconButton{min-width:31px;height:31px;font-size:20px}#messages{padding:12px}.composer{gap:5px}.composer button{min-width:42px;padding:0 7px}.composer #toggleCallActions{min-width:35px}}
+@media(prefers-reduced-motion:reduce){button{transition:none}button:active:not(:disabled){transform:none}}

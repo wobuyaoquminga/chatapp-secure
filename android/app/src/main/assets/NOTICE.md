@@ -1,10 +1,18 @@
-# Third-party software
+# Android dependency notices
 
-This development prototype uses the official Signal libsignal library but is not affiliated with or endorsed by Signal.
+Chat uses official Signal libsignal 0.103.0 (AGPL-3.0-only). It is not affiliated with Signal. Corresponding source is supplied in Chat-Source.zip under vendor/. Chat's license is LICENSE-Chat.txt.
 
-- @signalapp/libsignal-client 0.103.0 — AGPL-3.0-only, https://github.com/signalapp/libsignal/tree/v0.103.0 . Corresponding upstream source is included in the source archive under vendor/.
-- Electron 44.4.5 — MIT and third-party Chromium notices retained in the Windows distribution.
-- ws 8.20.0 — MIT; dependency license retained.
-- Spring Boot 3.5.16 and associated Java dependencies — original licenses apply; dependency notices are retained in the executable JAR.
+Android dependencies include OkHttp 4.12.0, Okio, Kotlin runtime and desugar JDK libraries. Their Apache-2.0 and additional notices are included in the adjacent LICENSE files.
 
-Application source and reproducible dependency lockfiles are supplied separately in Chat-Source.zip. Do not distribute the native client without its notices and corresponding source availability.
+io.github.webrtc-sdk:android 150.7871.01 declares BSD-3-Clause in its Maven POM. WebRTC's BSD license, third-party notices and the SDK repository's MIT license are included separately. The Maven artifact's declared license is distinct from the SDK repository license.
+
+Upstream sources:
+- https://github.com/signalapp/libsignal/tree/v0.103.0
+- https://github.com/square/okhttp/tree/parent-4.12.0
+- https://github.com/square/okio
+- https://github.com/JetBrains/kotlin
+- https://github.com/google/desugar_jdk_libs
+- https://webrtc.googlesource.com/src/
+- https://github.com/webrtc-sdk/android
+
+This Android distribution does not contain Electron or ws. General project information is in NOTICE-Chat.md; platform licenses here apply to Android's actual dependencies.

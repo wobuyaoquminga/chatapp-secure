@@ -41,6 +41,10 @@ async function openContact(p,peer){
   else{await p.fill('#peer',peer);await p.click('#contactForm button');await waitText(p,'#conversationName',peer);}
 }
 async function send(p,peer,text){await openContact(p,peer);await p.fill('#body',text);await p.click('#send');await waitText(p,'#messages',text);}
+async function clickChatMenu(p,selector){
+  if(!(await p.locator('#moreMenu').isVisible()))await p.click('#more');
+  await p.locator('#moreMenu '+selector).click();
+}
 async function logout(p){await p.click('#chatSettings');await p.click('#logout');await p.waitForSelector('#auth:not([hidden])');}
 async function capture(app,file){
   const data=await app.evaluate(async({BrowserWindow})=>(await BrowserWindow.getAllWindows()[0].webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG().toString('base64'));
@@ -136,7 +140,7 @@ async function featuresCheck(){
     await a.page.fill('#peerSearch','没有这个联系人');
     assert.equal(await a.page.locator('#peerList .peerPick').count(),0);
     await a.page.fill('#peerSearch','');
-    await a.page.click('#removeContact');
+    await clickChatMenu(a.page,'#removeContact');
     await a.page.locator(`#peerList .peerPick[data-peer="${receiver}"]`).waitFor({state:'detached'});
     await a.page.evaluate(()=>window.chat.command('refreshContacts'));
     assert.equal(await a.page.locator(`#peerList .peerPick[data-peer="${receiver}"]`).count(),0,'server refresh must preserve revoked relation');
@@ -150,7 +154,7 @@ async function featuresCheck(){
     await a.page.click('#acceptContact');
     await a.page.locator(`#peerList .peerPick[data-peer="${receiver}"]`).waitFor();
     assert.match(await a.page.locator('#messages').innerText(),/已接受，可以双向聊天/);
-    await a.page.click('#clearConversation');
+    await clickChatMenu(a.page,'#clearConversation');
     await logout(a.page);await auth(a.page,sender,false);
     await a.page.click('#sessionsTab');
     assert.equal(await a.page.locator(`#peerList .peerPick[data-peer="${receiver}"]`).count(),0,'session stays cleared after login');
@@ -233,7 +237,7 @@ async function migrationCheck(){
     await auth(a.page,state.alice,mode==='before-restart');await auth(b.page,state.bob,mode==='before-restart');
     await openContact(a.page,state.bob);await openContact(b.page,state.alice);
     if(mode==='before-restart'){
-      await a.page.click('#safety');await b.page.click('#safety');
+      await clickChatMenu(a.page,'#safety');await clickChatMenu(b.page,'#safety');
       await a.page.waitForSelector('#safetyPanel:not([hidden])');await b.page.waitForSelector('#safetyPanel:not([hidden])');
       assert.equal(await a.page.locator('#safetyCode').innerText(),await b.page.locator('#safetyCode').innerText());
       await a.page.click('#confirmSafety');await b.page.click('#confirmSafety');
@@ -260,7 +264,7 @@ async function migrationCheck(){
     }else{
       await waitText(b.page,'#messages',state.offline);
       await send(b.page,state.alice,'客户端与服务器重启后仍可加密');await waitText(a.page,'#messages','客户端与服务器重启后仍可加密');
-      await a.page.click('#history');await waitText(a.page,'#notice','已同步');
+      await clickChatMenu(a.page,'#history');await waitText(a.page,'#notice','已同步');
       const local=a.page.locator('.bubble').filter({hasText:state.offline});assert.ok((await local.innerText()).includes('对方客户端已接收'));
       await capture(b.app,path.join(out,'after-restart.png'));
       console.log('PASS: both clients and server restart, private state recovery, offline decryption/ACK, preserved history, ratchet continuation');

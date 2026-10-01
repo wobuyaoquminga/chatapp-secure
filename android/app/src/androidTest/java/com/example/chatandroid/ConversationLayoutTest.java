@@ -72,6 +72,21 @@ public class ConversationLayoutTest {
         assertEquals(161, stream.getChildCount());
     }
 
+    @Test public void handledConfigurationChangeKeepsControllerCallAndComposerDraft() {
+        Object controller = field("controller"), call = field("call");
+        EditText original = (EditText) field("composer");
+        instrumentation.runOnMainSync(() -> {
+            original.setText("配置变更前的草稿");
+            android.content.res.Configuration configuration = new android.content.res.Configuration(activity.getResources().getConfiguration());
+            configuration.fontScale = configuration.fontScale + 0.1f;
+            activity.onConfigurationChanged(configuration);
+        });
+        instrumentation.waitForIdleSync();
+        assertSame(controller, field("controller"));
+        assertSame(call, field("call"));
+        assertEquals("配置变更前的草稿", ((EditText) field("composer")).getText().toString());
+    }
+
     @Test public void imeInsetsKeepComposerAboveKeyboardInBothOrientations() {
         assumeTrue(Build.VERSION.SDK_INT >= 30);
         instrumentation.runOnMainSync(() -> {
@@ -113,6 +128,33 @@ public class ConversationLayoutTest {
         assertNull(field("safetyDialog"));
         publish(snapshot(240).put("identityChanges", new JSONObject()));
         assertTrue(((EditText) field("composer")).isEnabled());
+    }
+
+    @Test public void conversationListRetainsUnaffectedRowOnPresenceUpdate() throws Exception {
+        JSONObject initial = snapshot(240);
+        initial.put("conversations", new JSONArray().put("peer").put("other"));
+        initial.getJSONObject("relationships").put("other",
+                new JSONObject().put("status", "accepted").put("online", false));
+        publish(initial);
+        instrumentation.runOnMainSync(() -> {
+            try {
+                setField("detailPeer", "");
+                java.lang.reflect.Method render = MainActivity.class.getDeclaredMethod("render");
+                render.setAccessible(true);
+                render.invoke(activity);
+            } catch (Exception failure) { throw new AssertionError(failure); }
+        });
+        LinearLayout results = (LinearLayout) field("messageResults");
+        assertEquals(2, results.getChildCount());
+        View peerRow = results.getChildAt(0);
+        View otherRow = results.getChildAt(1);
+        JSONObject updated = snapshot(240);
+        updated.put("conversations", new JSONArray().put("peer").put("other"));
+        updated.getJSONObject("relationships").put("other",
+                new JSONObject().put("status", "accepted").put("online", true));
+        publish(updated);
+        assertSame(peerRow, results.getChildAt(0));
+        assertNotSame(otherRow, results.getChildAt(1));
     }
 
     private JSONObject snapshot(int count) throws Exception {

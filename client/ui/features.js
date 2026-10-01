@@ -34,7 +34,21 @@ function search(messages,user,peer,{query='',from='',to='',page=0,pageSize=20}={
 // One index belongs to one account snapshot. The caller replaces it whenever
 // the snapshot or account changes; only the most recent search is retained.
 function messageIndex(messages,user,server){
- const byPeer=new Map(),bodyLower=new WeakMap();let cachedSearch=null,cachedRows=null;
+ const byPeer=new Map(),byKey=new Map(),bodyLower=new WeakMap(),displayCache=new Map();let cachedSearch=null,cachedRows=null;
+ function peerOf(m){return m.sender===user?m.recipient:m.recipient===user?m.sender:null;}
+ function apply(changes){
+  for(const [key,value] of Object.entries(changes||{})){
+   const old=byKey.get(key);
+   if(!value){if(old){const peer=peerOf(old),rows=byPeer.get(peer),i=rows.indexOf(old);if(i>=0)rows.splice(i,1);byKey.delete(key);displayCache.delete(peer);}continue;}
+   const peer=peerOf(value);if(!peer||peer===user)continue;
+   const rows=byPeer.get(peer)||[];
+   const existing=byKey.get(key);
+   if(existing){Object.assign(existing,value);bodyLower.delete(existing);}
+   else{let left=0,right=rows.length;while(left<right){const mid=(left+right)>>>1;if(rows[mid].createdAt.localeCompare(value.createdAt)<=0)left=mid+1;else right=mid;}rows.splice(left,0,value);byPeer.set(peer,rows);byKey.set(key,value);}
+   displayCache.delete(peer);
+  }
+  cachedSearch=cachedRows=null;
+ }
  for(const m of messages){
   let peer;
   if(m.sender===user&&m.recipient!==user)peer=m.recipient;
@@ -42,6 +56,7 @@ function messageIndex(messages,user,server){
   else continue;
   if(!byPeer.has(peer))byPeer.set(peer,[]);
   byPeer.get(peer).push(m);
+  byKey.set(m.sender+':'+m.clientId,m);
  }
  for(const rows of byPeer.values())rows.sort((a,b)=>a.createdAt.localeCompare(b.createdAt));
  function forPeer(peer){return byPeer.get(peer)||[];}
@@ -78,7 +93,16 @@ function messageIndex(messages,user,server){
   const size=Math.max(1,Math.min(50,pageSize)),index=Math.max(0,Number.isSafeInteger(page)?page:0);
   return {total:cachedSearch.matches.length,items:cachedSearch.matches.slice(index*size,(index+1)*size)};
  }
- return {user,server,messages:forPeer,hasBodyMatch,search:find};
+ function display(peer){
+  if(!displayCache.has(peer)){
+   const all=forPeer(peer),tracker=sessions(all),used=new Set(),items=[];
+   for(const m of all){const p=parse(m.body);if(p&&p.kind!=='pin'){const key=m.sender+'\0'+p.sessionId;if(used.has(key))continue;used.add(key);items.push({m,key,session:tracker.get(key)});}else items.push({m,key:m.sender+':'+m.clientId});}
+   displayCache.set(peer,{items,tracker});
+  }
+  const result=displayCache.get(peer);for(const item of result.tracker.values())if(!item.stopped&&item.deadline<=Date.now()){item.stopped=true;item.status='已过期';}
+  return result;
+ }
+ return {user,server,messages:forPeer,hasBodyMatch,search:find,apply,display};
 }
 return {PREFIX,HOUR,parse,encode,summary,sessions,search,messageIndex};
 });

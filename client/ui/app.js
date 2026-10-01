@@ -1,7 +1,10 @@
 const $=id=>document.getElementById(id);
 const F=window.ChatFeatures;let locationEpoch=0,live=null,watch=null,liveTimer=null,expiryTimer=null,searchTimer=null,searchPage=0,visibleEnd=null,historicalSnapshot=null,renderPeer='',messageNodes=new Map();
 let state={accounts:[],servers:[],contacts:[],sessions:[],contactStates:[],messages:[]};
-let indexedSnapshot=null,messageIndex=null;
+let indexedSnapshot=null,indexedRevision=null,messageIndex=null,contactIndex=new Map(),peerRows=new Map();
+let accountSignature='',serverSignature='',sending=false,safetyRequest=0;
+let lastSnapshotRevision=-1;
+const drafts=new Map();
 let selected=null,activePeer='',tab='sessions',settingsOpen=false,safetyResult=null,safetyPeer='',context='',draftRevision=0;
 const notice=message=>{$('notice').textContent=message||'';};
 async function command(action,payload){const result=await window.chat.command(action,payload);if(!result.ok)throw new Error(result.error);return result.value;}
@@ -9,12 +12,15 @@ const accountKey=account=>account.server+'\0'+account.user;
 const server=()=>state.selectedServer||state.server||(state.servers||[])[0]||'';
 const accounts=()=>((state.accounts||[]).filter(account=>account.server===server()));
 function resetPanels(){ $('moreMenu').hidden=true;$('more').setAttribute('aria-expanded','false');calls.closeActions();$('locationPanel').hidden=true;$('searchPanel').hidden=true;$('historyQuery').value='';$('historyFrom').value='';$('historyTo').value='';searchPage=0;clearTimeout(searchTimer);clearInterval(expiryTimer);expiryTimer=null;visibleEnd=null;historicalSnapshot=null;renderPeer='';messageNodes.clear();}
-function clearConversation(){resetPanels();activePeer='';draftRevision++;safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;calls.snapshot();}
+function saveDraft(){if(activePeer){const key=context+'\0'+activePeer,text=$('body').value;if(text)drafts.set(key,text);else drafts.delete(key);}}
+function clearConversation(){saveDraft();resetPanels();activePeer='';draftRevision++;safetyRequest++;safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;calls.snapshot();}
 function useAccount(account){selected=account;$('username').value=account.user;$('username').readOnly=true;$('register').hidden=true;$('usernameLabel').hidden=true;$('password').focus();renderAccountSelection();}
 function useNewAccount(){selected=null;$('username').value='';$('username').readOnly=false;$('usernameLabel').hidden=false;$('register').hidden=false;renderAccountSelection();$('username').focus();}
 function renderAccountSelection(){$('registrationWarning').hidden=$('register').hidden;for(const item of document.querySelectorAll('#accountList .account'))item.classList.toggle('active',!!selected&&item.dataset.key===accountKey(selected));}
 function renderAccounts(){
-  const list=$('accountList');list.replaceChildren();const filtered=accounts();$('accountPicker').hidden=!filtered.length;$('otherAccount').hidden=!filtered.length;
+  const list=$('accountList'),filtered=accounts(),signature=JSON.stringify([server(),filtered]);
+  if(signature===accountSignature){renderAccountSelection();return;}accountSignature=signature;
+  list.replaceChildren();$('accountPicker').hidden=!filtered.length;$('otherAccount').hidden=!filtered.length;
   for(const account of filtered){
     const item=document.createElement('li');item.className='account';item.dataset.key=accountKey(account);item.dataset.user=account.user;
     const pick=document.createElement('button');pick.type='button';pick.className='accountPick';pick.textContent=account.user;pick.onclick=()=>useAccount(account);
@@ -27,11 +33,12 @@ function renderAccounts(){
   renderAccountSelection();
 }
 function renderServers(){
+  const signature=JSON.stringify([server(),state.servers||[]]);if(signature===serverSignature)return;serverSignature=signature;
   const list=$('serverList');list.replaceChildren();
   for(const address of state.servers||[]){const item=document.createElement('li');const pick=document.createElement('button');pick.type='button';pick.className='serverPick'+(address===server()?' active':'');pick.textContent=address;pick.onclick=()=>switchServer(address);item.append(pick);list.append(item);}
 }
 function peerMessages(peer){return messageIndex?.messages(peer)||[];}
-function contact(peer){return (state.contactStates||[]).find(item=>item.username===peer);}
+function contact(peer){return contactIndex.get(peer);}
 function updateLocationButtons(){const canLocate=!!(activePeer&&state.online&&contact(activePeer)?.status==='accepted'&&!state.deletedPeers?.[activePeer]&&!state.identityChanges?.[activePeer]);$('sendPosition').disabled=$('sendPositionEntry').disabled=!canLocate||!!live;$('startLive').disabled=!canLocate||!!live;$('startLiveEntry').disabled=!canLocate&&!live;}
 function peerStatus(peer){if(state.deletedPeers?.[peer])return '该用户已销户';if(state.identityChanges?.[peer])return '身份已更新，请重新核对';const item=contact(peer),presence=item?.online?'在线':'离线';if(item?.status==='pending_incoming')return presence+' · 等待你接受';if(item?.status==='pending_outgoing')return presence+' · 等待对方接受';if(item?.status==='accepted')return presence;return '尚未建立联系';}
 function peers(){
@@ -45,16 +52,24 @@ function peers(){
 function renderPeers(){
   $('sessionsTab').classList.toggle('active',tab==='sessions');$('contactsTab').classList.toggle('active',tab==='contacts');
   $('peerSearch').placeholder=tab==='sessions'?'搜索会话':'搜索联系人';
-  const list=$('peerList');list.replaceChildren();
-  for(const item of peers()){
-    const row=document.createElement('li');const button=document.createElement('button');button.type='button';button.className='peerPick'+(item.name===activePeer?' active':'');button.dataset.peer=item.name;
+  const list=$('peerList'),items=peers(),keep=new Set(items.map(item=>item.name));
+  for(const [name,row] of peerRows)if(!keep.has(name)){row.node.remove();peerRows.delete(name);}
+  if(items.length&&list.firstChild?.classList.contains('listEmpty'))list.firstChild.remove();
+  let cursor=list.firstChild;
+  for(const item of items){
+    let saved=peerRows.get(item.name);
+    if(!saved){const row=document.createElement('li');const button=document.createElement('button');button.type='button';button.className='peerPick';button.dataset.peer=item.name;
     const avatar=document.createElement('span');avatar.className='avatar';avatar.textContent=item.name.slice(0,1).toUpperCase();
     const detail=document.createElement('span');detail.className='peerDetail';const name=document.createElement('strong');name.textContent=item.name;detail.append(name);
-    const presence=document.createElement('small');presence.className='peerStatus'+(contact(item.name)?.online?' online':'');presence.textContent=peerStatus(item.name);detail.append(presence);
-    const preview=document.createElement('small');preview.textContent=F.summary(item.messages.at(-1)?.body||'开始聊天');detail.append(preview);
-    button.append(avatar,detail);button.onclick=()=>openPeer(item.name);row.append(button);list.append(row);
+    const presence=document.createElement('small');presence.className='peerStatus';detail.append(presence);
+    const preview=document.createElement('small');detail.append(preview);
+    button.append(avatar,detail);button.onclick=()=>openPeer(item.name);row.append(button);saved={node:row,button,presence,preview};peerRows.set(item.name,saved);}
+    saved.button.classList.toggle('active',item.name===activePeer);
+    saved.presence.classList.toggle('online',!!contact(item.name)?.online);saved.presence.textContent=peerStatus(item.name)+(state.unread?.[item.name]?' · '+state.unread[item.name]+' 条未读':'');
+    saved.preview.textContent=F.summary(item.messages.at(-1)?.body||'开始聊天');
+    if(saved.node!==cursor)list.insertBefore(saved.node,cursor);cursor=saved.node.nextSibling;
   }
-  if(!list.children.length){const empty=document.createElement('li');empty.className='listEmpty';empty.textContent=$('peerSearch').value.trim()?'没有匹配结果':tab==='contacts'?'暂无联系人':'暂无会话';list.append(empty);}
+  if(!items.length){let empty=list.firstChild;if(!empty){empty=document.createElement('li');empty.className='listEmpty';list.append(empty);}empty.textContent=$('peerSearch').value.trim()?'没有匹配结果':tab==='contacts'?'暂无联系人':'暂无会话';}
 }
 function renderConversation(){
   $('emptyConversation').hidden=!!activePeer;$('conversationContent').hidden=!activePeer;if(!activePeer)return;
@@ -70,7 +85,7 @@ function renderConversation(){
   $('safety').disabled=false;
   const relation=contact(activePeer)?.status;
   const canSend=state.online&&!deleted&&!changed&&(relation==='accepted'||!relation);
-  $('send').disabled=!canSend;$('body').disabled=!canSend;
+  $('send').disabled=!canSend||sending;$('body').disabled=!canSend;
   $('body').placeholder=changed?'请先核对新的安全码':deleted?'该用户已销户，聊天记录仍保留':relation==='pending_incoming'?'接受聊天后可回复':relation==='pending_outgoing'?'等待对方接受后可继续发送':'发送消息…';
   $('acceptContact').hidden=relation!=='pending_incoming';$('removeContact').hidden=relation!=='accepted'||!(state.contacts||[]).includes(activePeer);
   updateLocationButtons();
@@ -78,11 +93,16 @@ function renderConversation(){
   renderMessages();if(!$('searchPanel').hidden)renderSearch();
 
 }
-async function openPeer(peer){try{if(activePeer!==peer){resetPanels();draftRevision++;}activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;if(!(state.sessions||[]).includes(peer))render(await command('openConversation',{peer}));else{renderPeers();renderConversation();}calls.snapshot();$('body').focus();}catch(error){notice(error.message);}}
+async function openPeer(peer){try{if(activePeer!==peer){saveDraft();resetPanels();draftRevision++;safetyRequest++;$('body').value=drafts.get(context+'\0'+peer)||'';}activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;render(await command('openConversation',{peer}));calls.snapshot();$('body').focus();}catch(error){notice(error.message);}}
 function render(next){
+  if(Number.isSafeInteger(next.snapshotRevision)){if(next.snapshotRevision<lastSnapshotRevision)return;lastSnapshotRevision=next.snapshotRevision;}
   const oldIdentity=context;if(live&&(!next.online||next.server!==state.server||next.username!==state.username))stopLive();state=next;const current=(state.username?state.server+'\0'+state.username:'')+'|'+server();
-  if(indexedSnapshot!==next||messageIndex?.user!==state.username||messageIndex?.server!==server()){messageIndex=F.messageIndex(state.messages||[],state.username,server());indexedSnapshot=next;}
-  if(oldIdentity&&oldIdentity!==current){clearConversation();selected=null;$('username').value='';$('password').value='';$('peerSearch').value='';}
+  const revision=Number.isSafeInteger(state.messageRevision)?state.messageRevision:null;
+  if(!messageIndex||messageIndex.user!==state.username||messageIndex.server!==server()||(Array.isArray(state.messages)&&(revision===null?indexedSnapshot!==next:indexedRevision!==revision))){messageIndex=F.messageIndex(state.messages||[],state.username,server());indexedSnapshot=next;indexedRevision=revision;}
+  else if(indexedRevision!==revision){messageIndex.apply(state.messageChanges);indexedRevision=revision;}
+  document.title=(Object.values(state.unread||{}).reduce((a,b)=>a+b,0)?'('+Object.values(state.unread).reduce((a,b)=>a+b,0)+') ':'')+'Chat';
+  contactIndex=new Map((state.contactStates||[]).map(item=>[item.username,item]));
+  if(oldIdentity&&oldIdentity!==current){clearConversation();drafts.clear();peerRows.clear();$('peerList').replaceChildren();selected=null;$('username').value='';$('password').value='';$('peerSearch').value='';}
   context=current;
   const hasServer=!!server();$('serverSetup').hidden=hasServer||settingsOpen;$('auth').hidden=!hasServer||!!state.username||settingsOpen;$('chat').hidden=!state.username||settingsOpen;$('settings').hidden=!settingsOpen;
   $('authServer').textContent=server();$('identity').textContent=state.username||'';$('connection').textContent=state.status||'';
@@ -106,21 +126,22 @@ $('contactForm').onsubmit=async event=>{event.preventDefault();try{const peer=$(
 $('acceptContact').onclick=async()=>{try{render(await command('acceptContact',{peer:activePeer}));notice('已接受聊天，现在可以回复。');}catch(error){notice(error.message);}};
 $('clearConversation').onclick=async()=>{try{const peer=activePeer;render(await command('clearConversation',{peer}));clearConversation();renderPeers();renderConversation();notice('会话已从列表清除，聊天记录仍保留；可从联系人重新打开。');}catch(error){notice(error.message);}};
 $('removeContact').onclick=async()=>{try{render(await command('removeContact',{peer:activePeer}));notice('联系人关系已解除，聊天记录仍保留。之后的新消息需要重新接受。');}catch(error){notice(error.message);}};
-$('body').oninput=()=>{draftRevision++;};
-$('sendForm').onsubmit=async event=>{event.preventDefault();if(!activePeer)return;const peer=activePeer,body=$('body').value,revision=draftRevision;try{render(await command('send',{peer,body}));if(activePeer===peer&&draftRevision===revision)$('body').value='';notice('消息已在本机加密并加入待发队列。');}catch(error){notice(error.message);}};
+$('body').oninput=()=>{draftRevision++;saveDraft();};
+$('sendForm').onsubmit=async event=>{event.preventDefault();if(!activePeer||sending||!$('body').value.trim())return;const peer=activePeer,body=$('body').value,revision=draftRevision,identity=context;sending=true;$('send').disabled=true;$('send').textContent='发送中';$('sendForm').setAttribute('aria-busy','true');try{const snapshot=await command('send',{peer,body});render(snapshot);if(context===identity&&activePeer===peer&&draftRevision===revision){$('body').value='';saveDraft();}notice('消息已加入发送队列。');}catch(error){notice(error.message);}finally{sending=false;$('send').textContent='发送';$('sendForm').setAttribute('aria-busy','false');const relation=contact(activePeer)?.status;$('send').disabled=!activePeer||!state.online||!!state.deletedPeers?.[activePeer]||!!state.identityChanges?.[activePeer]||!(!relation||relation==='accepted');}};
 $('history').onclick=async()=>{try{render(await command('history',{peer:activePeer}));notice('已同步服务器回执；历史正文来自本机受保护的缓存。');}catch(error){notice(error.message);}};
-$('safety').onclick=async()=>{try{safetyPeer=activePeer;safetyResult=await command('safety',{peer:safetyPeer});$('safetyCode').textContent=safetyResult.code.match(/.{1,5}/g).join(' ');$('safetyPanel').hidden=false;$('verification').textContent=safetyResult.verified?'安全码已核对':'请通过可信渠道核对安全码';}catch(error){notice(error.message);}};
-$('confirmSafety').onclick=async()=>{try{if(!safetyResult||safetyPeer!==activePeer)throw new Error('请重新获取安全码');safetyResult=await command('safety',{peer:safetyPeer,confirm:true,expectedCode:safetyResult.code});$('verification').textContent='安全码已核对';notice('核对结果已在本机保存，身份密钥变化将被阻止。');}catch(error){notice(error.message);}};
+$('safety').onclick=async()=>{const peer=activePeer,identity=context,request=++safetyRequest;try{const result=await command('safety',{peer});if(request!==safetyRequest||peer!==activePeer||identity!==context)return;safetyPeer=peer;safetyResult=result;$('safetyCode').textContent=result.code.match(/.{1,5}/g).join(' ');$('safetyPanel').hidden=false;$('verification').textContent=result.verified?'安全码已核对':'请通过可信渠道核对安全码';}catch(error){if(request===safetyRequest&&peer===activePeer&&identity===context)notice(error.message);}};
+$('confirmSafety').onclick=async()=>{const peer=activePeer,identity=context,request=++safetyRequest;try{if(!safetyResult||safetyPeer!==peer)throw new Error('请重新获取安全码');const result=await command('safety',{peer,confirm:true,expectedCode:safetyResult.code});if(request!==safetyRequest||peer!==activePeer||identity!==context)return;safetyResult=result;$('verification').textContent='安全码已核对';notice('核对结果已在本机保存。');}catch(error){if(request===safetyRequest&&peer===activePeer&&identity===context)notice(error.message);}};
 const calls=window.ChatCalls.create({command,notice,getState:()=>state,getPeer:()=>activePeer});
 window.chat.onCall(event=>calls.onEvent(event));
 window.chat.subscribe(render);
 command('snapshot').then(render).catch(error=>notice(error.message));
 function messageKey(m){return m.sender+':'+m.clientId;}
-function refreshLocationCards(){if(!activePeer||document.hidden)return;const tracker=F.sessions(peerMessages(activePeer));for(const [key,node] of messageNodes){const item=tracker.get(key);if(item){node.querySelector('strong').textContent='📍 实时位置 · '+item.status;}}}
+function refreshLocationCards(){if(!activePeer||document.hidden)return;const tracker=messageIndex.display(activePeer).tracker;for(const [key,node] of messageNodes){const item=tracker.get(key);if(item){node.querySelector('strong').textContent='📍 实时位置 · '+item.status;}}}
 function renderMessages(jump){
- const all=peerMessages(activePeer),log=$('messages'),tracker=F.sessions(all),used=new Set(),display=[];
+ const all=peerMessages(activePeer),log=$('messages'),cached=messageIndex.display(activePeer),tracker=cached.tracker;
  if(jump){const packet=F.parse(jump.body);historicalSnapshot=packet&&packet.kind!=='pin'?messageKey(jump):null;}
- for(const m of all){const p=F.parse(m.body);if(p&&p.kind!=='pin'){const key=m.sender+'\0'+p.sessionId;if(used.has(key)){if(messageKey(m)===historicalSnapshot)display.push({m,key:'snapshot:'+messageKey(m),snapshot:true});continue;}used.add(key);display.push({m,key,session:tracker.get(key)});if(messageKey(m)===historicalSnapshot)display.push({m,key:'snapshot:'+messageKey(m),snapshot:true});}else display.push({m,key:messageKey(m)});}
+ let display=cached.items;
+ if(historicalSnapshot){display=[...display];const m=all.find(m=>messageKey(m)===historicalSnapshot);if(m){let at=display.findIndex(item=>item.m.createdAt>m.createdAt);if(at<0)at=display.length;display.splice(at,0,{m,key:'snapshot:'+messageKey(m),snapshot:true});}}
  let jumpKey;if(jump){const p=F.parse(jump.body);jumpKey=p&&p.kind!=='pin'?'snapshot:'+messageKey(jump):messageKey(jump);const index=display.findIndex(item=>item.key===jumpKey);visibleEnd=Math.min(display.length,index+21);}
  const end=visibleEnd===null?display.length:Math.min(visibleEnd,display.length),items=display.slice(Math.max(0,end-100),end),wasBottom=log.scrollHeight-log.scrollTop-log.clientHeight<80;
  if(renderPeer!==activePeer){log.replaceChildren();messageNodes.clear();renderPeer=activePeer;}
@@ -142,6 +163,8 @@ $('closeLocation').onclick=()=>{$('locationPanel').hidden=true;};$('closeSearch'
 for(const id of ['historyQuery','historyFrom','historyTo'])$(id).oninput=()=>{clearTimeout(searchTimer);searchPage=0;searchTimer=setTimeout(renderSearch,200);};
 $('historyPrev').onclick=()=>{searchPage--;renderSearch();};$('historyNext').onclick=()=>{searchPage++;renderSearch();};$('olderMessages').onclick=()=>{visibleEnd=Math.max(1,(visibleEnd??peerMessages(activePeer).length)-80);renderMessages();};
 document.addEventListener('click',e=>{if(!e.target.closest('.moreWrap'))closeMenu();});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeMenu();});
+$('moreMenu').addEventListener('click',event=>{if(event.target.closest('button'))closeMenu();});
+$('body').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){event.preventDefault();if(!$('send').disabled)$('sendForm').requestSubmit();}});
 function locationPayload(kind,coords,sessionId=crypto.randomUUID(),seq=0,expiry=Date.now()+F.HOUR,recordedAt=Date.now()){const now=Date.now();expiry=Math.min(expiry,recordedAt+F.HOUR);return {v:1,kind,sessionId,seq,...(coords?{latitude:coords.latitude,longitude:coords.longitude,accuracy:coords.accuracy}:{}),recordedAt:new Date(recordedAt).toISOString(),expiresAt:new Date(Math.max(recordedAt,expiry)).toISOString()};}
 function validateFix(pos){if(!Number.isFinite(pos.timestamp)||pos.timestamp<Date.now()-120000||pos.timestamp>Date.now()+300000)throw new Error('定位结果时间无效或已超过两分钟，请重新获取位置。');return pos.timestamp;}
 function geoError(error){return error?.code===1?'定位权限被拒绝，请检查 Windows 位置权限或发送手动坐标。':error?.code===3?'定位超时，可重试或发送手动坐标。':'此设备无法获取系统位置，请使用手动坐标；实时共享需要可用定位服务。';}

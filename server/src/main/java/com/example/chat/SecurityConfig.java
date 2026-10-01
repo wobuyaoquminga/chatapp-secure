@@ -47,7 +47,7 @@ public class SecurityConfig {
     @Bean SecurityFilterChain security(HttpSecurity http) throws Exception {
         return http.csrf(c -> c.disable())
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-            .authorizeHttpRequests(a -> a.requestMatchers("/", "/index.html", "/api/auth/register", "/api/auth/login", "/ws", "/error").permitAll().anyRequest().authenticated())
+            .authorizeHttpRequests(a -> a.requestMatchers("/", "/index.html", "/api/auth/register", "/api/auth/login", "/api/auth/refresh", "/ws", "/error").permitAll().anyRequest().authenticated())
             .oauth2ResourceServer(o -> o.jwt(j -> {}))
             .headers(h -> h.contentSecurityPolicy(c -> c.policyDirectives("default-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")))
             .build();

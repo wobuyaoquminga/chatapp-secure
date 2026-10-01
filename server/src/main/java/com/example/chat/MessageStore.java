@@ -157,7 +157,11 @@ public class MessageStore {
             }, user, user);
     }
     public Contact contact(String user, String peer) {
-        return contacts(user).stream().filter(c -> c.username().equals(peer)).findFirst().orElse(null);
+        return db.query("SELECT initiator,accepted FROM contacts WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?) "
+                + "ORDER BY user_a,user_b LIMIT 1",
+            (r, i) -> new Contact(peer, r.getBoolean("accepted") ? "accepted"
+                : user.equals(r.getString("initiator")) ? "pending_outgoing" : "pending_incoming", false),
+            user, peer, peer, user).stream().findFirst().orElse(null);
     }
     @Transactional
     public void accept(String user, String peer) {
@@ -195,7 +199,7 @@ public class MessageStore {
             throw new IllegalArgumentException("设备身份已更新，请重新登录");
         var found = db.query("SELECT * FROM messages WHERE id=? AND recipient=?", this::map, id, user);
         if (found.isEmpty()) throw new IllegalArgumentException("消息不存在或无权确认");
-        db.update("UPDATE messages SET acknowledged=TRUE WHERE id=? AND recipient=?", id, user);
+        db.update("UPDATE messages SET acknowledged=TRUE, acknowledged_at=COALESCE(acknowledged_at,CURRENT_TIMESTAMP) WHERE id=? AND recipient=?", id, user);
         return found.get(0);
     }
     public List<Message> history(String user, String peer, long beforeId) {

@@ -11,6 +11,8 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.content.res.ColorStateList;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -46,7 +48,7 @@ import java.util.concurrent.RejectedExecutionException;
 public final class MainActivity extends Activity implements ChatController.Listener {
     private static final int INK = Color.rgb(29, 39, 42);
     private static final int MUTED = Color.rgb(106, 117, 119);
-    private static final int GREEN = Color.rgb(7, 166, 96);
+    private static final int GREEN = Color.rgb(9, 132, 78);
     private static final int BG = Color.rgb(246, 248, 247);
     private static final int BORDER = Color.rgb(228, 233, 230);
     private ChatController controller;
@@ -82,13 +84,14 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private boolean lanTest;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService uiPreparation = Executors.newSingleThreadExecutor();
-    private MessageIndex messageIndex = new MessageIndex();
+    private volatile MessageIndex messageIndex = new MessageIndex();
     private volatile long snapshotGeneration;
     private volatile boolean destroyed;
     private boolean foreground;
     private HistoryWindow historyWindow = HistoryWindow.latest(0);
     private int revealedHistoryIndex = -1;
     private LinearLayout conversationStream, messageResults, contactResults;
+    private final Map<String, View> messageRows = new HashMap<>(), contactRows = new HashMap<>();
     private TextView conversationStatus;
     private final Map<String, View> messageViews = new HashMap<>();
     private final Map<String, String> drafts = new HashMap<>();
@@ -139,10 +142,26 @@ public final class MainActivity extends Activity implements ChatController.Liste
         main.postDelayed(expiryRefresh, 15000);
     }
 
+    @Override protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        openNotifiedConversation();
+    }
+
+    private void openNotifiedConversation() {
+        String peer = getIntent().getStringExtra("messagePeer");
+        if (signedIn() && Usernames.valid(peer) && !peer.equals(state.optString("username"))) {
+            getIntent().removeExtra("messagePeer");
+            openPeer(peer);
+        }
+    }
+
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        if (controller != null) controller.setVisibleConversation(true, detailPeer);
         if (signedIn()) CallNotifier.ensurePermission(this);
+        openNotifiedConversation();
         if (call != null) call.showPendingIncoming();
         if (pendingReadyCall != null) {
             CallSession ready = pendingReadyCall;
@@ -159,6 +178,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     @Override protected void onStop() {
         foreground = false;
+        if (controller != null) controller.setVisibleConversation(false, "");
         if (call != null) call.onBackgrounded();
         main.removeCallbacks(expiryRefresh);
         if (locationSharing != null) locationSharing.stopLive();
@@ -220,6 +240,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
         conversationStatus = null;
         messageResults = null;
         contactResults = null;
+        messageRows.clear();
+        contactRows.clear();
         messageViews.clear();
         header.removeAllViews();
         content.removeAllViews();
@@ -247,6 +269,12 @@ public final class MainActivity extends Activity implements ChatController.Liste
             composer.setSelection(Math.min(Math.max(cursor, 0), composer.length()));
         }
         shell.requestApplyInsets();
+        if (controller != null) controller.setVisibleConversation(foreground, detailPeer);
+    }
+
+    @Override public void onConfigurationChanged(android.content.res.Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        render();
     }
 
     private String screenKey() {
@@ -448,24 +476,29 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     private void populateMessages(LinearLayout results) {
-        results.removeAllViews();
         List<String> peers = messageIndex.conversations;
         Map<String, JSONObject> last = messageIndex.latest;
-        int shown = 0;
+        String query = messageQuery.trim().toLowerCase(java.util.Locale.ROOT);
+        List<View> desired = new ArrayList<>();
+        Map<String, View> retained = new HashMap<>();
         for (String peer : peers) {
-            if (!matches(peer, messageQuery)) continue;
+            if (!matchesNormalized(peer, query)) continue;
             JSONObject message = last.get(peer);
             String preview = message == null ? "点击开始聊天" : HistorySearch.preview(message);
-            LinearLayout line = row();
-            line.setBackgroundColor(Color.WHITE);
-            line.addView(rowItem(peer, peerStatus(peer) + " · " + preview,
-                    () -> openPeer(peer)), new LinearLayout.LayoutParams(0, -2, 1));
-            line.addView(button("清除", 13, MUTED, v -> confirmClearConversation(peer)));
-            results.addView(line);
-            shown++;
+            int unread = state.optJSONObject("unread") == null ? 0 : state.optJSONObject("unread").optInt(peer);
+            String subtitle = (unread > 0 ? "未读 " + unread + " 条 · " : "") + peerStatus(peer) + " · " + preview;
+            String key = peer + '\0' + subtitle;
+            View line = messageRows.get(key);
+            if (line == null) line = listActionRow(peer, subtitle, "清除",
+                    () -> openPeer(peer), v -> confirmClearConversation(peer));
+            retained.put(key, line);
+            desired.add(line);
         }
-        if (shown == 0) results.addView(empty(messageQuery.isEmpty() ? "还没有会话" : "没有匹配的会话",
+        messageRows.clear();
+        messageRows.putAll(retained);
+        if (desired.isEmpty()) desired.add(empty(messageQuery.isEmpty() ? "还没有会话" : "没有匹配的会话",
                 messageQuery.isEmpty() ? "点击右上角＋，输入用户名开始聊天。" : "试试其他用户名。"));
+        reconcileRows(results, desired);
     }
 
     private void renderContacts() {
@@ -484,33 +517,63 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     private void populateContacts(LinearLayout results) {
-        results.removeAllViews();
         List<String> contacts = messageIndex.contacts;
-        int shown = 0;
+        String query = contactQuery.trim().toLowerCase(java.util.Locale.ROOT);
+        List<View> desired = new ArrayList<>();
+        Map<String, View> retained = new HashMap<>();
         for (String peer : contacts) {
-            if (!matches(peer, contactQuery)) continue;
-            LinearLayout line = row();
-            line.setBackgroundColor(Color.WHITE);
-            line.addView(rowItem(peer, peerStatus(peer), () -> openPeer(peer)),
-                    new LinearLayout.LayoutParams(0, -2, 1));
-            line.addView(button("删除", 13, MUTED, v -> confirmRemoveContact(peer)));
-            results.addView(line);
-            shown++;
+            if (!matchesNormalized(peer, query)) continue;
+            String subtitle = peerStatus(peer);
+            String key = "contact\0" + peer + '\0' + subtitle;
+            View line = contactRows.get(key);
+            if (line == null) line = listActionRow(peer, subtitle, "删除",
+                    () -> openPeer(peer), v -> confirmRemoveContact(peer));
+            retained.put(key, line);
+            desired.add(line);
         }
         JSONObject relations = state.optJSONObject("relationships");
         if (relations != null) for (java.util.Iterator<String> names = relations.keys(); names.hasNext();) {
             String peer = names.next();
-            if (!"pending_incoming".equals(relation(peer)) || !matches(peer, contactQuery)) continue;
-            LinearLayout line = row();
-            line.setBackgroundColor(Color.WHITE);
-            line.addView(rowItem(peer, "请求与你聊天 · " + peerStatus(peer), () -> openPeer(peer)),
-                    new LinearLayout.LayoutParams(0, -2, 1));
-            line.addView(button("同意", 13, GREEN, v -> controller.acceptContact(peer)));
-            results.addView(line);
-            shown++;
+            if (!"pending_incoming".equals(relation(peer)) || !matchesNormalized(peer, query)) continue;
+            String subtitle = "请求与你聊天 · " + peerStatus(peer);
+            String key = "request\0" + peer + '\0' + subtitle;
+            View line = contactRows.get(key);
+            if (line == null) line = listActionRow(peer, subtitle, "同意",
+                    () -> openPeer(peer), v -> controller.acceptContact(peer));
+            retained.put(key, line);
+            desired.add(line);
         }
-        if (shown == 0) results.addView(empty(contactQuery.isEmpty() ? "暂无联系人" : "没有匹配的联系人",
+        contactRows.clear();
+        contactRows.putAll(retained);
+        if (desired.isEmpty()) desired.add(empty(contactQuery.isEmpty() ? "暂无联系人" : "没有匹配的联系人",
                 contactQuery.isEmpty() ? "同意聊天请求后，对方会出现在这里。" : "试试其他用户名。"));
+        reconcileRows(results, desired);
+    }
+
+    private View listActionRow(String peer, String subtitle, String action,
+                               Runnable open, View.OnClickListener onAction) {
+        LinearLayout line = row();
+        line.setBackground(interactiveBackground(Color.WHITE, 15, BORDER));
+        line.addView(rowItem(peer, subtitle, open), new LinearLayout.LayoutParams(0, -2, 1));
+        TextView actionButton = button(action, 13, action.equals("同意") ? GREEN : MUTED, onAction);
+        actionButton.setContentDescription(action + peer);
+        line.addView(actionButton);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(dp(14), dp(4), dp(14), dp(4));
+        line.setLayoutParams(params);
+        return line;
+    }
+
+    private void reconcileRows(LinearLayout parent, List<View> desired) {
+        java.util.HashSet<View> wanted = new java.util.HashSet<>(desired);
+        for (int i = parent.getChildCount() - 1; i >= 0; i--)
+            if (!wanted.contains(parent.getChildAt(i))) parent.removeViewAt(i);
+        for (int i = 0; i < desired.size(); i++) {
+            View child = desired.get(i);
+            if (i < parent.getChildCount() && parent.getChildAt(i) == child) continue;
+            if (child.getParent() == parent) parent.removeView(child);
+            parent.addView(child, i);
+        }
     }
 
     private void renderConversation() {
@@ -553,7 +616,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         body.addView(tools);
         LinearLayout bar = row();
         bar.setPadding(dp(10), dp(8), dp(10), dp(8));
-        bar.setBackgroundColor(Color.WHITE);
+        bar.setBackgroundColor(BG);
         composer = field("发送消息", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         composerDraftKey = draftKey(detailPeer);
         composer.setText(draft);
@@ -566,11 +629,13 @@ public final class MainActivity extends Activity implements ChatController.Liste
             @Override public void afterTextChanged(Editable s) { }
         });
         composer.setMaxLines(5);
-        composer.setMinHeight(dp(44));
+        composer.setMinHeight(dp(48));
         boolean canSend = !deleted && !identityChanged(detailPeer) && !relation.startsWith("pending_");
         composer.setEnabled(canSend);
         if (!canSend) composer.setHint(deleted ? "该用户已销户，不能发送" : identityChanged(detailPeer) ? "重新核对安全码后可发送" : relation.equals("pending_incoming") ? "同意后可以回复" : "等待对方同意");
-        bar.addView(composer, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams composerParams = new LinearLayout.LayoutParams(0, -2, 1);
+        composerParams.setMargins(0, 0, dp(8), 0);
+        bar.addView(composer, composerParams);
         TextView sendButton = button("发送", 16, canSend ? GREEN : MUTED, v -> {
             String message = composer.getText().toString();
             if (message.trim().isEmpty()) return;
@@ -579,16 +644,18 @@ public final class MainActivity extends Activity implements ChatController.Liste
             controller.send(detailPeer, message, key, draftRevisions.getOrDefault(key, 0L));
         });
         sendButton.setEnabled(canSend);
-        bar.addView(sendButton, new LinearLayout.LayoutParams(dp(62), dp(44)));
+        sendButton.setBackground(interactiveBackground(canSend ? GREEN : BORDER, 12, canSend ? GREEN : BORDER));
+        sendButton.setTextColor(canSend ? Color.WHITE : MUTED);
+        bar.addView(sendButton, new LinearLayout.LayoutParams(dp(64), dp(48)));
         TextView callToggle = button("＋", 27, GREEN, v -> {
             callToolsExpanded = !callToolsExpanded;
             if (callActions != null) callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
         });
         callToggle.setContentDescription("展开聊天功能");
-        bar.addView(callToggle, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        bar.addView(callToggle, new LinearLayout.LayoutParams(dp(48), dp(48)));
         body.addView(bar);
         callActions = row();
-        callActions.setBackgroundColor(Color.WHITE);
+        callActions.setBackgroundColor(BG);
         callActions.setPadding(dp(12), dp(4), dp(12), dp(12));
         callActions.addView(button("语音通话", 13, GREEN, v -> requestCallPermissions("audio")),
                 new LinearLayout.LayoutParams(0, dp(48), 1));
@@ -1231,14 +1298,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
         return changes != null && changes.has(peer);
     }
 
-    private boolean matches(String name, String query) {
-        return name.toLowerCase(java.util.Locale.ROOT).contains(query.trim().toLowerCase(java.util.Locale.ROOT));
+    private boolean matchesNormalized(String name, String normalizedQuery) {
+        return name.toLowerCase(java.util.Locale.ROOT).contains(normalizedQuery);
     }
 
     private interface QueryChanged { void onQuery(String query); }
 
     private void addSearch(LinearLayout body, String hint, String current, QueryChanged listener) {
         EditText search = field(hint, InputType.TYPE_CLASS_TEXT);
+        search.setBackground(rounded(Color.rgb(238, 243, 240), 14, Color.rgb(238, 243, 240)));
         search.setSingleLine(true);
         search.setText(current);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(46));
@@ -1315,7 +1383,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         JSONObject oldChanges = state.optJSONObject("identityChanges");
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
-        if (foreground && !wasSigned && signedIn()) CallNotifier.ensurePermission(this);
+        if (foreground && !wasSigned && signedIn()) { CallNotifier.ensurePermission(this); openNotifiedConversation(); }
         if (call != null && call.busy()) {
             CallSession active = call.session();
             JSONObject relations = state.optJSONObject("relationships");
@@ -1496,6 +1564,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         TextView label = text(value, size, false, color);
         label.setGravity(Gravity.CENTER);
         label.setPadding(dp(9), dp(7), dp(9), dp(7));
+        label.setBackground(interactiveBackground(Color.TRANSPARENT, 11, Color.TRANSPARENT));
         label.setOnClickListener(click);
         return label;
     }
@@ -1503,13 +1572,13 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private TextView primary(String value, View.OnClickListener click) {
         TextView label = button(value, 16, Color.WHITE, click);
         label.setTypeface(null, Typeface.BOLD);
-        label.setBackground(rounded(GREEN, 11, GREEN));
+        label.setBackground(interactiveBackground(GREEN, 11, GREEN));
         return label;
     }
 
     private TextView secondary(String value, View.OnClickListener click) {
         TextView label = button(value, 16, INK, click);
-        label.setBackground(rounded(Color.WHITE, 11, BORDER));
+        label.setBackground(interactiveBackground(Color.WHITE, 11, BORDER));
         return label;
     }
 
@@ -1522,24 +1591,25 @@ public final class MainActivity extends Activity implements ChatController.Liste
         field.setHintTextColor(MUTED);
         field.setInputType(type);
         field.setPadding(dp(13), dp(10), dp(13), dp(10));
-        field.setBackground(rounded(Color.WHITE, 10, BORDER));
+        field.setBackground(rounded(Color.WHITE, 14, BORDER));
         return field;
     }
 
     private TextView readonly(String value) {
         TextView label = text(value, 16, false, INK);
         label.setPadding(dp(13), dp(13), dp(13), dp(13));
-        label.setBackground(rounded(Color.WHITE, 10, BORDER));
+        label.setBackground(rounded(Color.WHITE, 14, BORDER));
         return label;
     }
 
     private View rowItem(String title, String subtitle, Runnable click) {
         LinearLayout line = row();
-        line.setPadding(dp(18), dp(12), dp(16), dp(12));
-        line.setBackgroundColor(Color.WHITE);
+        line.setPadding(dp(14), dp(12), dp(12), dp(12));
+        line.setBackground(interactiveBackground(Color.WHITE, 15, Color.WHITE));
+        line.setMinimumHeight(dp(66));
         TextView avatar = text(title.isEmpty() ? "?" : title.substring(0, 1).toUpperCase(java.util.Locale.ROOT), 18, true, Color.WHITE);
         avatar.setGravity(Gravity.CENTER);
-        avatar.setBackground(rounded(Color.rgb(102, 175, 143), 10, Color.rgb(102, 175, 143)));
+        avatar.setBackground(rounded(Color.rgb(55, 137, 97), 21, Color.rgb(55, 137, 97)));
         line.addView(avatar, new LinearLayout.LayoutParams(dp(42), dp(42)));
         LinearLayout labels = column();
         labels.setPadding(dp(13), 0, dp(8), 0);
@@ -1581,6 +1651,11 @@ public final class MainActivity extends Activity implements ChatController.Liste
         shape.setCornerRadius(dp(radius));
         shape.setStroke(dp(1), stroke);
         return shape;
+    }
+
+    private RippleDrawable interactiveBackground(int fill, int radius, int stroke) {
+        return new RippleDrawable(ColorStateList.valueOf(Color.rgb(205, 226, 215)),
+                rounded(fill, radius, stroke), rounded(Color.WHITE, radius, Color.WHITE));
     }
 
     private boolean isLoopback(String address) {

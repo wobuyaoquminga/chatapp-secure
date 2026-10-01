@@ -4,11 +4,13 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.view.View;
 
 /** Network-free coordinate preview. Grid is illustrative, never represented as road data. */
 final class LocationPreview extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Path tip = new Path();
     private final double latitude, longitude;
     LocationPreview(Context context, double latitude, double longitude) {
         super(context); this.latitude = latitude; this.longitude = longitude;
@@ -26,7 +28,7 @@ final class LocationPreview extends View {
         for (float y = yOffset; y < h; y += spacing) canvas.drawLine(0, y, w, y, paint);
         paint.setColor(Color.rgb(7, 166, 96));
         canvas.drawCircle(w / 2, h / 2 - 8 * density, 12 * density, paint);
-        android.graphics.Path tip = new android.graphics.Path();
+        tip.reset();
         tip.moveTo(w / 2 - 9 * density, h / 2); tip.lineTo(w / 2, h / 2 + 17 * density);
         tip.lineTo(w / 2 + 9 * density, h / 2); tip.close(); canvas.drawPath(tip, paint);
         paint.setColor(Color.WHITE); canvas.drawCircle(w / 2, h / 2 - 8 * density, 4 * density, paint);

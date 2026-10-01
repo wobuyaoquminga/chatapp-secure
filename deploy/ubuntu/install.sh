@@ -41,6 +41,8 @@ had_jar=0
 had_service=0
 had_env=0
 was_active=0
+data_snapshot=0
+new_started=0
 if [[ -f /opt/chat/chat-server.jar ]]; then
   cp -p /opt/chat/chat-server.jar "$backup/chat-server.jar"
   had_jar=1
@@ -64,6 +66,26 @@ rollback() {
     if (( had_jar )); then cp -p "$backup/chat-server.jar" /opt/chat/chat-server.jar; else rm -f /opt/chat/chat-server.jar; fi
     if (( had_service )); then cp -p "$backup/chat.service" /etc/systemd/system/chat.service; else rm -f /etc/systemd/system/chat.service; fi
     if (( had_env )); then cp -p "$backup/chat.env" /etc/chat/chat.env; fi
+    if (( data_snapshot )); then
+      # The original H2 files were copied only after the old process stopped.
+      # Restore them together with the binary; a migrated DB is not safe to downgrade alone.
+      if systemctl is-active --quiet chat.service; then
+        echo '服务仍在运行，不能安全恢复数据库。请停服后手动恢复升级前备份。' >&2
+        was_active=0
+      else
+        if ! mv -- /var/lib/chat/data "$backup/failed-data"; then
+          echo "数据目录未能移开；备份保留在 $backup，不会启动旧版本。" >&2
+          exit "$status"
+        fi
+        if ! cp -a -- "$backup/data" /var/lib/chat/data; then
+          echo "数据库恢复失败；备份保留在 $backup，请手动恢复。" >&2
+          exit "$status"
+        fi
+      fi
+    elif (( new_started )); then
+      echo '非默认 H2 数据库不能自动恢复；请恢复升级前数据库备份后再启动旧版本。' >&2
+      was_active=0
+    fi
     systemctl daemon-reload || true
     if (( was_active )); then systemctl restart chat.service || true; fi
   fi
@@ -82,6 +104,11 @@ systemctl stop chat.service 2>/dev/null || true
 if systemctl is-active --quiet chat.service; then
   echo '旧服务未能停止，安装已中止。' >&2
   exit 1
+fi
+if grep -q "^DB_URL=['\"]\?jdbc:h2:file:/var/lib/chat/data/" /etc/chat/chat.env; then
+  [[ ! -L /var/lib/chat/data ]] || { echo '数据目录不能是符号链接。' >&2; exit 1; }
+  cp -a -- /var/lib/chat/data "$backup/data"
+  data_snapshot=1
 fi
 install -o root -g root -m 0644 "$base/chat-server.jar" "$backup/new-chat-server.jar"
 mv -f "$backup/new-chat-server.jar" /opt/chat/chat-server.jar
@@ -111,6 +138,7 @@ ReadWritePaths=/var/lib/chat
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
+new_started=1
 systemctl enable --now chat.service
 # A protected endpoint returns 401 when the web application is ready.
 for attempt in {1..60}; do

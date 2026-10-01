@@ -42,7 +42,7 @@ const testAppData=profile.startsWith('qa-migrate-')&&process.argv.includes('--te
 app.setPath('userData',userDataRoot(testAppData||app.getPath('appData')));
 if(!app.requestSingleInstanceLock()){app.quit();}else{
   let window,controller,geoUntil=0,geoPeer='',geoGeneration=-1;
-  let incomingNotice;
+  let incomingNotice,messageNotice;
   const mediaLease=new MediaLease();
   if(process.platform==='win32')app.setAppUserModelId('Chat');
   app.on('second-instance',()=>{window?.show();window?.focus();});
@@ -53,8 +53,14 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
     const entryUrl=pathToFileURL(entry).href.toLowerCase();
     controller=new Controller(app.getPath('userData'),safeStorage,event=>{
       if(!window||window.isDestroyed())return;
-      window.webContents.send(event?.type?.startsWith('call')?'chat:call':'chat:event',event);
-      if(event?.type==='call'&&event.event?.action==='offer'){
+      if(event?.type!=='message')window.webContents.send(event?.type?.startsWith('call')?'chat:call':'chat:event',event);
+      if(event?.type==='message'&&!window.isFocused()&&event.generation===controller.generation&&event.server===controller.server&&event.username===controller.user){
+        window.flashFrame(true);
+        try{messageNotice?.close();if(Notification.isSupported()){
+          messageNotice=new Notification({title:'Chat 新消息',body:`${event.peer} 发来了新消息`,silent:false});
+          messageNotice.on('click',()=>{if(window.isMinimized())window.restore();window.show();window.focus();});messageNotice.show();
+        }}catch{}
+      }else if(event?.type==='call'&&event.event?.action==='offer'){
         window.flashFrame(true);
         try{
           incomingNotice?.close();
@@ -67,15 +73,16 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
       }else if(event?.type==='call_end'||event?.type==='call_error'){
         incomingNotice?.close();incomingNotice=undefined;window.flashFrame(false);
       }
+      if(!event?.type&&!event?.username){messageNotice?.close();messageNotice=undefined;}
     });
     window=new BrowserWindow({width:1040,height:900,minWidth:560,minHeight:650,show:false,title:'Chat',
       icon:path.join(__dirname,'assets','icon.ico'),
       webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,devTools:!app.isPackaged}});
     window.removeMenu();window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
-    window.on('focus',()=>window.flashFrame(false));
+    window.on('focus',()=>{window.flashFrame(false);controller.setForeground(true);});
     window.webContents.on('will-navigate',event=>event.preventDefault());
     ipcMain.handle('chat:open-map',async(event,latitude,longitude)=>{
-      if(event.sender!==window.webContents||event.senderFrame.url.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
+      if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
       if(typeof latitude!=='number'||!Number.isFinite(latitude)||Math.abs(latitude)>90||
          typeof longitude!=='number'||!Number.isFinite(longitude)||Math.abs(longitude)>180)throw new Error('位置坐标无效');
       // Only numeric coordinates reach this fixed HTTPS endpoint; renderer text is never a URL.
@@ -89,11 +96,11 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
     const mediaAllowed=(contents,permission,details)=>permission==='media'&&contents===window.webContents&&window.isFocused()&&mediaLease.allows({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame,mediaTypes:details?.mediaTypes||(details?.mediaType?[details.mediaType]:null),server:controller.server,generation:controller.generation,call:controller.call});
     session.defaultSession.setPermissionRequestHandler((contents,permission,callback,details)=>callback(geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details)));
     session.defaultSession.setPermissionCheckHandler((contents,permission,_origin,details)=>geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details));
-    window.on('blur',()=>{geoUntil=0;mediaLease.revoke();nativeLocation.cancel();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations()).catch(()=>{});});
+    window.on('blur',()=>{controller.setForeground(false);geoUntil=0;mediaLease.revoke();nativeLocation.cancel();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations()).catch(()=>{});});
     let closing=false;window.on('close',event=>{geoUntil=0;mediaLease.revoke();nativeLocation.cancel();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).catch(()=>{}).finally(()=>window.destroy());});
     ipcMain.handle('chat:command',async(event,{action,payload})=>{
-      if(event.sender!==window.webContents||event.senderFrame.url.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
-      if(action==='sendLocation'&&!window.isFocused()&&require('./ui/features.js').parse(payload?.body)?.kind!=='stop')return {ok:false,error:'请在应用前台发送位置'};
+      if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
+      if((action==='sendLocation'||action==='send'&&payload?.body?.startsWith(require('./ui/features.js').PREFIX))&&!window.isFocused()&&require('./ui/features.js').parse(payload?.body)?.kind!=='stop')return {ok:false,error:'请在应用前台发送位置'};
       if(action==='nativePosition'){
         const generation=controller.generation,peer=payload?.peer;
         const authorized=()=>Date.now()<geoUntil&&peer===geoPeer&&generation===geoGeneration&&controller.generation===generation&&controller.online&&window&&!window.isDestroyed()&&window.isFocused()&&controller.contactState[peer]?.status==='accepted'&&!controller.engine?.state.identityChanges?.[peer]&&!controller.engine?.state.deletedPeers?.[peer];

@@ -58,6 +58,79 @@ final class ChatController {
     private String server;
     private String username;
     private String token; // Never persisted.
+    private String refreshToken, authAccountId;
+    private long tokenExpiresAt, authSession;
+    private ScheduledFuture<?> refreshTask, refreshAckTimeout;
+    private boolean foreground;
+    private String visiblePeer = "";
+
+    void setVisibleConversation(boolean visible, String peer) {
+        execute(() -> {
+            foreground = visible;
+            visiblePeer = visible && peer != null ? peer : "";
+            if (engine != null && !visiblePeer.isEmpty()) {
+                JSONObject unread = engine.state().optJSONObject("unread");
+                if (unread != null && unread.optInt(visiblePeer) > 0) {
+                    transaction(() -> { unread.remove(visiblePeer); return null; });
+                    MessageNotifier.cancel(context, visiblePeer);
+                    publish("");
+                }
+            }
+        });
+    }
+
+    private void acceptAuth(JSONObject auth) throws Exception {
+        String nextToken = auth.getString("token"), nextAccount = auth.optString("accountId", "");
+        String nextRefresh = auth.optString("refreshToken", "");
+        long expiry = 0;
+        if (nextToken.isEmpty()) throw new SecurityException("服务器认证凭据无效");
+        if (!nextRefresh.isEmpty()) {
+            if (!nextRefresh.matches("[A-Za-z0-9_-]{43}")) throw new SecurityException("服务器续期凭据无效");
+            expiry = java.time.Instant.parse(auth.getString("expiresAt")).toEpochMilli();
+            if (expiry <= System.currentTimeMillis()) throw new SecurityException("服务器认证凭据已过期");
+        }
+        token = nextToken; authAccountId = nextAccount; refreshToken = nextRefresh; tokenExpiresAt = expiry;
+        if (nextRefresh.isEmpty()) cancelRefresh(); else scheduleRefresh(0);
+    }
+
+    private void scheduleRefresh(int retry) {
+        if (refreshTask != null) refreshTask.cancel(false);
+        if (closed || refreshToken == null || refreshToken.isEmpty() || token == null) return;
+        long epoch = authSession;
+        long remaining = tokenExpiresAt - System.currentTimeMillis();
+        long delay = AuthRenewal.delay(remaining, retry);
+        refreshTask = worker.schedule(() -> {
+            refreshTask = null;
+            if (closed || epoch != authSession || token == null) return;
+            try {
+                JSONObject auth = requestObject("/api/auth/refresh", "POST", new JSONObject().put("refreshToken", refreshToken));
+                if (!username.equals(auth.getString("username")) || !authAccountId.equals(auth.getString("accountId"))
+                        || auth.optString("refreshToken").isEmpty())
+                    throw new SecurityException("续期返回的账号不匹配");
+                acceptAuth(auth);
+                WebSocket active = socket;
+                if (online && active != null) {
+                    if (!active.send(new JSONObject().put("type", "auth").put("token", token).toString()))
+                        throw new Exception("连接续期发送失败");
+                    if (refreshAckTimeout != null) refreshAckTimeout.cancel(false);
+                    refreshAckTimeout = worker.schedule(() -> {
+                        if (epoch == authSession && socket == active)
+                            stopConnection("连接续期未获确认，请重新登录", new Exception("续期确认超时"));
+                    }, 20, TimeUnit.SECONDS);
+                }
+            } catch (Exception error) {
+                if (epoch != authSession) return;
+                if (!(error instanceof SecurityException) && !isAuthenticationFailure(error)
+                        && retry < 3 && System.currentTimeMillis() < tokenExpiresAt) scheduleRefresh(retry + 1);
+                else stopConnection("认证续期失败，请重新登录", error);
+            }
+        }, delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelRefresh() {
+        if (refreshTask != null) { refreshTask.cancel(false); refreshTask = null; }
+        if (refreshAckTimeout != null) { refreshAckTimeout.cancel(false); refreshAckTimeout = null; }
+    }
     private String selectedPeer = "";
     private final JSONObject relationships = new JSONObject();
     private String status = "未登录";
@@ -78,12 +151,12 @@ final class ChatController {
     private java.util.concurrent.ScheduledFuture<?> liveTimeout;
     private volatile Runnable locationStopped;
     private long messagesRevision;
-    private String messagesSignature = "";
+    private long cachedHistoryRevision = -1;
     private JSONArray cachedMessages = new JSONArray();
     private SignalEngine cachedEngine;
     private int messagesAppendFrom = -1;
     private long messagesBaseRevision;
-    private final java.util.Map<String,String> messageSourceCache = new java.util.HashMap<>();
+    private final java.util.Map<String,Long> messageSourceCache = new java.util.HashMap<>();
     private final java.util.Map<String,JSONObject> cleanMessageCache = new java.util.HashMap<>();
     void setLocationStoppedListener(Runnable stopped) { locationStopped = stopped; }
     long locationContext() { return generation; }
@@ -211,7 +284,7 @@ final class ChatController {
             try {
                 JSONObject auth = requestObject("/api/auth/" + (register ? "register" : "login"),
                         "POST", credentials);
-                token = auth.getString("token");
+                acceptAuth(auth);
                 username = user;
                 vault = new SecureVault(context, server, username);
                 JSONObject saved = vault.read();
@@ -233,7 +306,7 @@ final class ChatController {
                                 new JSONObject().put("password", password).put("bundle", resetBundle));
                         if (!username.equals(reset.getString("username")))
                             throw new Exception("服务器返回的账号不匹配");
-                        token = reset.getString("token");
+                        acceptAuth(reset);
                         replacement.state().put("accountId", reset.getString("accountId"));
                     } else {
                         // A previous reset succeeded before the final local write completed.
@@ -435,7 +508,13 @@ final class ChatController {
     void clearConversation(String peer) {
         execute(() -> {
             requirePeer(peer);
-            transaction(() -> { engine.state().getJSONObject("hiddenConversations").put(peer, true); return null; });
+            transaction(() -> {
+                engine.state().getJSONObject("hiddenConversations").put(peer, true);
+                JSONObject unread = engine.state().optJSONObject("unread");
+                if (unread != null) unread.remove(peer);
+                return null;
+            });
+            MessageNotifier.cancel(context, peer);
             publish("");
         });
     }
@@ -535,11 +614,14 @@ final class ChatController {
     private <T> T transaction(Callable<T> action) throws Exception {
         if (storageFailed) throw new Exception("本地保存失败后已暂停加解密，请退出并重新登录");
         if (engine == null || vault == null) throw new Exception("请先登录");
-        JSONObject previous = new JSONObject(engine.state().toString());
+        boolean committed = false;
+        JSONObject previous = SecureVault.protocolCopy(engine.state());
+        HistoryRecords history = (HistoryRecords) engine.state().getJSONObject("messages");
         try {
             T result = action.call();
             try {
                 vault.write(engine.state());
+                committed = true;
                 refreshMessageCache();
             } catch (Exception error) {
                 storageFailed = true;
@@ -547,7 +629,11 @@ final class ChatController {
             }
             return result;
         } catch (Exception error) {
-            engine = new SignalEngine(previous);
+            if (!committed) {
+                history.rollback();
+                previous.put("messages", history);
+                engine = new SignalEngine(previous);
+            }
             throw error;
         }
     }
@@ -644,6 +730,9 @@ final class ChatController {
     private void event(JSONObject event) throws Exception {
         String type = event.optString("type", "");
         switch (type) {
+            case "reauthenticated":
+                if (refreshAckTimeout != null) { refreshAckTimeout.cancel(false); refreshAckTimeout = null; }
+                return;
             case "ready":
                 cancelAuthTimeout();
                 online = false;
@@ -668,16 +757,24 @@ final class ChatController {
                 JSONObject message = event.getJSONObject("message");
                 String sender = message.getString("sender");
                 JSONObject senderIdentity = requestObject("/api/keys/" + Usernames.path(sender), "GET", null);
+                boolean newIncoming = !engine.state().getJSONObject("messages").has(sender + ":" + message.getString("clientId"));
                 transaction(() -> {
                     engine.bindPeer(sender, senderIdentity, false);
                     String key = message.getString("sender") + ":" + message.getString("clientId");
                     boolean isNew = !engine.state().getJSONObject("messages").has(key);
                     engine.decrypt(message);
-                    if (isNew) engine.state().getJSONObject("hiddenConversations")
-                            .remove(message.getString("sender"));
+                    if (isNew) {
+                        engine.state().getJSONObject("hiddenConversations").remove(sender);
+                        if (!(foreground && sender.equals(visiblePeer))) {
+                            JSONObject unread = engine.state().optJSONObject("unread");
+                            if (unread == null) { unread = new JSONObject(); engine.state().put("unread", unread); }
+                            unread.put(sender, Math.min(9999, unread.optInt(sender) + 1));
+                        }
+                    }
                     return null;
                 });
                 wire(new JSONObject().put("type", "ack").put("id", message.get("id")));
+                if (newIncoming && !foreground) MessageNotifier.show(context, sender);
                 break;
             case "contact":
                 if (!online) return;
@@ -760,7 +857,7 @@ final class ChatController {
 
     private Object request(String path, String method, JSONObject body) throws Exception {
         Request.Builder builder = new Request.Builder().url(server + path).header("Accept", "application/json");
-        if (token != null) builder.header("Authorization", "Bearer " + token);
+        if (token != null && !path.equals("/api/auth/refresh")) builder.header("Authorization", "Bearer " + token);
         RequestBody requestBody = body == null ? null : RequestBody.create(body.toString(), JSON);
         builder.method(method, requestBody);
         try (Response response = client.newCall(builder.build()).execute()) {
@@ -787,6 +884,10 @@ final class ChatController {
     }
 
     private void clearSession() {
+        ++authSession;
+        cancelRefresh();
+        refreshToken = null; authAccountId = null; tokenExpiresAt = 0;
+        MessageNotifier.cancelAll(context);
         main.post(listener::onCallContextLost);
         cancelReconnect();
         cancelAuthTimeout();
@@ -812,6 +913,7 @@ final class ChatController {
     }
 
     private void stopConnection(String reason, Exception error) {
+        cancelRefresh();
         main.post(listener::onCallContextLost);
         ++generation;
         cancelReconnect();
@@ -860,22 +962,28 @@ final class ChatController {
 
     private void refreshMessageCache() throws Exception {
         JSONObject saved = engine == null ? new JSONObject() : engine.state().getJSONObject("messages");
-        String signature = saved.toString();
+        HistoryRecords history = saved instanceof HistoryRecords ? (HistoryRecords) saved : null;
+        long revision = history == null ? 0 : history.revision();
+        if (engine == cachedEngine && revision == cachedHistoryRevision) return;
+        if (engine != cachedEngine) { cleanMessageCache.clear(); messageSourceCache.clear(); }
         cachedEngine = engine;
-        if (signature.equals(messagesSignature)) return;
-        messagesSignature = signature;
+        cachedHistoryRevision = revision;
         messagesBaseRevision = messagesRevision; ++messagesRevision;
         List<JSONObject> ordered = new ArrayList<>();
         for (Iterator<String> keys = saved.keys(); keys.hasNext();) {
             String key = keys.next();
-            String source = saved.getJSONObject(key).toString();
+            long version = history == null ? 0 : history.version(key);
             JSONObject clean = cleanMessageCache.get(key);
-            if (clean == null || !source.equals(messageSourceCache.get(key))) {
-                clean = new JSONObject(source); clean.remove("ciphertext");
-                messageSourceCache.put(key,source); cleanMessageCache.put(key,clean);
+            if (clean == null || !Long.valueOf(version).equals(messageSourceCache.get(key))) {
+                clean = new JSONObject(saved.getJSONObject(key).toString()); clean.remove("ciphertext");
+                messageSourceCache.put(key,version); cleanMessageCache.put(key,clean);
             }
             ordered.add(clean);
         }
+        java.util.Set<String> retainedKeys = new java.util.HashSet<>();
+        for (Iterator<String> keys = saved.keys(); keys.hasNext();) retainedKeys.add(keys.next());
+        cleanMessageCache.keySet().retainAll(retainedKeys);
+        messageSourceCache.keySet().retainAll(retainedKeys);
         Collections.sort(ordered, (a,b) -> a.optString("createdAt").compareTo(b.optString("createdAt")));
         messagesAppendFrom = cachedMessages.length() <= ordered.size() ? cachedMessages.length() : -1;
         for (int i=0; messagesAppendFrom >= 0 && i<cachedMessages.length(); i++) {
@@ -908,6 +1016,7 @@ final class ChatController {
             TreeSet<String> contacts = new TreeSet<>();
             TreeSet<String> conversations = new TreeSet<>();
             if (engine != null) {
+                snapshot.put("unread", engine.state().optJSONObject("unread") == null ? new JSONObject() : new JSONObject(engine.state().getJSONObject("unread").toString()));
                 snapshot.put("deletedPeers", new JSONObject(engine.state().getJSONObject("deletedPeers").toString()));
                 snapshot.put("identityChanges", new JSONObject(engine.state().getJSONObject("identityChanges").toString()));
                 snapshot.put("peerAccountIds", new JSONObject(engine.state().getJSONObject("peerAccountIds").toString()));

@@ -7,6 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import org.json.JSONArray;
@@ -18,6 +19,7 @@ import org.junit.runner.RunWith;
 @RunWith(AndroidJUnit4.class)
 public class DeviceIntegrationTest {
     private final Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+    private static final AtomicLong nextDraftRevision = new AtomicLong();
 
     @Test public void keystoreRoundTripAndTamperRejection() throws Exception {
         String user = "vault_" + System.nanoTime();
@@ -31,15 +33,22 @@ public class DeviceIntegrationTest {
         StringBuilder hex = new StringBuilder();
         for (byte item : hash) hex.append(String.format(java.util.Locale.ROOT, "%02x", item & 255));
         String digest = hex.toString();
-        File file = new File(context.getNoBackupFilesDir(), "vaults/" + digest + ".vault");
-        byte[] encrypted = Files.readAllBytes(file.toPath());
-        assertFalse(new String(encrypted, StandardCharsets.UTF_8).contains(secret));
-        byte[] original = encrypted.clone();
-        encrypted[encrypted.length - 1] ^= 1;
-        Files.write(file.toPath(), encrypted);
+        File file = new File(context.getNoBackupFilesDir(), "vaults/" + digest + ".db");
+        assertFalse(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8).contains(secret));
+        byte[] original;
+        try (android.database.sqlite.SQLiteDatabase db = android.database.sqlite.SQLiteDatabase.openDatabase(file.getPath(), null, 0)) {
+            try (android.database.Cursor cursor = db.rawQuery("SELECT encrypted FROM state WHERE id=1", null)) {
+                assertTrue(cursor.moveToFirst()); original = cursor.getBlob(0);
+            }
+            byte[] encrypted = original.clone(); encrypted[encrypted.length - 1] ^= 1;
+            db.execSQL("UPDATE state SET encrypted=? WHERE id=1", new Object[]{encrypted});
+        }
         try { vault.read(); fail("Tampered vault accepted"); } catch (Exception expected) { }
-        Files.write(file.toPath(), original);
-        assertEquals(secret, vault.read().getString("secret"));
+        try { vault.write(new JSONObject().put("secret", "replacement")); fail("Corrupt vault overwritten"); } catch (Exception expected) { }
+        try (android.database.sqlite.SQLiteDatabase db = android.database.sqlite.SQLiteDatabase.openDatabase(file.getPath(), null, 0)) {
+            db.execSQL("UPDATE state SET encrypted=? WHERE id=1", new Object[]{original});
+        }
+        assertEquals(secret, new SecureVault(context, "http://127.0.0.1:8083", user).read().getString("secret"));
     }
 
     private static final class Probe implements ChatController.Listener {
@@ -47,7 +56,10 @@ public class DeviceIntegrationTest {
         final AtomicReference<String> error = new AtomicReference<>("");
         @Override public void onState(JSONObject state, String message) { latest.set(state); if (message != null && !message.isEmpty()) error.set(message); }
         @Override public void onSafety(String peer, JSONObject result) { }
-        @Override public void onSent() { }
+        @Override public void onSent(String draftKey, String body, long draftRevision) { }
+        @Override public void onCall(JSONObject frame, long context) { }
+        @Override public void onCallReady(CallSession session, JSONArray iceServers, long context) { }
+        @Override public void onCallContextLost() { }
         JSONObject await(Predicate<JSONObject> predicate) throws Exception {
             long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(40);
             while (System.nanoTime() < end) {
@@ -81,6 +93,10 @@ public class DeviceIntegrationTest {
         return relations != null && !relations.has(peer);
     }
 
+    private static void send(ChatController controller, String peer, String body) {
+        controller.send(peer, body, "device-integration:" + peer, nextDraftRevision.incrementAndGet());
+    }
+
     @Test public void serverAckOfflineAndRecreatedClient() throws Exception {
         String base = InstrumentationRegistry.getArguments().getString("server", "http://127.0.0.1:8083");
         String suffix = Long.toString(System.currentTimeMillis(), 36);
@@ -91,17 +107,17 @@ public class DeviceIntegrationTest {
             ca.login(base, alice, password, true, false);
             cb.login(base, bob, password, true, false);
             a.await(s -> s.optBoolean("online")); b.await(s -> s.optBoolean("online"));
-            ca.send(bob, "Android 真机加密 " + suffix);
+            send(ca, bob, "Android 真机加密 " + suffix);
             b.await(s -> hasMessage(s, "Android 真机加密 " + suffix, "已接收并安全保存"));
             a.await(s -> hasMessage(s, "Android 真机加密 " + suffix, "对方客户端已接收"));
             b.await(s -> hasRelation(s, alice, "pending_incoming"));
             cb.acceptContact(alice);
             b.await(s -> hasRelation(s, alice, "accepted"));
             a.await(s -> hasRelation(s, bob, "accepted"));
-            cb.send(alice, "Android 回复 " + suffix);
+            send(cb, alice, "Android 回复 " + suffix);
             a.await(s -> hasMessage(s, "Android 回复 " + suffix, "已接收并安全保存"));
             cb.logout(); b.await(s -> s.optString("username").isEmpty());
-            ca.send(bob, "Android 离线 " + suffix);
+            send(ca, bob, "Android 离线 " + suffix);
             a.await(s -> hasMessage(s, "Android 离线 " + suffix, "服务器已保存密文"));
             cb.close();
             Probe restored = new Probe();
@@ -109,12 +125,12 @@ public class DeviceIntegrationTest {
             cb.login(base, bob, password, false, false);
             restored.await(s -> hasMessage(s, "Android 离线 " + suffix, "已接收并安全保存"));
             a.await(s -> hasMessage(s, "Android 离线 " + suffix, "对方客户端已接收"));
-            cb.send(alice, "恢复后加密 " + suffix);
+            send(cb, alice, "恢复后加密 " + suffix);
             a.await(s -> hasMessage(s, "恢复后加密 " + suffix, "已接收并安全保存"));
             ca.removeContact(bob);
             a.await(s -> hasNoRelation(s, bob) && hasMessage(s, "恢复后加密 " + suffix, null));
             restored.await(s -> hasNoRelation(s, alice) && hasMessage(s, "恢复后加密 " + suffix, null));
-            cb.send(alice, "重新请求 " + suffix);
+            send(cb, alice, "重新请求 " + suffix);
             restored.await(s -> hasMessage(s, "重新请求 " + suffix, null));
             a.await(s -> hasRelation(s, bob, "pending_incoming")
                     && hasMessage(s, "重新请求 " + suffix, "已接收并安全保存"));

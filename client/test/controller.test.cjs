@@ -119,3 +119,19 @@ test('pending request blocks a second outgoing message before consuming a prekey
     await assert.rejects(controller.send({peer:'小红',body:'回复'}),/先接受/);
   }finally{close();}
 });
+
+test('message revisions change after committed storage mutations, not presence or failed transactions',async()=>{
+  const {controller,close}=fixture();
+  try{
+    const initial=controller.snapshot();
+    controller.contactState['小红'].online=false;
+    const presence=controller.snapshot();
+    assert.equal(presence.messageRevision,initial.messageRevision);
+    assert.ok(presence.snapshotRevision>initial.snapshotRevision);
+    await controller.transaction(()=>{controller.engine.state.messages['小明:1'].status='对方客户端已接收';});
+    const committed=controller.snapshot();assert.ok(committed.messageRevision>initial.messageRevision);
+    await assert.rejects(controller.transaction(()=>{controller.engine.state.messages['小明:1'].body='不应保留';throw Error('rollback');}),/rollback/);
+    const after=controller.snapshot();assert.equal(after.messageRevision,committed.messageRevision);
+    assert.equal(after.messages[0].body,'历史正文');
+  }finally{close();}
+});

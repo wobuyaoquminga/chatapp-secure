@@ -44,6 +44,10 @@ public final class SignalEngine {
         }
         if (data.optJSONArray("pendingUpload") == null)
             put(data, "pendingUpload", new JSONArray());
+        try {
+            if (!(data.getJSONObject("messages") instanceof HistoryRecords))
+                put(data, "messages", new HistoryRecords(data.getJSONObject("messages")));
+        } catch (Exception error) { throw new IllegalArgumentException("历史记录格式错误", error); }
         store = new SignalStore(data);
     }
 

@@ -9,6 +9,23 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ContactMigrationTest {
+    @Test void contactLookupPreservesStatusWithEitherStoredOrder() {
+        String url = "jdbc:h2:mem:contact-lookup-" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1";
+        Flyway.configure().dataSource(url, "sa", "").load().migrate();
+        var db = new JdbcTemplate(new DriverManagerDataSource(url, "sa", ""));
+        db.update("INSERT INTO app_users(username,password_hash,account_id) VALUES "
+            + "('alice','hash',?),('bob','hash',?),('carol','hash',?)",
+            UUID.randomUUID().toString(), UUID.randomUUID().toString(), UUID.randomUUID().toString());
+        db.update("INSERT INTO contacts(user_a,user_b,initiator) VALUES ('bob','alice','bob')");
+        db.update("INSERT INTO contacts(user_a,user_b,initiator,accepted) VALUES ('alice','carol','carol',TRUE)");
+
+        var store = new MessageStore(db);
+        assertThat(store.contact("alice", "bob").status()).isEqualTo("pending_incoming");
+        assertThat(store.contact("bob", "alice").status()).isEqualTo("pending_outgoing");
+        assertThat(store.contact("carol", "alice").status()).isEqualTo("accepted");
+        assertThat(store.contact("bob", "carol")).isNull();
+    }
+
     @Test void existingMessagesBecomeAcceptedContacts() {
         String url = "jdbc:h2:mem:upgrade-" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1";
         Flyway.configure().dataSource(url, "sa", "").target(MigrationVersion.fromVersion("2")).load().migrate();

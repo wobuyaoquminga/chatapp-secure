@@ -163,6 +163,24 @@ test('multi-homed ICE burst is paced below the server call-signal budget and nev
   assert.equal(timers.pending(),0,'closing the call stops the pacer');
 });
 
+test('ICE queue overflow ends the call with an explicit error, never silently discards candidates',async()=>{
+ const timers=fakeTimers(),f=uiFixture({timers});
+ await f.element('startAudioCall').onclick();
+ for(let i=0;i<140;i++)f.pcs[0].onicecandidate({candidate:{toJSON:()=>({candidate:'burst-'+i})}});
+ assert.equal(f.element('callPanel').hidden,true);assert.match(f.notices.at(-1),/队列已满/);assert.equal(timers.pending(),0);
+});
+
+test('remote ICE deduplication stays bounded and overflow cannot repeatedly add untracked candidates',async()=>{
+ const f=uiFixture({timers:fakeTimers()});await f.element('startAudioCall').onclick();
+ const callId=f.sent.find(frame=>frame.action==='offer').callId;
+ await f.calls.onEvent({type:'call',event:{from:'bob',callId,mode:'audio',action:'answer',payload:JSON.stringify({type:'answer',sdp:'remote'})}});
+ for(let i=0;i<512;i++)await f.calls.onEvent({type:'call',event:{from:'bob',callId,mode:'audio',action:'ice',payload:JSON.stringify({candidate:'remote-'+i})}});
+ assert.equal(f.pcs[0].added.length,512);
+ const overflow={type:'call',event:{from:'bob',callId,mode:'audio',action:'ice',payload:JSON.stringify({candidate:'over-limit'})}};
+ await f.calls.onEvent(overflow);await f.calls.onEvent(overflow);
+ assert.equal(f.pcs[0].added.length,512);assert.equal(f.element('callPanel').hidden,true);assert.match(f.notices.at(-1),/候选过多/);
+});
+
 test('a call that never connects explains the network instead of reporting a normal end',async()=>{
   const never=uiFixture();
   await never.element('startAudioCall').onclick();

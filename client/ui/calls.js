@@ -57,7 +57,8 @@
       signal(item,'ice',next).catch(error=>close(error.message));
     }
     function queueIce(item,payload) {
-      if(!same(item)||item.outIce.length>=128)return;
+      if(!same(item))return;
+      if(item.outIce.length>=128){close('通话候选队列已满，请重新拨打','hangup');return;}
       item.outIce.push(payload);
       // The first candidate leaves immediately so a direct path is not delayed by the pacing gap.
       if(!item.paceTimer){pumpIce(item);item.paceTimer=setInterval(()=>pumpIce(item),ICE_SIGNAL_MS);}
@@ -77,7 +78,7 @@
     async function setup(item) {
       const servers=await iceServers();if(!same(item))return;
       const pc=new RTCPeerConnection({iceServers:servers});item.pc=pc;
-      pc.onicecandidate=event=>{if(!event.candidate||!same(item))return;const payload=JSON.stringify(event.candidate.toJSON());if(!item.descriptionSent)item.pendingIce.push(payload);else queueIce(item,payload);};
+      pc.onicecandidate=event=>{if(!event.candidate||!same(item))return;const payload=JSON.stringify(event.candidate.toJSON());if(!item.descriptionSent){if(item.pendingIce.length>=256){close('通话候选队列已满，请重新拨打','hangup');return;}item.pendingIce.push(payload);}else queueIce(item,payload);};
       // Unified Plan emits separate audio/video events, sometimes without a stream.
       // Keep both tracks: a later audio event must never replace the video stream.
       item.remoteStream=new MediaStream();
@@ -169,8 +170,9 @@
           if(typeof event.payload!=='string')return;
           item.remoteIce ||= new Set();
           if(item.remoteIce.has(event.payload))return;
-          const candidate=JSON.parse(event.payload);if(item.remoteIce.size<512)item.remoteIce.add(event.payload);
-          if(item.pc?.remoteDescription)await item.pc.addIceCandidate(candidate);else if(item.ice.length<256)item.ice.push(candidate);
+          if(item.remoteIce.size>=512){close('对方通话候选过多，请重新拨打','hangup');return;}
+          const candidate=JSON.parse(event.payload);item.remoteIce.add(event.payload);
+          if(item.pc?.remoteDescription)await item.pc.addIceCandidate(candidate);else{if(item.ice.length>=256){close('对方通话候选队列已满，请重新拨打','hangup');return;}item.ice.push(candidate);}
         }else if(event.action==='answer'&&item.direction==='outgoing'&&typeof event.payload==='string'&&item.pc&&!item.answerReceived){
           item.answerReceived=true;
           await item.pc.setRemoteDescription(JSON.parse(event.payload));await flushIce(item);

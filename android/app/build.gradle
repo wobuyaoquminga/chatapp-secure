@@ -7,8 +7,8 @@ android {
         applicationId 'com.example.chatandroid'
         minSdk 26
         targetSdk 35
-        versionCode 13
-        versionName '0.4.7'
+        versionCode 15
+        versionName '0.4.9'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildFeatures { buildConfig true }
@@ -48,7 +48,7 @@ android {
         jniLibs.excludes += ['**/libsignal_jni_testing.so']
     }
     testOptions { unitTests.all {
-        systemProperty 'chat.root', System.getenv('CHAT_ROOT') ?: rootProject.projectDir.parentFile.absolutePath
+        systemProperty 'chat.root', System.getenv('CHAT_ROOT') ?: rootProject.projectDir.toPath().toRealPath().parent.toFile().absolutePath
         systemProperty 'java.io.tmpdir', System.getenv('CHAT_TMP') ?: System.getProperty('java.io.tmpdir')
     } }
 }

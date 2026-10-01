@@ -31,7 +31,7 @@
         <li><strong>首次聊天需要对方同意。</strong>接受前只能发送一条消息，接受后才能继续聊天。</li>
       </ul>
     </section>
-    <div class="actions"><button id="login" type="submit">登录</button><button id="register" type="button" class="secondary">注册并初始化密钥</button></div></form>
+    <div class="actions"><button id="login" type="submit">登录</button><button id="register" type="button" class="secondary">注册账号</button></div></form>
     <p class="fineprint">密码不会保存在此设备。私钥与聊天记录由 Windows 安全存储保护；丢失本机密钥后，无法仅用密码恢复历史正文。</p>
   </section>
   <section id="chat" class="chatShell" hidden>
@@ -45,7 +45,7 @@
     <div class="conversation">
       <div id="emptyConversation" class="emptyConversation"><div class="emptySymbol">✦</div><h2>选择一位联系人</h2><p>开始一段端到端加密对话</p></div>
       <div id="conversationContent" class="conversationContent" hidden>
-        <div class="conversationHeader"><div><h2 id="conversationName"></h2><span id="conversationStatus"></span><span id="verification">尚未核对安全码</span></div><div class="headerActions"><button id="acceptContact" type="button" class="secondary" hidden>接受聊天</button><button id="clearConversation" type="button" class="textButton">清除会话</button><button id="removeContact" type="button" class="textButton" hidden>删除联系人</button><button id="history" type="button" class="textButton">同步回执</button><button id="safety" type="button" class="textButton">核对安全码</button><div class="moreWrap"><button id="more" type="button" class="iconButton" aria-label="聊天菜单" aria-expanded="false">···</button><div id="moreMenu" class="moreMenu" hidden><button id="findHistory" type="button">查找聊天记录</button></div></div></div></div>
+        <div class="conversationHeader"><div class="conversationIdentity"><h2 id="conversationName"></h2><div class="conversationDetails"><span id="conversationStatus"></span><span id="verification">尚未核对安全码</span></div></div><div class="headerActions"><button id="acceptContact" type="button" class="secondary" hidden>接受聊天</button><div class="moreWrap"><button id="more" type="button" class="iconButton" aria-label="聊天菜单" aria-expanded="false" aria-controls="moreMenu">···</button><div id="moreMenu" class="moreMenu" hidden><button id="findHistory" type="button">查找聊天记录</button><button id="history" type="button">同步回执</button><button id="safety" type="button">核对安全码</button><div class="menuDivider" role="separator"></div><button id="clearConversation" type="button">清除会话</button><button id="removeContact" type="button" hidden>删除联系人</button></div></div></div></div>
         <div id="safetyPanel" hidden><p>请通过见面或已信任的通话渠道比较双方的完整数字：</p><code id="safetyCode"></code><button id="confirmSafety" type="button" class="secondary">已通过可信渠道核对一致</button></div>
         <section id="locationPanel" class="featurePanel" hidden><div class="panelHeading"><strong>位置</strong><button id="closeLocation" type="button" class="textButton">关闭</button></div><p>系统定位可能为近似位置；Windows 设备可能没有可用定位服务。坐标只在点击发送后端到端加密发送。</p><div class="actions"><button id="sendPosition" type="button">发送当前位置</button><button id="startLive" type="button" class="secondary">共享实时位置（1 小时）</button><button id="stopLive" type="button" class="secondary" hidden>停止共享</button></div><p id="locationStatus" role="status"></p><details><summary>定位不可用？手动输入坐标发送</summary><p>手动坐标是你选择的固定位置，不代表设备当前位置，不能用于实时共享。</p><form id="manualPosition"><label>纬度<input id="latitude" type="number" min="-90" max="90" step="any" required></label><label>经度<input id="longitude" type="number" min="-180" max="180" step="any" required></label><button type="submit">发送选定坐标</button></form></details></section>
         <section id="searchPanel" class="featurePanel" hidden><div class="panelHeading"><strong>查找聊天记录</strong><button id="closeSearch" type="button" class="textButton">关闭</button></div><div class="historyFilters"><input id="historyQuery" type="search" placeholder="搜索当前聊天正文"><label>开始日期<input id="historyFrom" type="date"></label><label>结束日期<input id="historyTo" type="date"></label></div><p id="historyCount"></p><ul id="historyResults"></ul><div class="actions"><button id="historyPrev" type="button" class="secondary">上一页</button><button id="historyNext" type="button" class="secondary">下一页</button></div><p class="fineprint">仅搜索当前账号本机已保存的历史；同步回执不会恢复丢失的正文。</p></section>
@@ -74,7 +74,7 @@
         <li>首次向某人发起聊天时，只能先发一条消息；等对方接受后，才能继续发送。</li>
         <li>删除联系人会撤销对方继续向你发消息的权限，已有聊天记录仍保留；“清除会话”只把它从会话列表隐藏。</li>
         <li>“在线”表示你已成功连上服务器。对方不在线时，服务器暂存加密消息，等对方连接后再送达。“服务器已保存密文”不代表对方收到；“对方客户端已接收”也不代表已读。</li>
-        <li>聊天发送按钮右侧“＋”可发起通话、发送位置或实时共享位置；右上角“···”可查找本机聊天记录。实时位置最多共享一小时，应用离开前台、断线或退出时停止。定位失败可手动发送固定坐标。</li>
+        <li>聊天按 Enter 发送，Shift+Enter 换行；输入中文选词时不会误发。发送按钮右侧“＋”可发起通话、发送位置或实时共享位置；右上角“···”可查找本机聊天记录、核对安全码和管理联系人。实时位置最多共享一小时，应用离开前台、断线或退出时停止。定位失败可手动发送固定坐标。</li>
         <li>聊天前可通过见面或可信通话，和对方比较完整的安全码；一致后点击“已通过可信渠道核对一致”。</li>
         <li>账号连续 7 天未成功连接服务器，服务器会删除该账号及服务器上的密钥、加密消息，无法从服务器恢复。打开应用或输入密码但连接失败不算成功；请至少每周登录，并确认客户端显示“在线”。本机历史记录可能仍在。</li>
       </ul>

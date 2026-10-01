@@ -90,6 +90,7 @@ certdir="/etc/letsencrypt/live/$certname"
 [[ -s $certdir/fullchain.pem && -s $certdir/privkey.pem ]]
 cat > "$work/https" <<EOF
 $marker
+limit_req_zone \$binary_remote_addr zone=chat_ip_auth:10m rate=5r/s;
 server {
     listen 80;
     server_name $ip;
@@ -106,6 +107,19 @@ server {
     ssl_certificate $certdir/fullchain.pem;
     ssl_certificate_key $certdir/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 512k;
+    add_header Strict-Transport-Security "max-age=86400" always;
+    location ^~ /api/auth/ {
+        client_max_body_size 8k;
+        limit_req zone=chat_ip_auth burst=30 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8082;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
     location / {
         proxy_pass http://127.0.0.1:8082;
         proxy_http_version 1.1;
