@@ -62,7 +62,7 @@ SHA256.txt：上述安装包与源码包的 SHA-256。
 数据库自动执行 V8–V10 迁移；回滚旧服务器必须同时恢复升级前的静止数据库和 JAR。
 客户端本地加密存储会迁移，迁移后不能直接降级。Windows 不要拆分 vault 与 history；安卓不要还原旧 migrated 文件。
 已送达服务器密文从首次 ACK 满七天后删除，本机历史保留；未送达消息仍按账号规则保留。
-各平台测试覆盖与未验证功能见测试报告.md。发布信息见 GitHub Releases。
+各平台测试覆盖与未验证的功能见测试报告.md。下载与更新信息见 GitHub 对应版本发布页。
 本项目为开发原型。文字和位置使用 libsignal；通话媒体用 WebRTC DTLS-SRTP，信令尚未绑定 Signal 安全码。
 "@
 [IO.File]::WriteAllText((Join-Path $release '成品说明.txt'),$guide,[Text.UTF8Encoding]::new($false))

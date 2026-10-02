@@ -7,10 +7,10 @@ email=''
 while (( $# )); do
   case "$1" in
     --email|--ip) [[ $# -ge 2 ]] || { echo '参数缺少值' >&2; exit 1; }; key=$1; value=$2; shift 2; if [[ $key == --email ]]; then email=$value; else ip=$value; fi ;;
-    *) echo '用法: sudo bash enable-ip-https.sh --email you@example.com [--ip 203.0.113.10]' >&2; exit 1 ;;
+    *) echo '用法: sudo bash enable-ip-https.sh --email you@example.com --ip 服务器公网IPv4' >&2; exit 1 ;;
   esac
 done
-[[ -n $ip ]] || { echo 'Provide --ip PUBLIC_IP explicitly.' >&2; exit 1; }
+[[ -n $ip ]] || { echo '必须明确提供 --ip 服务器公网IPv4。' >&2; exit 1; }
 [[ $EUID == 0 ]] || { echo '请使用 sudo 执行。' >&2; exit 1; }
 [[ $email =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { echo '必须提供有效的 --email。' >&2; exit 1; }
 source /etc/os-release

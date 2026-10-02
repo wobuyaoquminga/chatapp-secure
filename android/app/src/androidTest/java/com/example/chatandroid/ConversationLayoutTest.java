@@ -4,7 +4,6 @@ import static org.junit.Assert.*;
 import static org.junit.Assume.assumeTrue;
 
 import android.app.Instrumentation;
-import android.content.Intent;
 import android.graphics.Insets;
 import android.os.Build;
 import android.view.View;
@@ -28,17 +27,15 @@ public class ConversationLayoutTest {
     private MainActivity activity;
 
     @Before public void launch() throws Exception {
-        Intent intent = new Intent(instrumentation.getTargetContext(), MainActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity = (MainActivity) instrumentation.startActivitySync(intent);
-        instrumentation.runOnMainSync(() -> ((ChatController) field("controller")).close());
+        activity = QaActivityLauncher.launch(instrumentation);
+        QaActivityLauncher.settleInitialState(instrumentation, activity);
         publish(snapshot(240));
         instrumentation.runOnMainSync(() -> {
             try {
-                setField("detailPeer", "peer");
-                java.lang.reflect.Method render = MainActivity.class.getDeclaredMethod("render");
-                render.setAccessible(true);
-                render.invoke(activity);
+                // Use the real navigation path so the history window starts at the latest page.
+                java.lang.reflect.Method open = MainActivity.class.getDeclaredMethod("openPeer", String.class);
+                open.setAccessible(true);
+                open.invoke(activity, "peer");
             } catch (Exception failure) { throw new AssertionError(failure); }
         });
         instrumentation.waitForIdleSync();

@@ -31,3 +31,8 @@ android/**/build/
 android/TEST-*.xml
 android/phone-login.png
 deploy/ubuntu/chat-server.jar
+# Private development evidence belongs outside the public repository.
+docs/verification/
+**/credentials.json
+**/logcat*.txt
+**/logcat*.log

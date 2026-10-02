@@ -3,7 +3,7 @@ package com.example.chatandroid;
 import static org.junit.Assert.*;
 import android.app.AlertDialog;
 import android.app.Instrumentation;
-import android.content.Intent;
+import android.os.SystemClock;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
@@ -29,11 +29,10 @@ public class ChatMenuHistoryTest {
     private final Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
     private MainActivity activity;
     @Before public void launch() throws Exception {
-        activity = (MainActivity) instrumentation.startActivitySync(new Intent(instrumentation.getTargetContext(), MainActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-        instrumentation.runOnMainSync(() -> ((ChatController) field("controller")).close());
+        activity = QaActivityLauncher.launch(instrumentation);
+        QaActivityLauncher.settleInitialState(instrumentation, activity);
         publish(snapshot());
-        instrumentation.runOnMainSync(() -> { set("detailPeer", "peer"); invoke("render"); });
+        instrumentation.runOnMainSync(() -> invoke("openPeer", new Class<?>[]{String.class}, "peer"));
         instrumentation.waitForIdleSync();
     }
     @After public void finish() { if (activity != null) instrumentation.runOnMainSync(activity::finish); }
@@ -74,13 +73,38 @@ public class ChatMenuHistoryTest {
                 .put("body", LocationPayload.encode("live", session, 0, 30.0, 120.0, 20, now-2000, now-1000))
                 .put("createdAt", java.time.Instant.ofEpochMilli(now-2000).toString()));
         publish(state);
+        // Real navigation selects the latest history window even if the old scroll position was above it.
+        instrumentation.runOnMainSync(() -> invoke("openPeer", new Class<?>[]{String.class}, "peer"));
+        instrumentation.waitForIdleSync();
+        View card = awaitLatestLocationCard();
         EditText composer = (EditText) field("composer");
         LinearLayout stream = (LinearLayout) field("conversationStream");
-        View card = stream.getChildAt(stream.getChildCount()-1);
         instrumentation.runOnMainSync(() -> invoke("refreshLocationCards"));
         assertSame(composer, field("composer"));
         assertSame(card, stream.getChildAt(stream.getChildCount()-1));
-        assertTrue(contains(card, "实时位置 · 已过期"));
+        assertTrue("location card did not show expiry", contains(card, "实时位置 · 已过期"));
+    }
+    private View awaitLatestLocationCard() throws Exception {
+        long deadline = SystemClock.elapsedRealtime() + 5000;
+        do {
+            View[] found = new View[1];
+            instrumentation.runOnMainSync(() -> {
+                LinearLayout stream = (LinearLayout) field("conversationStream");
+                if (stream == null || stream.getChildCount() == 0) return;
+                View last = stream.getChildAt(stream.getChildCount()-1);
+                if (hasLocationLabel(last)) found[0] = last;
+            });
+            if (found[0] != null) return found[0];
+            if (SystemClock.elapsedRealtime() >= deadline) break;
+            Thread.sleep(50);
+        } while (true);
+        throw new AssertionError("Latest history page did not render the location card");
+    }
+    private boolean hasLocationLabel(View view) {
+        if (view instanceof TextView && view.getTag() instanceof MessageIndex.LocationCard) return true;
+        if (view instanceof ViewGroup) for (int i=0; i<((ViewGroup)view).getChildCount(); i++)
+            if (hasLocationLabel(((ViewGroup)view).getChildAt(i))) return true;
+        return false;
     }
     private JSONObject snapshot() throws Exception {
         JSONArray messages = new JSONArray();
@@ -108,10 +132,6 @@ public class ChatMenuHistoryTest {
     private Object field(String name) {
         try { Field field = MainActivity.class.getDeclaredField(name); field.setAccessible(true); return field.get(activity); }
         catch (Exception failure) { throw new AssertionError(failure); }
-    }
-    private void set(String name, Object value) {
-        try { Field field=MainActivity.class.getDeclaredField(name); field.setAccessible(true); field.set(activity,value); }
-        catch(Exception failure) { throw new AssertionError(failure); }
     }
     private void invoke(String name) { invoke(name,new Class<?>[0]); }
     private void invoke(String name, Class<?>[] types, Object... args) {

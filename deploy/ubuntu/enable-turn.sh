@@ -12,7 +12,7 @@ if [[ $# -eq 2 && $1 == --public-ip ]]; then
   public_ip=$2
 fi
 if [[ ! $public_ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-  echo '用法: sudo bash enable-turn.sh --public-ip 203.0.113.10' >&2
+  echo '用法: sudo bash enable-turn.sh --public-ip 服务器公网IPv4' >&2
   exit 1
 fi
 IFS=. read -r a b c d <<<"$public_ip"

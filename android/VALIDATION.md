@@ -1,9 +1,15 @@
-# 历史版本公开说明
+# Android 验证范围
 
-本提交保留对应版本的产品源码。内部设备操作记录、个人部署信息及原始验证材料不属于公开产品文档，已从发布历史移除。
+当前源码的 Android 版本为 0.4.9（versionCode 15）。本页记录可公开复核的验证结论；完整的跨平台范围见[项目验证说明](../VALIDATION.md)。测试计数来自本地验证记录，不代表 GitHub Actions 的实时结果。
 
-Chat 是可自行部署的一对一通讯项目。历史版本的具体功能、依赖与行为以本提交源码和版本配置为准；不要以最新版介绍推断旧版能力。
+## 已验证
 
-[当前产品介绍](https://github.com/wobuyaoquminga/chatapp-secure#readme) · [公开部署指南](https://github.com/wobuyaoquminga/chatapp-secure/tree/main/deploy/ubuntu) · [当前验证范围](https://github.com/wobuyaoquminga/chatapp-secure/blob/main/VALIDATION.md)
+- `testDebugUnitTest` 本地 58 项通过；`assembleDebug`、`assembleQa`、`assembleDebugAndroidTest` 和 `lintDebug` 构建检查通过。JVM 测试和设备测试 APK 编译本身不能证明设备行为。
+- 独立 QA 包在 Android 17 设备上完成 14 项自动设备检查。自动检查覆盖加密存储、消息与 ACK、会话和菜单界面，以及合成 IME inset 布局。另行操作检查确认实际软键盘避让、双向消息及本地摄像头预览。测试使用独立包名、隔离服务器和测试账号。
 
-项目业务源码采用 AGPL-3.0-only，第三方许可见仓库 LICENSE、NOTICE 与 vendor。
+## 尚未验证
+
+- Android 全屏视频预览和最小化通话小窗的拖动未通过最终实机验收；远端音视频媒体链路也未通过本轮设备验收。
+- 尚未完成多机型、省电策略、长时间运行、跨运营商网络及公网 TURN 的系统性验证。通话来电依赖应用在线连接，没有系统停止进程后的离线推送保证。
+
+Android 应用的私钥和聊天历史只在本地保存。更新时应使用同签名 APK 覆盖安装；卸载或清除应用数据可能导致本地历史及身份材料无法恢复。

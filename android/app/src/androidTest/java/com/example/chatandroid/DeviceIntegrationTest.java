@@ -1,7 +1,11 @@
 package com.example.chatandroid;
 
 import static org.junit.Assert.*;
+import android.app.Instrumentation;
 import android.content.Context;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.WindowManager;
 import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import java.io.File;
@@ -18,6 +22,7 @@ import org.junit.runner.RunWith;
 /** Runs on Android, including the real hardware-backed/system Keystore provider and WebSocket. */
 @RunWith(AndroidJUnit4.class)
 public class DeviceIntegrationTest {
+    private static final String TAG = "DeviceIntegrationTest";
     private final Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
     private static final AtomicLong nextDraftRevision = new AtomicLong();
 
@@ -52,23 +57,49 @@ public class DeviceIntegrationTest {
     }
 
     private static final class Probe implements ChatController.Listener {
+        final String name;
         final AtomicReference<JSONObject> latest = new AtomicReference<>();
         final AtomicReference<String> error = new AtomicReference<>("");
-        @Override public void onState(JSONObject state, String message) { latest.set(state); if (message != null && !message.isEmpty()) error.set(message); }
+        final AtomicReference<String> sent = new AtomicReference<>("");
+        Probe(String name) { this.name = name; }
+        @Override public void onState(JSONObject state, String failure) {
+            latest.set(state);
+            if (failure != null && !failure.isEmpty()) error.set(failure);
+            JSONArray messages = state.optJSONArray("messages");
+            Log.i(TAG, name + " online=" + state.optBoolean("online")
+                    + " status=" + state.optString("status")
+                    + " messages=" + (messages == null ? 0 : messages.length())
+                    + (failure == null || failure.isEmpty() ? "" : " error=" + failure));
+        }
         @Override public void onSafety(String peer, JSONObject result) { }
-        @Override public void onSent(String draftKey, String body, long draftRevision) { }
+        @Override public void onSent(String draftKey, String body, long draftRevision) {
+            sent.set(body);
+            Log.i(TAG, name + " locally sent: " + body);
+        }
         @Override public void onCall(JSONObject frame, long context) { }
         @Override public void onCallReady(CallSession session, JSONArray iceServers, long context) { }
         @Override public void onCallContextLost() { }
         JSONObject await(Predicate<JSONObject> predicate) throws Exception {
-            long end = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(40);
-            while (System.nanoTime() < end) {
-                if (!error.get().isEmpty()) throw new AssertionError(error.get());
+            long end = SystemClock.elapsedRealtime() + 40_000;
+            while (SystemClock.elapsedRealtime() < end) {
+                checkError();
                 JSONObject value = latest.get();
                 if (value != null && predicate.test(value)) return value;
                 Thread.sleep(100);
             }
-            throw new AssertionError("Timed out: " + latest.get());
+            throw new AssertionError(name + " timed out: " + latest.get());
+        }
+        void awaitSent(String body) throws Exception {
+            long end = SystemClock.elapsedRealtime() + 40_000;
+            while (SystemClock.elapsedRealtime() < end) {
+                checkError();
+                if (body.equals(sent.get())) return;
+                Thread.sleep(100);
+            }
+            throw new AssertionError(name + " did not finish local send: " + body + "; snapshot=" + latest.get());
+        }
+        private void checkError() {
+            if (!error.get().isEmpty()) throw new AssertionError(name + ": " + error.get());
         }
     }
 
@@ -101,9 +132,15 @@ public class DeviceIntegrationTest {
         String base = InstrumentationRegistry.getArguments().getString("server", "http://127.0.0.1:8083");
         String suffix = Long.toString(System.currentTimeMillis(), 36);
         String alice = "手机甲_" + suffix, bob = "手机乙_" + suffix, password = "device-test-123";
-        Probe a = new Probe(), b = new Probe();
+        // Keep the instrumented QA process visible on devices that freeze background apps.
+        Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
+        MainActivity foregroundActivity = QaActivityLauncher.launch(instrumentation);
+        instrumentation.runOnMainSync(() -> foregroundActivity.getWindow()
+                .addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
+        Probe a = new Probe("alice"), b = new Probe("bob");
         ChatController ca = new ChatController(context, a), cb = new ChatController(context, b);
         try {
+            Log.i(TAG, "registering isolated accounts on " + base);
             ca.login(base, alice, password, true, false);
             cb.login(base, bob, password, true, false);
             a.await(s -> s.optBoolean("online")); b.await(s -> s.optBoolean("online"));
@@ -120,12 +157,18 @@ public class DeviceIntegrationTest {
             send(ca, bob, "Android 离线 " + suffix);
             a.await(s -> hasMessage(s, "Android 离线 " + suffix, "服务器已保存密文"));
             cb.close();
-            Probe restored = new Probe();
+            Log.i(TAG, "recreating offline client's controller");
+            Probe restored = new Probe("bob-restored");
             cb = new ChatController(context, restored);
             cb.login(base, bob, password, false, false);
-            restored.await(s -> hasMessage(s, "Android 离线 " + suffix, "已接收并安全保存"));
+            restored.await(s -> s.optBoolean("online")
+                    && hasRelation(s, alice, "accepted")
+                    && hasMessage(s, "Android 离线 " + suffix, "已接收并安全保存"));
             a.await(s -> hasMessage(s, "Android 离线 " + suffix, "对方客户端已接收"));
+            a.await(s -> s.optBoolean("online") && hasRelation(s, bob, "accepted"));
+            Log.i(TAG, "both clients online after restore; sending encrypted reply");
             send(cb, alice, "恢复后加密 " + suffix);
+            restored.awaitSent("恢复后加密 " + suffix);
             a.await(s -> hasMessage(s, "恢复后加密 " + suffix, "已接收并安全保存"));
             ca.removeContact(bob);
             a.await(s -> hasNoRelation(s, bob) && hasMessage(s, "恢复后加密 " + suffix, null));
@@ -138,6 +181,9 @@ public class DeviceIntegrationTest {
             ca.acceptContact(bob);
             a.await(s -> hasRelation(s, bob, "accepted"));
             restored.await(s -> hasRelation(s, alice, "accepted"));
-        } finally { ca.close(); cb.close(); }
+        } finally {
+            ca.close(); cb.close();
+            instrumentation.runOnMainSync(foregroundActivity::finish);
+        }
     }
 }

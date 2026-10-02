@@ -1,9 +1,19 @@
-# 历史版本公开说明
+# 验证范围
 
-本提交保留对应版本的产品源码。内部设备操作记录、个人部署信息及原始验证材料不属于公开产品文档，已从发布历史移除。
+本页说明当前源码对应的验证范围，供试用、部署和贡献者判断哪些行为已有检查依据。当前版本为 Windows 0.5.8、Android 0.4.9（versionCode 15）、服务器 0.2.3；发布包若与源码版本不同，应以相应发布说明和实际构件为准。以下计数来自本地验证记录，不是 GitHub Actions 的实时状态，也不代表独立安全审计。
 
-Chat 是可自行部署的一对一通讯项目。历史版本的具体功能、依赖与行为以本提交源码和版本配置为准；不要以最新版介绍推断旧版能力。
+## 已验证
 
-[当前产品介绍](https://github.com/wobuyaoquminga/chatapp-secure#readme) · [公开部署指南](https://github.com/wobuyaoquminga/chatapp-secure/tree/main/deploy/ubuntu) · [当前验证范围](https://github.com/wobuyaoquminga/chatapp-secure/blob/main/VALIDATION.md)
+- 服务器：本地 `mvn verify` 共 70 项通过，覆盖账号、消息与 ACK、密钥消费、离线队列、限流、续期凭据和数据库迁移等。测试使用隔离数据。
+- Windows：本地 `npm test` 共 84 项通过；真实 Electron 窗口界面检查 12 项通过。两个客户端连接隔离服务器的 7 组网络流程，以及打包 EXE 的 4 组流程通过，覆盖首次联系、双向加密消息、ACK、断线恢复、登录续期和本地历史恢复。界面检查使用测试账号与合成数据。
+- Android：本地 `testDebugUnitTest` 共 58 项通过，`assembleDebug`、`assembleQa`、`assembleDebugAndroidTest` 和 `lintDebug` 构建检查通过。独立 QA 包在 Android 17 设备上完成 14 项自动设备检查，覆盖加密存储、消息与 ACK、会话和菜单行为，以及合成 IME inset 布局检查。另行操作检查确认实际键盘避让、双向消息及本地摄像头预览。QA 包与测试账号均用于隔离验证。
+- Ubuntu 部署脚本通过 Bash 语法检查；Nginx 配置模板在测试证书环境中通过配置检查。此项仅验证脚本语法与配置，不代表目标服务器已部署。
 
-项目业务源码采用 AGPL-3.0-only，第三方许可见仓库 LICENSE、NOTICE 与 vendor。
+## 尚未验证及安全边界
+
+- Android 全屏视频预览和通话小窗拖动未通过最终实机验收；远端音视频媒体链路也未通过本轮设备验收。不要将本地预览或自动设备检查解释为跨网络通话已可用。
+- 尚无独立安全审计、PostgreSQL 实例验收、多机型或长时间负载测试，也未在本轮验证生产云服务器上的 HTTPS、TURN、升级失败回滚与证书续期。
+- 文字和位置消息使用 libsignal；服务器仍能看到账号、路由、时间和回执等元数据。音视频媒体使用 WebRTC DTLS-SRTP，但通话信令尚未绑定 Signal 安全码。
+- 客户端历史和私钥保存在本地；卸载 Android 应用或清除应用数据可能导致历史与身份材料无法恢复。升级前应阅读 [服务器升级说明](deploy/ubuntu/UPGRADE.md)；服务器数据库备份不能恢复客户端私钥。
+
+本页只陈述上述检查范围。若需核对某次提交的自动化结果，请查看该提交对应的 GitHub Actions 记录。
