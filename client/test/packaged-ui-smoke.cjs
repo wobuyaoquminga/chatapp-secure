@@ -8,6 +8,7 @@ const out=path.resolve(process.env.CHAT_PACKAGED_QA_DIR||path.join(require('node
 const delay=ms=>new Promise(r=>setTimeout(r,ms));let a,b;const checks=[];
 async function launch(port,label){
  const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
+ env.APPDATA=path.join(out,'appdata-'+label);fs.mkdirSync(env.APPDATA,{recursive:true});
  const child=spawn(exe,['--profile=qa-audit-'+label+'-'+Date.now().toString(36),'--test-hidden','--remote-debugging-address=127.0.0.1','--remote-debugging-port='+port],{env,windowsHide:true,stdio:'ignore'});
  let target;for(let i=0;i<200;i++){try{target=(await(await fetch('http://127.0.0.1:'+port+'/json')).json()).find(t=>t.type==='page'&&t.url.includes('index.html'));if(target)break;}catch{}await delay(50);}
  if(!target){child.kill();throw Error('EXE renderer debugger unavailable');}
@@ -30,6 +31,12 @@ async function sendUI(client,text){await client.evaluate(`{document.getElementBy
  a=await launch(18102,'a');b=await launch(18103,'b');
  await check('成品EXE使用实际main/preload与新版服务器登录',async()=>{
   for(const [c,username]of [[a,alice],[b,bob]]){await c.until('!!window.chat&&typeof render==="function"','preload ready');await c.command('login',{server,username,password,register:true});await c.until('state.online','online');assert.equal(await c.evaluate('state.messages===undefined'),true,'login reply uses delta');}
+  await a.until('!!state.accountStatus&&!!state.accountStatus.accountExpiresAt','account deadline');
+  assert.match(await a.evaluate("document.getElementById('accountDeadline').textContent"),/账号期限/);
+  assert.match(await a.evaluate("document.getElementById('appVersion').textContent"),/0\.6\.1/);
+  assert.equal(await a.evaluate('typeof window.chat.openUpdates'),'function');
+  assert.equal(await a.evaluate('typeof window.chat.checkUpdate'),'function');
+  assert.equal(await a.evaluate('typeof window.chat.downloadUpdate'),'function');
  });
  await check('真实界面增量收发、未读与接受聊天审批',async()=>{
   await a.command('addContact',{peer:bob});await a.evaluate(`openPeer(${JSON.stringify(bob)})`);await sendUI(a,'成品首条加密消息');
@@ -38,7 +45,7 @@ async function sendUI(client,text){await client.evaluate(`{document.getElementBy
   await b.command('acceptContact',{peer:alice});await a.until(`state.contactStates.some(c=>c.username===${JSON.stringify(bob)}&&c.status==='accepted')`,'accepted');
   await sendUI(b,'成品真实回复');await a.until("document.getElementById('messages').textContent.includes('成品真实回复')",'bidirectional UI');
  });
- await check('超过10秒TTL后真实界面继续增量显示消息',async()=>{
+ await check('空闲后真实界面继续增量显示消息',async()=>{
   await delay(12500);assert(await a.evaluate('state.online'));assert(await b.evaluate('state.online'));
   await sendUI(a,'成品自动续期后的消息');await b.until("document.getElementById('messages').textContent.includes('成品自动续期后的消息')",'renewed UI delivery');
  });

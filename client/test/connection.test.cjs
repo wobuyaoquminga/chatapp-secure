@@ -133,3 +133,90 @@ test('ready sync authorization failure stops reconnecting and asks for login',as
     assert.equal(f.controller.retry,null);
   }finally{await f.close();}
 });
+
+test('network restoration bypasses backoff without creating duplicate sockets',async()=>{
+  const f=await fixture();let connections=0,first;
+  try{
+    f.controller.connectionOptions.retryBaseMs=1000;
+    f.controller.connectionOptions.retryMaxMs=1000;
+    f.server.on('connection',socket=>{
+      connections++;if(!first)first=socket;
+      socket.on('message',()=>socket.send(JSON.stringify({type:'ready'})));
+    });
+    f.controller.connect();await waitFor(()=>f.controller.online,'first ready');
+    first.terminate();await waitFor(()=>!!f.controller.retry,'scheduled retry');
+    f.controller.networkRestored();f.controller.networkRestored();
+    await waitFor(()=>connections===2&&f.controller.online,'immediate reconnect');
+    await pause(100);assert.equal(connections,2);
+  }finally{await f.close();}
+});
+
+test('failed message retry reuses its persisted envelope and is not replayed on reconnect',async()=>{
+  const f=await fixture();const id='11111111-1111-4111-8111-111111111111';
+  const envelope={type:'send',clientId:id,to:'bob',ciphertext:'encrypted-once',toAccountId:'bob-account'};
+  const received=[];let socket;
+  try{
+    f.controller.vault={write:()=>{}};
+    f.controller.engine.state.outbox[id]=envelope;
+    f.controller.engine.state.messages['alice:'+id]={sender:'alice',recipient:'bob',clientId:id,ciphertext:'encrypted-once',body:'hello',status:'待发送'};
+    f.server.on('connection',peer=>{
+      socket=peer;peer.on('message',raw=>{
+        const frame=JSON.parse(raw);if(frame.type==='auth')peer.send(JSON.stringify({type:'ready'}));
+        if(frame.type==='send')received.push(frame);
+      });
+    });
+    f.controller.connect();await waitFor(()=>received.length===1,'initial encrypted send');
+    socket.send(JSON.stringify({type:'error',clientId:id,error:'服务暂时不可用'}));
+    await waitFor(()=>f.controller.engine.state.messages['alice:'+id].status.startsWith('发送失败'),'failure state');
+    socket.terminate();await waitFor(()=>f.controller.online&&f.controller.retryAttempt===0&&f.controller.generation>=2,'ready after reconnect');
+    assert.equal(received.length,1,'failed envelope requires explicit retry');
+    await f.controller.retryMessage({clientId:id});
+    await waitFor(()=>received.length===2,'explicit retry');
+    assert.deepEqual(received[1],received[0]);
+    assert.match(f.controller.engine.state.messages['alice:'+id].status,/发送中/);
+    await assert.rejects(f.controller.retryMessage({clientId:id}),/正在发送/);
+    f.controller.engine.accepted=record=>{
+      const message=f.controller.engine.state.messages['alice:'+record.clientId];
+      message.id=record.id;message.status='服务器已保存密文';
+      delete f.controller.engine.state.outbox[record.clientId];
+    };
+    socket.send(JSON.stringify({type:'accepted',message:{...envelope,id:'saved-once'}}));
+    await waitFor(()=>!f.controller.engine.state.outbox[id],'persisted server acceptance');
+    socket.terminate();await waitFor(()=>f.controller.online&&f.controller.generation>=3,'ready after acceptance');
+    assert.equal(received.length,2,'accepted message is not replayed');
+  }finally{await f.close();}
+});
+
+test('account deadline is saved for the same account and an older server may omit the endpoint',async()=>{
+  const f=await fixture();
+  try{
+    f.controller.accountId='account-one';f.controller.vault={write:()=>{}};
+    const status={serverTime:'2026-10-03T00:00:00Z',lastConnectedAt:'2026-10-03T00:00:00Z',accountExpiresAt:'2026-10-10T00:00:00Z',retentionDays:7};
+    f.controller.request=async()=>status;
+    await f.controller.refreshAccountStatus();
+    assert.equal(f.controller.snapshot().accountStatus.accountId,'account-one');
+    f.controller.request=async()=>{throw Object.assign(new Error('not found'),{status:404});};
+    await f.controller.refreshAccountStatus();
+    assert.equal(f.controller.snapshot().accountStatus.accountExpiresAt,status.accountExpiresAt);
+    f.controller.accountId='account-two';assert.equal(f.controller.snapshot().accountStatus,null);
+  }finally{await f.close();}
+});
+
+test('missing server acknowledgement becomes a manual retry of the same ciphertext',async()=>{
+  const f=await fixture(),id='22222222-2222-4222-8222-222222222222',frames=[];
+  const envelope={type:'send',clientId:id,to:'bob',ciphertext:'unchanged-encrypted-message'};
+  try{
+    f.controller.connectionOptions.ackTimeoutMs=35;f.controller.vault={write:()=>{}};
+    f.controller.engine.state.outbox[id]=envelope;
+    f.controller.engine.state.messages['alice:'+id]={sender:'alice',recipient:'bob',clientId:id,body:'hello',ciphertext:envelope.ciphertext,status:'待发送'};
+    f.server.on('connection',socket=>socket.on('message',raw=>{
+      const frame=JSON.parse(raw);if(frame.type==='auth')socket.send(JSON.stringify({type:'ready'}));
+      if(frame.type==='send')frames.push(frame);
+    }));
+    f.controller.connect();await waitFor(()=>frames.length===1,'first send');
+    await waitFor(()=>f.controller.engine.state.messages['alice:'+id].status==='发送失败 · 服务器确认超时','ack timeout');
+    assert.equal(frames.length,1,'timeout does not auto resend');
+    await f.controller.retryMessage({clientId:id});await waitFor(()=>frames.length===2,'manual retry');
+    assert.deepEqual(frames[1],frames[0]);
+  }finally{await f.close();}
+});

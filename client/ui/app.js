@@ -4,6 +4,7 @@ let state={accounts:[],servers:[],contacts:[],sessions:[],contactStates:[],messa
 let indexedSnapshot=null,indexedRevision=null,messageIndex=null,contactIndex=new Map(),peerRows=new Map();
 let accountSignature='',serverSignature='',sending=false,safetyRequest=0;
 let lastSnapshotRevision=-1;
+let updateEpoch=0,updateInfo=null,updateBusy=false;
 const drafts=new Map();
 let selected=null,activePeer='',tab='sessions',settingsOpen=false,safetyResult=null,safetyPeer='',context='',draftRevision=0;
 const notice=message=>{$('notice').textContent=message||'';};
@@ -16,7 +17,13 @@ function saveDraft(){if(activePeer){const key=context+'\0'+activePeer,text=$('bo
 function clearConversation(){saveDraft();resetPanels();activePeer='';draftRevision++;safetyRequest++;safetyPeer='';safetyResult=null;$('body').value='';$('peer').value='';$('safetyPanel').hidden=true;calls.snapshot();}
 function useAccount(account){selected=account;$('username').value=account.user;$('username').readOnly=true;$('register').hidden=true;$('usernameLabel').hidden=true;$('password').focus();renderAccountSelection();}
 function useNewAccount(){selected=null;$('username').value='';$('username').readOnly=false;$('usernameLabel').hidden=false;$('register').hidden=false;renderAccountSelection();$('username').focus();}
-function renderAccountSelection(){$('registrationWarning').hidden=$('register').hidden;for(const item of document.querySelectorAll('#accountList .account'))item.classList.toggle('active',!!selected&&item.dataset.key===accountKey(selected));}
+function renderAccountSelection(){
+  $('registrationWarning').hidden=$('register').hidden;
+  for(const item of document.querySelectorAll('#accountList .account'))item.classList.toggle('active',!!selected&&item.dataset.key===accountKey(selected));
+  const cached=selected?.accountId&&selected.accountStatus?.accountId===selected.accountId?selected.accountStatus:null;
+  $('savedAccountDeadline').hidden=!cached;
+  $('savedAccountDeadline').textContent=cached?'按上次服务器记录估计：'+deadlineText(cached,false).replace(/^离线估计期限：/,'')+'。请成功连接后确认；本软件不会在后台提醒。':'';
+}
 function renderAccounts(){
   const list=$('accountList'),filtered=accounts(),signature=JSON.stringify([server(),filtered]);
   if(signature===accountSignature){renderAccountSelection();return;}accountSignature=signature;
@@ -27,7 +34,7 @@ function renderAccounts(){
     const drop=document.createElement('button');drop.type='button';drop.className='accountForget';drop.textContent='移除';drop.setAttribute('aria-label','移除 '+account.user);drop.onclick=()=>forgetAccount(account);
     item.append(pick,drop);list.append(item);
   }
-  if(selected&&!filtered.some(account=>accountKey(account)===accountKey(selected)))selected=null;
+  if(selected)selected=filtered.find(account=>accountKey(account)===accountKey(selected))||null;
   if(!selected&&filtered.length&&$('username').value==='')useAccount(filtered[0]);
   else if(!selected){$('username').readOnly=false;$('usernameLabel').hidden=false;$('register').hidden=false;}
   renderAccountSelection();
@@ -41,6 +48,22 @@ function peerMessages(peer){return messageIndex?.messages(peer)||[];}
 function contact(peer){return contactIndex.get(peer);}
 function updateLocationButtons(){const canLocate=!!(activePeer&&state.online&&contact(activePeer)?.status==='accepted'&&!state.deletedPeers?.[activePeer]&&!state.identityChanges?.[activePeer]);$('sendPosition').disabled=$('sendPositionEntry').disabled=!canLocate||!!live;$('startLive').disabled=!canLocate||!!live;$('startLiveEntry').disabled=!canLocate&&!live;}
 function peerStatus(peer){if(state.deletedPeers?.[peer])return '该用户已销户';if(state.identityChanges?.[peer])return '身份已更新，请重新核对';const item=contact(peer),presence=item?.online?'在线':'离线';if(item?.status==='pending_incoming')return presence+' · 等待你接受';if(item?.status==='pending_outgoing')return presence+' · 等待对方接受';if(item?.status==='accepted')return presence;return '尚未建立联系';}
+function deadlineText(value=state.accountStatus,online=state.online){
+  if(!value||!Number.isFinite(Date.parse(value.accountExpiresAt)))return online?'账号期限暂不可用；请保持每周成功连接':'尚无服务器期限记录；连接成功后可查看';
+  const serverNow=Date.parse(value.serverTime)+Math.max(0,Date.now()-Date.parse(value.receivedAt));
+  const expires=Date.parse(value.accountExpiresAt),localExpires=Date.parse(value.receivedAt)+expires-Date.parse(value.serverTime),days=Math.max(0,Math.ceil((expires-serverNow)/86400000));
+  if(!online&&expires<=serverNow)return '账号可能已到期；连接后确认';
+  if(days<=2)return (online?'账号期限':'离线估计期限')+'：约 '+days+' 天内到期，请在 '+new Date(localExpires).toLocaleString()+' 前成功连接（按服务器时间估算）';
+  return (online?'账号期限：':'离线估计期限：')+new Date(localExpires).toLocaleString()+'（约 '+days+' 天，按服务器时间估算）';
+}
+function deliveryText(message){
+  if(message.sender!==state.username)return message.status;
+  if(message.status?.startsWith('发送失败'))return message.status;
+  if(message.status==='对方客户端已接收')return '已送达 · 对方客户端已接收';
+  if(message.status==='服务器已保存密文')return '服务器已保存密文 · 等待对方接收';
+  if((state.outboxIds||[]).includes(message.clientId))return state.online?'发送中 · 等待服务器确认':'等待连接恢复 · 尚未确认发送';
+  return message.status||'发送中';
+}
 function peers(){
   const names=new Set(tab==='contacts'?state.contacts||[]:state.sessions||[]);names.delete(state.username);names.delete('');
   const query=$('peerSearch').value.trim().toLocaleLowerCase();
@@ -87,6 +110,8 @@ function renderConversation(){
   const canSend=state.online&&!deleted&&!changed&&(relation==='accepted'||!relation);
   $('send').disabled=!canSend||sending;$('body').disabled=!canSend;
   $('body').placeholder=changed?'请先核对新的安全码':deleted?'该用户已销户，聊天记录仍保留':relation==='pending_incoming'?'接受聊天后可回复':relation==='pending_outgoing'?'等待对方接受后可继续发送':'发送消息…';
+  const guidance=changed?'联系人身份已变化。请通过可信渠道核对新安全码，再恢复聊天。':deleted?'对方账号已注销。原聊天记录保留；如对方重新注册，请重新发起聊天并核对安全码。':relation==='pending_incoming'?'对方已发起聊天。接受后才能回复；接受前请核对对方身份。':relation==='pending_outgoing'?'首条消息已发出，等待对方接受。接受后才能继续发送。':!state.online?'连接中断，消息暂不能发送。网络恢复后将尝试重连；未获服务器确认的消息会保留在本机。':'';
+  $('conversationGuidance').textContent=guidance;$('conversationGuidance').hidden=!guidance;
   $('acceptContact').hidden=relation!=='pending_incoming';$('removeContact').hidden=relation!=='accepted'||!(state.contacts||[]).includes(activePeer);
   updateLocationButtons();
   if(live&&(!state.online||!state.username||state.identityChanges?.[live.peer]||state.deletedPeers?.[live.peer]||contact(live.peer)?.status!=='accepted'))stopLive();
@@ -96,6 +121,8 @@ function renderConversation(){
 async function openPeer(peer){try{if(activePeer!==peer){saveDraft();resetPanels();draftRevision++;safetyRequest++;$('body').value=drafts.get(context+'\0'+peer)||'';}activePeer=peer;if(!expiryTimer)expiryTimer=setInterval(refreshLocationCards,15000);safetyPeer='';safetyResult=null;$('safetyPanel').hidden=true;render(await command('openConversation',{peer}));calls.snapshot();$('body').focus();}catch(error){notice(error.message);}}
 function render(next){
   if(Number.isSafeInteger(next.snapshotRevision)){if(next.snapshotRevision<lastSnapshotRevision)return;lastSnapshotRevision=next.snapshotRevision;}
+  const previousServer=server(),nextServer=next.selectedServer||next.server||(next.servers||[])[0]||'';
+  if(previousServer!==nextServer){updateEpoch++;updateInfo=null;updateBusy=false;$('serverVersion').textContent='点击检查所选服务器提供的 Windows 版本。';$('updateNotes').hidden=true;$('downloadUpdate').hidden=true;$('cancelUpdate').hidden=true;$('openDownload').hidden=true;$('updateProgress').hidden=true;$('updateProgressText').textContent='';$('checkUpdate').disabled=false;}
   const oldIdentity=context;if(live&&(!next.online||next.server!==state.server||next.username!==state.username))stopLive();state=next;const current=(state.username?state.server+'\0'+state.username:'')+'|'+server();
   const revision=Number.isSafeInteger(state.messageRevision)?state.messageRevision:null;
   if(!messageIndex||messageIndex.user!==state.username||messageIndex.server!==server()||(Array.isArray(state.messages)&&(revision===null?indexedSnapshot!==next:indexedRevision!==revision))){messageIndex=F.messageIndex(state.messages||[],state.username,server());indexedSnapshot=next;indexedRevision=revision;}
@@ -106,6 +133,9 @@ function render(next){
   context=current;
   const hasServer=!!server();$('serverSetup').hidden=hasServer||settingsOpen;$('auth').hidden=!hasServer||!!state.username||settingsOpen;$('chat').hidden=!state.username||settingsOpen;$('settings').hidden=!settingsOpen;
   $('authServer').textContent=server();$('identity').textContent=state.username||'';$('connection').textContent=state.status||'';
+  $('connection').classList.toggle('online',!!state.online);$('accountDeadline').textContent=state.username?deadlineText():'';
+  $('accountDeadline').classList.toggle('urgent',!!state.username&&/到期|已到期/.test($('accountDeadline').textContent));
+  $('settingsDeadline').textContent=state.username?deadlineText()+'。成功连接后 7 天从该次连接重新计算；本软件不会在后台提醒。':'';
   $('accountSettings').hidden=!state.username;$('settingsAccount').textContent=state.username?state.username+' · '+state.server:'';
   if(!state.username)renderAccounts();renderServers();renderPeers();renderConversation();calls.snapshot();if(state.error)notice(state.error);
 }
@@ -135,6 +165,16 @@ const calls=window.ChatCalls.create({command,notice,getState:()=>state,getPeer:(
 window.chat.onCall(event=>calls.onEvent(event));
 window.chat.subscribe(render);
 command('snapshot').then(render).catch(error=>notice(error.message));
+command('appInfo').then(info=>{$('appVersion').textContent='当前安装版本 '+info.version+'。请查看发布说明确认与服务器的兼容要求。';}).catch(()=>{$('appVersion').textContent='当前版本暂不可读取，请查看发布说明。';});
+function updateUiBusy(value){updateBusy=value;$('checkUpdate').disabled=value;$('downloadUpdate').disabled=value;$('cancelUpdate').hidden=!value;}
+$('checkUpdate').onclick=async()=>{const epoch=++updateEpoch,selectedServer=server();if(!selectedServer){$('serverVersion').textContent='请先选择服务器。';return;}updateInfo=null;$('downloadUpdate').hidden=true;$('openDownload').hidden=true;$('updateProgress').hidden=true;$('updateProgressText').textContent='';$('serverVersion').textContent='正在检查 '+selectedServer+'…';updateUiBusy(true);$('cancelUpdate').hidden=true;try{const info=await window.chat.checkUpdate();if(epoch!==updateEpoch||selectedServer!==server())return;updateInfo=info;$('serverVersion').textContent='服务器提供版本 '+info.version+(info.available?' · 可下载更新':' · 当前已是最新版本');$('updateNotes').hidden=!info.notes;$('updateNotes').textContent=info.notes||'';$('downloadUpdate').hidden=!info.available;}catch(error){if(epoch===updateEpoch&&selectedServer===server())$('serverVersion').textContent=error.message||'检查更新失败';}finally{if(epoch===updateEpoch){updateUiBusy(false);$('cancelUpdate').hidden=true;}}};
+$('downloadUpdate').onclick=async()=>{const epoch=++updateEpoch,selectedServer=server();if(!updateInfo||!updateInfo.available||updateInfo.server!==selectedServer)return;updateUiBusy(true);$('downloadUpdate').hidden=true;$('openDownload').hidden=true;$('updateProgress').hidden=false;$('updateProgress').value=0;$('updateProgressText').textContent='正在下载更新包…';try{const result=await window.chat.downloadUpdate();if(epoch!==updateEpoch||selectedServer!==server())return;if(result.canceled){$('updateProgressText').textContent='已取消保存。';return;}$('updateProgress').value=100;$('updateProgressText').textContent='下载并校验完成：'+result.fileName;$('openDownload').hidden=false;}catch(error){if(epoch===updateEpoch&&selectedServer===server())$('updateProgressText').textContent=error.message||'下载失败';}finally{if(epoch===updateEpoch){updateUiBusy(false);$('cancelUpdate').hidden=true;}}};
+$('cancelUpdate').onclick=()=>{window.chat.cancelUpdate().catch(()=>{});$('updateProgressText').textContent='正在取消下载…';};
+$('openDownload').onclick=()=>window.chat.openDownload().catch(error=>notice(error.message||'无法打开文件夹'));
+window.chat.onUpdateProgress?.(progress=>{if(!updateBusy||progress.server!==server())return;$('updateProgress').value=Math.round(progress.received/progress.total*100);$('updateProgressText').textContent='已下载 '+(progress.received/1048576).toFixed(1)+' / '+(progress.total/1048576).toFixed(1)+' MiB';});
+$('openUpdates').onclick=()=>window.chat.openUpdates().catch(error=>notice(error.message||'更新页面打开失败'));
+window.addEventListener('online',()=>command('networkRestored').catch(()=>{}));
+window.addEventListener('focus',()=>{if(!state.online&&navigator.onLine)command('networkRestored').catch(()=>{});});
 function messageKey(m){return m.sender+':'+m.clientId;}
 function refreshLocationCards(){if(!activePeer||document.hidden)return;const tracker=messageIndex.display(activePeer).tracker;for(const [key,node] of messageNodes){const item=tracker.get(key);if(item){node.querySelector('strong').textContent='📍 实时位置 · '+item.status;}}}
 function renderMessages(jump){
@@ -147,8 +187,8 @@ function renderMessages(jump){
  if(renderPeer!==activePeer){log.replaceChildren();messageNodes.clear();renderPeer=activePeer;}
  const keep=new Set(items.map(item=>item.key));for(const [key,node] of messageNodes)if(!keep.has(key)){node.remove();messageNodes.delete(key);}
  let cursor=log.firstChild;
- for(const item of items){let bubble=messageNodes.get(item.key);if(!bubble){bubble=document.createElement('div');bubble.className='bubble'+(item.m.sender===state.username?' mine':'');bubble.dataset.messageKey=messageKey(item.m);if(item.snapshot)bubble.dataset.historySnapshot='true';messageNodes.set(item.key,bubble);}const m=item.m,p=item.session?.value||F.parse(m.body),sig=JSON.stringify([m.body,m.status,item.session?.status,p,!!live,item.snapshot]);
- if(bubble.dataset.signature!==sig){bubble.replaceChildren();if(p){bubble.classList.add('locationCard');const title=document.createElement('strong');title.textContent=item.snapshot?'📍 历史位置快照 · '+(p.kind==='stop'?'当时已停止':'当时共享中'):p.kind==='pin'?'📍 位置':'📍 实时位置 · '+item.session.status;const coords=document.createElement('p');coords.textContent=p.latitude===undefined?'共享已结束':p.latitude.toFixed(6)+', '+p.longitude.toFixed(6);const detail=document.createElement('small');detail.textContent=(p.accuracy>0?'定位精度约 '+p.accuracy+' 米':'精度未提供')+' · '+new Date(p.recordedAt).toLocaleString();bubble.append(title,coords,detail);if(p.latitude!==undefined){const openMap=document.createElement('button');openMap.type='button';openMap.className='textButton';openMap.textContent='在高德地图查看';openMap.onclick=()=>window.chat.openMap(p.latitude,p.longitude).catch(error=>notice(error.message||'打开地图失败'));bubble.append(openMap);}if(p.kind!=='pin'&&!item.snapshot){const own=document.createElement('button');own.type='button';own.className='textButton';own.textContent=live?'正在共享我的位置':'共享我的位置';own.disabled=!!live||contact(activePeer)?.status!=='accepted'||!state.online;own.onclick=startLive;bubble.append(own);}}else{const body=document.createElement('p');body.textContent=m.body;bubble.append(body);}const meta=document.createElement('div');meta.className='meta';meta.textContent=new Date(m.createdAt).toLocaleString()+' · '+m.status;bubble.append(meta);bubble.dataset.signature=sig;}
+ for(const item of items){let bubble=messageNodes.get(item.key);if(!bubble){bubble=document.createElement('div');bubble.className='bubble'+(item.m.sender===state.username?' mine':'');bubble.dataset.messageKey=messageKey(item.m);if(item.snapshot)bubble.dataset.historySnapshot='true';messageNodes.set(item.key,bubble);}const m=item.m,p=item.session?.value||F.parse(m.body),sig=JSON.stringify([m.body,m.status,item.session?.status,p,!!live,item.snapshot,state.online]);
+ if(bubble.dataset.signature!==sig){bubble.replaceChildren();if(p){bubble.classList.add('locationCard');const title=document.createElement('strong');title.textContent=item.snapshot?'📍 历史位置快照 · '+(p.kind==='stop'?'当时已停止':'当时共享中'):p.kind==='pin'?'📍 位置':'📍 实时位置 · '+item.session.status;const coords=document.createElement('p');coords.textContent=p.latitude===undefined?'共享已结束':p.latitude.toFixed(6)+', '+p.longitude.toFixed(6);const detail=document.createElement('small');detail.textContent=(p.accuracy>0?'定位精度约 '+p.accuracy+' 米':'精度未提供')+' · '+new Date(p.recordedAt).toLocaleString();bubble.append(title,coords,detail);if(p.latitude!==undefined){const openMap=document.createElement('button');openMap.type='button';openMap.className='textButton';openMap.textContent='在高德地图查看';openMap.onclick=()=>window.chat.openMap(p.latitude,p.longitude).catch(error=>notice(error.message||'打开地图失败'));bubble.append(openMap);}if(p.kind!=='pin'&&!item.snapshot){const own=document.createElement('button');own.type='button';own.className='textButton';own.textContent=live?'正在共享我的位置':'共享我的位置';own.disabled=!!live||contact(activePeer)?.status!=='accepted'||!state.online;own.onclick=startLive;bubble.append(own);}}else{const body=document.createElement('p');body.textContent=m.body;bubble.append(body);}const meta=document.createElement('div');meta.className='meta'+(m.status?.startsWith('发送失败')?' failed':'');meta.textContent=new Date(m.createdAt).toLocaleString()+' · '+deliveryText(m);bubble.append(meta);if(m.sender===state.username&&m.status?.startsWith('发送失败')&&(state.outboxIds||[]).includes(m.clientId)){const retry=document.createElement('button');retry.type='button';retry.className='retryMessage';retry.textContent='重试发送';retry.disabled=!state.online;retry.onclick=async()=>{retry.disabled=true;try{render(await command('retryMessage',{clientId:m.clientId}));}catch(error){notice(error.message);retry.disabled=!state.online;}};bubble.append(retry);}bubble.dataset.signature=sig;}
  if(bubble!==cursor)log.insertBefore(bubble,cursor);cursor=bubble.nextSibling;
  }
  $('olderMessages').hidden=end<=100;

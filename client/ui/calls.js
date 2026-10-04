@@ -74,7 +74,7 @@
       else command('cancelCall',{callId:item.id}).catch(()=>{});
       if(reason)notice(reason);
     }
-    function armTimeout(item) {clearTimeout(item.timeout);item.timeout=setTimeout(()=>{if(same(item))close('通话等待超时','hangup');},45000);}
+    function armTimeout(item) {clearTimeout(item.timeout);item.timeout=setTimeout(()=>{if(same(item))close(item.direction==='incoming'?'来电已超时，未接听':'呼叫已超时：对方未接听或网络未能建立连接','hangup');},45000);}
     async function setup(item) {
       const servers=await iceServers();if(!same(item))return;
       const pc=new RTCPeerConnection({iceServers:servers});item.pc=pc;
@@ -102,9 +102,10 @@
           const elapsed=()=>{if(same(item)){$('callStatus').textContent='通话中 · '+new Date(Date.now()-item.connectedAt).toISOString().slice(11,19);}};
           elapsed();item.durationTimer=setInterval(elapsed,1000);
         }
-        if(pc.connectionState==='disconnected'){$('callStatus').textContent='连接中断，正在重连…';clearTimeout(item.disconnectTimer);item.disconnectTimer=setTimeout(()=>{if(same(item)&&pc.connectionState==='disconnected')close('通话连接已断开','hangup');},15000);}
-        if(['failed','closed'].includes(pc.connectionState))
-          close(item.connectedAt?'通话连接已结束':'通话无法建立：双方网络无法直连，可能需要配置 TURN 中继','hangup');
+        if(pc.connectionState==='disconnected'){$('callStatus').textContent='通话网络中断，正在尝试恢复…';clearTimeout(item.disconnectTimer);item.disconnectTimer=setTimeout(()=>{if(same(item)&&pc.connectionState==='disconnected')close('通话网络中断超过 15 秒，请检查网络后重拨','hangup');},15000);}
+        if(pc.connectionState==='closed')close('通话连接已结束','hangup');
+        if(pc.connectionState==='failed')
+          close(item.connectedAt?'通话连接失败：网络路径已中断，请重拨':'通话无法建立：媒体连接失败。请检查双方网络；若跨网络无法直连，服务器可能需要 TURN 中继','hangup');
       };
       await command('callMediaPermission',{peer:item.peer,callId:item.id,mode:item.mode});
       if(!same(item))return;
@@ -113,7 +114,8 @@
         item.stream=await navigator.mediaDevices.getUserMedia({audio:true,video:item.mode==='video'});
       }catch(error){
         if(error.name==='NotFoundError'||error.name==='DevicesNotFoundError')throw new Error(item.mode==='video'?'未找到可用的麦克风或摄像头':'未找到可用的麦克风');
-        if(error.name==='NotAllowedError'||error.name==='PermissionDeniedError'||error.name==='SecurityError')throw new Error('麦克风或摄像头权限被拒绝，请检查 Windows 隐私设置');
+        if(error.name==='NotAllowedError'||error.name==='PermissionDeniedError'||error.name==='SecurityError')throw new Error(item.mode==='video'?'麦克风或摄像头权限被拒绝，请检查 Windows 隐私设置':'麦克风权限被拒绝，请检查 Windows 隐私设置');
+        if(error.name==='NotReadableError'||error.name==='TrackStartError')throw new Error(item.mode==='video'?'麦克风或摄像头正被其他程序占用，请关闭占用程序后重试':'麦克风正被其他程序占用，请关闭占用程序后重试');
         throw error;
       }finally{command('revokeCallMediaPermission').catch(()=>{});}
       if(!same(item)){item.stream?.getTracks().forEach(track=>track.stop());return;}
@@ -164,7 +166,7 @@
         current=item;minimize(false);actions(false);view(item,'来电 · '+(item.mode==='video'?'视频':'语音'));armTimeout(item);updateButtons();return;
       }
       const item=current;if(!item||item.id!==event.callId||item.peer!==event.from||item.mode!==event.mode)return;
-      if(['reject','busy','hangup'].includes(event.action)){close(event.action==='busy'?'对方正在通话':'对方已结束通话');return;}
+      if(['reject','busy','hangup'].includes(event.action)){close(event.action==='busy'?'对方正在通话，请稍后重拨':event.action==='reject'?'对方已拒绝来电':'对方已结束通话');return;}
       try{
         if(event.action==='ice'){
           if(typeof event.payload!=='string')return;

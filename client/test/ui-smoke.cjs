@@ -1,10 +1,10 @@
 // Run: node client/test/ui-smoke.cjs. Uses the installed Electron, no server or account.
 'use strict';
 const fs=require('node:fs');
-const path=require('node:path');
+const path=require('node:path'),os=require('node:os');
 const assert=require('node:assert/strict');
 const {spawn}=require('node:child_process');
-const out=process.env.CHAT_UI_QA_DIR||'E:\\通讯软件\\work\\ui-qa';
+const out=process.env.CHAT_UI_QA_DIR||path.join(os.tmpdir(),'chat-ui-qa');
 const resultFile=path.join(out,'ui-smoke-result.json');
 
 if(!process.versions.electron){
@@ -73,13 +73,20 @@ function signedIn(){
   fixture.messageRevision++;
 }
 ipcMain.handle('qa:command',async(_event,{action,payload})=>{
+  if(action==='appInfo')return {ok:true,value:{version:'0.6.1'}};
   if(action==='snapshot')return {ok:true,value:clone()};
+  if(action==='retryMessage'){
+    const message=fixture.messages.find(item=>item.clientId===payload.clientId);
+    if(!message)return {ok:false,error:'消息不存在'};
+    message.status='发送中 · 等待服务器确认';fixture.messageRevision++;return {ok:true,value:clone()};
+  }
   if(action==='login'){
     if(payload.register&&fixture.accounts.some(a=>a.user===payload.username))return {ok:false,error:'用户名已存在'};
     signedIn();return {ok:true,value:clone()};
   }
   if(action==='logout'){
     fixture.username='';fixture.server='';fixture.status='未登录';fixture.online=false;
+    fixture.accountStatus=null;
     fixture.contacts=[];fixture.sessions=[];fixture.contactStates=[];fixture.messages=[];
     fixture.messageRevision++;return {ok:true,value:clone()};
   }
@@ -96,6 +103,10 @@ ipcMain.handle('qa:command',async(_event,{action,payload})=>{
   if(action==='revokeLocationPermission'||action==='stopLocations')return {ok:true,value:true};
   return {ok:true,value:clone()};
 });
+ipcMain.handle('qa:check-update',async()=>({server,platform:'windows-x64',version:'0.6.2',fileName:'Chat-0.6.2.zip',size:100,available:true,notes:'测试更新说明'}));
+ipcMain.handle('qa:download-update',async()=>{window.webContents.send('qa:update-progress',{server,received:100,total:100});await wait(30);return {server,fileName:'Chat-0.6.2.zip'};});
+ipcMain.handle('qa:cancel-update',async()=>true);
+ipcMain.handle('qa:open-download',async()=>true);
 
 async function run(){
   fs.mkdirSync(out,{recursive:true});
@@ -236,6 +247,31 @@ async function run(){
     assert.equal(await text('#connection'),'连接中','stale snapshot cannot overwrite connection');
     assert.equal(await js('messageIndex===window.__qaIndex'),true);
   });
+  await check('发送失败状态与原消息重试按钮',async()=>{
+    fixture.online=true;fixture.status='在线';
+    fixture.accountStatus={serverTime:new Date().toISOString(),lastConnectedAt:new Date().toISOString(),accountExpiresAt:new Date(Date.now()+7*86400000).toISOString(),receivedAt:new Date().toISOString(),retentionDays:7,accountId:'qa-account'};
+    const id='qa-failed-message';fixture.outboxIds=[id];
+    fixture.messages.push({sender:owner,recipient:'小红',clientId:id,body:'重试前的原消息',createdAt:new Date().toISOString(),status:'发送失败 · 服务暂时不可用'});
+    fixture.messageRevision++;publish();
+    await until(async()=>await text('#messages')?.then(value=>value.includes('重试前的原消息')),'failed message');
+    assert.match(await text('#accountDeadline'),/账号期限/);
+    const skewBase=Date.now();fixture.accountStatus.serverTime=new Date(skewBase-3*86400000).toISOString();
+    fixture.accountStatus.accountExpiresAt=new Date(skewBase+86400000).toISOString();publish();
+    const expectedRegular=new Date(Date.parse(fixture.accountStatus.receivedAt)+Date.parse(fixture.accountStatus.accountExpiresAt)-Date.parse(fixture.accountStatus.serverTime)).toLocaleString();
+    await until(async()=>await text('#accountDeadline')?.then(value=>value.includes(expectedRegular)),'clock-corrected calendar date');
+    assert(!(await text('#accountDeadline')).includes(new Date(fixture.accountStatus.accountExpiresAt).toLocaleString()),'raw server calendar date must not appear');
+    fixture.accountStatus.accountExpiresAt=new Date(skewBase-2*86400000).toISOString();publish();
+    await until(async()=>await text('#accountDeadline')?.then(value=>value.includes('约 1 天内到期')),'server-relative deadline');
+    const expectedUrgent=new Date(Date.parse(fixture.accountStatus.receivedAt)+Date.parse(fixture.accountStatus.accountExpiresAt)-Date.parse(fixture.accountStatus.serverTime)).toLocaleString();
+    assert((await text('#accountDeadline')).includes(expectedUrgent),'urgent calendar date uses server clock offset');
+    assert.equal(await js("document.querySelector('#accountDeadline').classList.contains('urgent')"),true);
+    fixture.accounts[0].accountId='qa-account';fixture.accounts[0].accountStatus=structuredClone(fixture.accountStatus);
+    assert.equal(await visible('.retryMessage'),true);
+    assert.match(await text('.meta.failed'),/发送失败/);
+    await click('.retryMessage');
+    await until(async()=>await text('#messages')?.then(value=>value.includes('发送中 · 等待服务器确认')),'retry status');
+    assert.equal(await visible('.retryMessage'),false);
+  });
   await shot('05-disconnected');
   await check('两万条单会话历史、增量索引和状态刷新显示缓存',async()=>{
     fixture.messages=Array.from({length:20000},(_,i)=>({sender:owner,recipient:'小红',clientId:'perf-'+i,body:'性能消息 '+i,createdAt:new Date(now-20000+i).toISOString(),status:'已保存'}));fixture.messageRevision++;publish();
@@ -253,6 +289,10 @@ async function run(){
   await check('设置页面与返回',async()=>{
     await click('#chatSettings');assert.equal(await visible('#settings'),true);
     assert.match(await text('#serverList'),/qa\.example\.invalid/);
+    await click('#checkUpdate');await until(async()=>/服务器提供版本 0\.6\.2/.test(await text('#serverVersion')),'update check');
+    assert.equal(await visible('#downloadUpdate'),true);assert.match(await text('#updateNotes'),/测试更新说明/);
+    await click('#downloadUpdate');await until(async()=>/下载并校验完成/.test(await text('#updateProgressText')),'update download');
+    assert.equal(await visible('#openDownload'),true);await click('#openDownload');
     await shot('06-settings');
     await click('#closeSettings');assert.equal(await visible('#chat'),true);
   });
@@ -262,6 +302,9 @@ async function run(){
     assert.equal(await js("document.querySelector('#username').readOnly"),true);
     assert.equal(await js("document.querySelector('#register').hidden"),true);
     assert.equal(await value('#username'),owner);
+    assert.equal(await visible('#savedAccountDeadline'),true);
+    assert.match(await text('#savedAccountDeadline'),/按上次服务器记录估计/);
+    assert.match(await text('#savedAccountDeadline'),/请成功连接后确认/);
     await shot('07-saved-login');
     await fill('#password','secure-pass-123');await click('#login');
     await until(()=>visible('#chat'),'chat after login');

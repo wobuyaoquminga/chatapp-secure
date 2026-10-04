@@ -2,7 +2,7 @@
 
 Chat 是一个可自行部署的开源一对一通讯项目，提供 Windows 桌面客户端、Android 客户端和 Java 服务器。它适合希望自己管理服务端、了解消息加密边界、参与客户端与服务端开发的人。当前仍是开发验证版，尚未经过独立安全审计；它不是 Signal 官方客户端，也不连接 Signal 服务。
 
-**当前版本：Chat v0.5.9**。发布组合为 Windows 0.5.8、Android 0.4.9（versionCode 15）和服务器 0.2.3。各组件版本也记录在 [release.json](release.json)。
+**当前版本：Chat v0.6.1**。发布组合为 Windows 0.6.1、Android 0.5.1（versionCode 17）和服务器 0.2.5。各组件版本也记录在 [release.json](release.json)。
 
 ## 可以做什么
 
@@ -18,14 +18,22 @@ Chat 是一个可自行部署的开源一对一通讯项目，提供 Windows 桌
 
 ## 下载与首次使用
 
-1. 从对应版本的 [GitHub Releases](https://github.com/wobuyaoquminga/chatapp-secure/releases) 获取发布包，并用发布包中的 `SHA256.txt` 核对下载文件。Windows 包名为 `Chat-Client-Windows-x64.zip`，Android 提供 `Chat-Android-arm64-v8a-debug.apk`，服务器部署包为 `Chat-Ubuntu-Deploy.tar.gz`。Android APK 是开发调试构建，安装前请确认设备处理器架构为 arm64。
+1. 从对应版本的 [GitHub Releases](https://github.com/wobuyaoquminga/chatapp-secure/releases) 获取发布包，并用发布包中的 `SHA256.txt` 核对下载文件。Windows 包名为 `Chat-Client-Windows-x64.zip`，Android 提供正式版 `Chat-Android-arm64-v8a-release.apk` 和旧调试版更新包 `Chat-Android-arm64-v8a-debug.apk`，服务器部署包为 `Chat-Ubuntu-Deploy.tar.gz`。安装前请确认设备处理器架构为 arm64，并按 [Android 安装与更新](android/RELEASE.md)选择原安装渠道。
 2. 准备一台自己信任的 Chat 服务器。可在本机运行源码进行试用，或按[Ubuntu 部署指南](deploy/ubuntu/README.md)部署远程服务器。远程访问应使用可信证书的 HTTPS/WSS；`http://127.0.0.1:8082` 仅适用于连接本机开发服务器。Android 连接电脑上的本机服务器时可通过 USB `adb reverse tcp:8082 tcp:8082` 转发，具体步骤见 [Android 说明](android/README.md)。
-3. Windows 将 ZIP 完整解压后运行 `Chat-win32-x64/Chat.exe`；Android 安装与当前应用签名一致的 APK。首次打开时添加服务器地址，随后注册或登录该服务器上的账号。
+3. Windows 将 ZIP 完整解压后运行 `Chat-win32-x64/Chat.exe`；Android 安装同渠道、同签名的 APK；正式版与旧调试版的本地数据独立。首次打开时添加服务器地址，随后注册或登录该服务器上的账号。
 4. 用户名须为 **2–32 位汉字、小写字母、数字或下划线**；密码至少 8 个字符。输入对方用户名发起联系，对方接受后即可继续聊天。首次交流请通过可信的其他渠道核对双方显示的安全码；对方设备身份变化后应再次核对。
 
 Chat 目前一个账号同时只有一个有效设备身份。忘记密码无法修改或找回账号；清除应用数据、丢失本机密钥或换设备后，可凭原用户名和密码重建设备身份，但无法从服务器恢复原设备上的聊天历史，旧设备身份会失效。客户端本地历史因此需要自行妥善保管。
 
+应用会显示最近一次取得的服务器账号期限，离线临近期限时提示重新连接。到期提示是根据已有服务器记录做的估算，不能代替实际在线连接；应用被系统停止后无法保证提醒。
+
 账号连续 **7 天没有成功认证并连接服务器**，服务端会自动清理该账号、联系人关系及相关服务器密文；只打开应用但未显示在线不算成功连接。服务器在消息首次送达 ACK 满 **7 天**后清理已送达密文，未送达密文随账号清理规则处理。服务端删除密文不删除设备上已保存的本地历史。
+
+## 连接与消息状态
+
+网络恢复后客户端会重试连接。消息界面区分发送中、服务器已接收但等待对方、对方已送达和发送失败；对可重试消息使用原消息的重试入口，客户端保留同一加密信封与消息编号，避免将重试当成新消息发送。服务器接收不等于对方已收到。身份变化时先核对安全码；等待对方接受时查看联系人请求状态。
+
+设置中可检查当前服务器提供的新版本，并下载对应平台和安装渠道的安装包；GitHub 发布页保留为备选入口。服务器管理员需先按 [发布客户端更新](deploy/ubuntu/CLIENT-UPDATES.md)上传安装包。升级前核对版本、安装渠道、签名与兼容性，详见 [Android 安装与更新](android/RELEASE.md)。
 
 ## 组件与运行环境
 
@@ -34,7 +42,7 @@ Chat 目前一个账号同时只有一个有效设备身份。忘记密码无法
 - [android/](android/)：原生 Android 客户端，最低 Android 8.0（API 26）。源码构建需要 **JDK 21**、Android SDK Platform 35 和 Build Tools 35.0.0；私钥和本地历史由 Android Keystore 保护。
 - [deploy/ubuntu/](deploy/ubuntu/)：Ubuntu 24.04 的单实例部署脚本、HTTPS 模板、TURN 配置与升级指南。
 
-本项目目前没有多设备同步、群聊、附件或自动更新。Windows 便携包无商业代码签名，Android 包为调试签名；安装或更新前应核对来源和签名。Android 覆盖更新必须使用与原安装相同的签名，卸载应用或清除数据会丢失本地密钥与历史。
+本项目目前没有多设备同步、群聊、附件或自动更新。Windows 便携包无商业代码签名，Android 正式版使用固定发布签名，旧调试版兼容包继续使用原调试签名；安装或更新前应核对来源和签名。Android 覆盖更新必须使用与原安装相同的签名，卸载应用或清除数据会丢失本地密钥与历史。
 
 ## 从源码运行
 
@@ -43,7 +51,7 @@ Chat 目前一个账号同时只有一个有效设备身份。忘记密码无法
 ```powershell
 cd server
 .\mvnw.cmd -B -ntp clean verify
-java -jar target/chat-server-0.2.3.jar
+java -jar target/chat-server-0.2.5.jar
 ```
 
 另开一个 PowerShell 窗口启动 Windows 客户端：
@@ -57,7 +65,7 @@ npm start
 
 首次使用时将桌面客户端服务器地址设为 `http://127.0.0.1:8082`。Android 构建可在 `android/` 下执行 `.\gradlew.bat assembleDebug testDebugUnitTest lintDebug`，APK 输出在 `android/app/build/outputs/apk/debug/`。Linux/macOS 构建命令与完整环境要求见各组件文档；本项目发布的桌面客户端目标平台为 Windows x64。
 
-部署到远程服务器时，先阅读 [Ubuntu 首次部署](deploy/ubuntu/README.md)；升级现有安装时阅读 [升级指南](deploy/ubuntu/UPGRADE.md)，**先升级服务器，再更新客户端**。服务器 0.2.3 首次启动会执行 V8–V10 数据库迁移；若回滚，必须同时恢复升级前的数据库和服务器 JAR。客户端本地加密存储迁移后也不能直接降级。生产访问需要配置可信 HTTPS；通话跨网络连接通常需要 TURN。服务器目前采用单实例架构，不能直接启动多个实例共享状态。
+部署到远程服务器时，先阅读 [Ubuntu 首次部署](deploy/ubuntu/README.md)；升级现有安装时阅读 [升级指南](deploy/ubuntu/UPGRADE.md)，**先升级服务器，再更新客户端**。服务器 0.2.5 首次启动会执行 V8–V10 数据库迁移；若回滚，必须同时恢复升级前的数据库和服务器 JAR。客户端本地加密存储迁移后也不能直接降级。生产访问需要配置可信 HTTPS；通话跨网络连接通常需要 TURN。服务器目前采用单实例架构，不能直接启动多个实例共享状态。
 
 ## 安全与隐私边界
 
@@ -72,3 +80,7 @@ npm start
 欢迎提交可复现的问题、文档改进和聚焦的 Pull Request。请先阅读[贡献指南](CONTRIBUTING.md)，说明触发条件、修改后的行为、迁移影响和实际运行的验证。加密与协议变更需要兼顾 Windows、Android 和服务器的互通。
 
 项目业务源码采用 [AGPL-3.0-only](LICENSE)；第三方依赖及对应源码信息见 [NOTICE.md](NOTICE.md) 和 [vendor/](vendor/)。Chat 不隶属于 Signal。
+
+### 服务器下载更新
+
+Windows 和 Android 可在设置中从当前服务器检查并下载对应安装包。服务器管理员须先发布客户端包；具体操作见 [服务器发布客户端更新](deploy/ubuntu/CLIENT-UPDATES.md)。下载校验通过后由用户确认更新，正式版和调试版不能互相覆盖。

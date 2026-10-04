@@ -1,7 +1,7 @@
 {
   "name": "chat-client",
   "productName": "Chat",
-  "version": "0.5.8",
+  "version": "0.6.1",
   "description": "Chat desktop client",
   "main": "main.cjs",
   "private": true,

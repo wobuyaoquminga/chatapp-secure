@@ -117,9 +117,20 @@ class AccountRegistry extends Journal {
     if(!this.servers().includes(server))throw new Error('服务器不在已保存列表');
     return this.saveServer(server);
   }
-  remember(server,user) {
-    const accounts=this.list().filter(a=>a.server!==server||a.user!==user);
-    accounts.unshift({server,user});this.write({version:2,accounts,servers:[server,...this.servers().filter(s=>s!==server)],selectedServer:server});return accounts;
+  remember(server,user,accountId) {
+    const currentAccounts=this.list(),previous=currentAccounts.find(a=>a.server===server&&a.user===user);
+    const accounts=currentAccounts.filter(a=>a.server!==server||a.user!==user);
+    const account={server,user};
+    if(accountId){account.accountId=accountId;if(previous?.accountId===accountId&&previous.accountStatus?.accountId===accountId)account.accountStatus=previous.accountStatus;}
+    else if(previous)Object.assign(account,previous);
+    accounts.unshift(account);this.write({version:2,accounts,servers:[server,...this.servers().filter(s=>s!==server)],selectedServer:server});return accounts;
+  }
+  recordStatus(server,user,accountId,status) {
+    const current=this.read()||{},accounts=current.accounts||[];
+    const index=accounts.findIndex(a=>a.server===server&&a.user===user&&a.accountId===accountId);
+    if(index<0)return false;
+    const updated=accounts.map((item,at)=>at===index?{...item,accountStatus:{...status,accountId}}:item);
+    this.write({...current,accounts:updated});return true;
   }
   forget(server,user) {
     const accounts=this.list().filter(a=>a.server!==server||a.user!==user);

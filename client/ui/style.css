@@ -18,6 +18,22 @@
 .callPanel.isMinimized .callVideos.showRemote.selfPrimary #localVideo{inset:0;width:100%;height:100%;border:0;border-radius:0}
 .callPanel.isMinimized .callVideos.showRemote.selfPrimary #remoteVideo{width:28%;height:42%;right:6px;bottom:6px}
 
+/* Connection, delivery and account guidance use the same compact status rhythm. */
+.profile #connection{font-weight:600;color:#a46530}
+.profile #connection.online{color:#27784e}
+.profile .accountDeadline{line-height:1.45;color:#627668;overflow-wrap:anywhere}
+.profile .accountDeadline.urgent{color:#a44d32;font-weight:600}
+.savedAccountDeadline{margin:5px 0 18px;padding:11px 13px;border:1px solid #eadbbd;border-radius:8px;background:#fff9ec;color:#76542a;font-size:12px;line-height:1.55}
+.conversationGuidance{margin:0;padding:11px 24px;border-bottom:1px solid #eadbbd;background:#fff9ec;color:#76542a;font-size:12px;line-height:1.55}
+.meta.failed{color:#ac443f;font-weight:600}
+.retryMessage{display:block;margin-top:7px;padding:6px 10px;font-size:12px;border:1px solid #c77b6b;background:#fff7f5;color:#9b3d37}
+.retryMessage:hover{background:#fbe9e5}
+.retryMessage:disabled{opacity:.55}
+.updates{border-top:1px solid #e2e9e2;margin-top:24px;padding-top:2px}
+.updates .fineprint{margin-top:10px}
+.updates progress{display:block;width:100%;margin-top:12px}.updates progress[hidden]{display:none}
+@media(max-width:700px){.conversationGuidance{padding:10px 12px}}
+
 /* Desktop presentation */
 :root{color:#263b31;background:#eef1ee;font-size:14px}
 body{background:#eef1ee}

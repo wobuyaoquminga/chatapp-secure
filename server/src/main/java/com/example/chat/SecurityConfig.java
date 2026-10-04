@@ -9,6 +9,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -47,7 +48,8 @@ public class SecurityConfig {
     @Bean SecurityFilterChain security(HttpSecurity http) throws Exception {
         return http.csrf(c -> c.disable())
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-            .authorizeHttpRequests(a -> a.requestMatchers("/", "/index.html", "/api/auth/register", "/api/auth/login", "/api/auth/refresh", "/ws", "/error").permitAll().anyRequest().authenticated())
+            .authorizeHttpRequests(a -> a.requestMatchers(HttpMethod.GET, "/api/updates/latest", "/api/updates/files/*").permitAll()
+                .requestMatchers("/", "/index.html", "/api/auth/register", "/api/auth/login", "/api/auth/refresh", "/ws", "/error").permitAll().anyRequest().authenticated())
             .oauth2ResourceServer(o -> o.jwt(j -> {}))
             .headers(h -> h.contentSecurityPolicy(c -> c.policyDirectives("default-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")))
             .build();

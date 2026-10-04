@@ -192,7 +192,7 @@ test('a call that never connects explains the network instead of reporting a nor
   await dropped.element('startAudioCall').onclick();
   dropped.pcs[0].connectionState='connected';dropped.pcs[0].onconnectionstatechange();
   dropped.pcs[0].connectionState='failed';dropped.pcs[0].onconnectionstatechange();
-  assert.equal(dropped.notices.at(-1),'通话连接已结束');
+  assert.equal(dropped.notices.at(-1),'通话连接失败：网络路径已中断，请重拨');
   dropped.calls.close();
 });
 

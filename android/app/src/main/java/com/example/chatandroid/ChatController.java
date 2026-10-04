@@ -1,6 +1,9 @@
 package com.example.chatandroid;
 
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -47,6 +50,9 @@ final class ChatController {
     private final Context context;
     private final Listener listener;
     private final AccountRegistry accounts;
+    private final ConnectivityManager connectivity;
+    private final ConnectivityManager.NetworkCallback networkCallback;
+    private Network connectionNetwork;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private final OkHttpClient client = new OkHttpClient.Builder()
@@ -61,6 +67,7 @@ final class ChatController {
     private String refreshToken, authAccountId;
     private long tokenExpiresAt, authSession;
     private ScheduledFuture<?> refreshTask, refreshAckTimeout;
+    private AccountStatusCache.Deadline accountDeadline;
     private boolean foreground;
     private String visiblePeer = "";
 
@@ -139,7 +146,10 @@ final class ChatController {
     private boolean reconnectPending;
     private final ReconnectBackoff backoff = new ReconnectBackoff();
     private ScheduledFuture<?> reconnectTask;
+    private boolean connecting;
     private ScheduledFuture<?> authTimeout;
+    private final java.util.Map<String,ScheduledFuture<?>> sendConfirmTimers = new java.util.HashMap<>();
+    private final java.util.Set<String> sendTimedOut = new java.util.HashSet<>();
     private SecureVault vault;
     private SignalEngine engine;
     private volatile WebSocket socket;
@@ -268,7 +278,36 @@ final class ChatController {
         this.context = context.getApplicationContext();
         this.listener = listener;
         this.accounts = new AccountRegistry(this.context);
+        connectivity = (ConnectivityManager) this.context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network network) { post(() -> networkChanged()); }
+            @Override public void onLost(Network network) { post(() -> networkChanged()); }
+            @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
+                post(() -> networkChanged());
+            }
+        };
+        if (connectivity != null) {
+            try { connectivity.registerDefaultNetworkCallback(networkCallback); }
+            catch (RuntimeException ignored) { /* Backoff still handles connection failures. */ }
+        }
         worker.execute(() -> publish(""));
+    }
+
+    private void networkChanged() {
+        if (closed || token == null || storageFailed) return;
+        Network active = connectivity == null ? null : connectivity.getActiveNetwork();
+        NetworkCapabilities capabilities = active == null ? null : connectivity.getNetworkCapabilities(active);
+        boolean usable = capabilities != null
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        if (!java.util.Objects.equals(active, connectionNetwork)) {
+            connectionNetwork = active;
+            if (socket != null && (online || connecting)) {
+                socket.cancel();
+                disconnected(generation, 0);
+            }
+        }
+        // A new default network can arrive during a long backoff. Keep one socket attempt.
+        if (usable && reconnectPending && !connecting) connect();
     }
 
     void login(String address, String user, String password, boolean register, boolean allowLanTest) {
@@ -286,6 +325,7 @@ final class ChatController {
                         "POST", credentials);
                 acceptAuth(auth);
                 username = user;
+                accountDeadline = AccountStatusCache.load(context, server, username);
                 vault = new SecureVault(context, server, username);
                 JSONObject saved = vault.read();
                 engine = saved == null ? SignalEngine.create(username) : new SignalEngine(saved);
@@ -401,6 +441,18 @@ final class ChatController {
 
     void send(String peer, String body, String draftKey, long draftRevision) {
         execute(() -> sendBody(peer, body, false, draftKey, draftRevision));
+    }
+
+    void retryPending(String clientId) {
+        execute(() -> {
+            if (engine == null || clientId == null || clientId.isEmpty()) return;
+            JSONObject original = engine.state().getJSONObject("outbox").optJSONObject(clientId);
+            if (original == null) return; // Acknowledgment may have arrived since the tap.
+            if (!online) throw new Exception("连接尚未恢复；恢复后会自动重试这条消息");
+            transaction(() -> { engine.state().getJSONObject("rejectedOutbox").remove(clientId); return null; });
+            if (!wire(original)) throw new Exception("发送未确认；连接恢复后会自动重试");
+            publish("");
+        });
     }
 
     private void sendBody(String peer, String body, boolean transientLocation) throws Exception {
@@ -595,6 +647,10 @@ final class ChatController {
     synchronized void close() {
         if (closed) return;
         closed = true;
+        if (connectivity != null) {
+            try { connectivity.unregisterNetworkCallback(networkCallback); }
+            catch (RuntimeException ignored) { /* Registration may have failed. */ }
+        }
         notifyLocationStopped();
         worker.execute(this::clearSession);
         worker.shutdown();
@@ -644,6 +700,8 @@ final class ChatController {
         cancelAuthTimeout();
         long epoch = ++generation;
         reconnectPending = false;
+        connecting = true;
+        connectionNetwork = connectivity == null ? null : connectivity.getActiveNetwork();
         online = false;
         String wsUrl = (server.startsWith("https://") ? "wss://" : "ws://")
                 + server.substring(server.indexOf("://") + 3) + "/ws";
@@ -702,6 +760,8 @@ final class ChatController {
     private void disconnected(long epoch, int code) {
         if (epoch != generation || reconnectPending || token == null) return;
         cancelAuthTimeout();
+        cancelSendTimers();
+        connecting = false;
         online = false;
         main.post(listener::onCallContextLost);
         stopLiveInternal();
@@ -735,6 +795,7 @@ final class ChatController {
                 return;
             case "ready":
                 cancelAuthTimeout();
+                connecting = false;
                 online = false;
                 try {
                     syncAccountEvents();
@@ -744,8 +805,13 @@ final class ChatController {
                 backoff.reset();
                 status = "在线 · 消息端到端加密";
                 JSONObject outbox = engine.state().getJSONObject("outbox");
+                JSONObject rejected = engine.state().getJSONObject("rejectedOutbox");
                 Iterator<String> ids = outbox.keys();
-                while (ids.hasNext()) wire(outbox.getJSONObject(ids.next()));
+                while (ids.hasNext()) {
+                    String id = ids.next();
+                    if (!rejected.has(id)) wire(outbox.getJSONObject(id));
+                }
+                refreshAccountDeadline();
                 break;
             case "account_deleted":
             case "identity_reset":
@@ -810,6 +876,7 @@ final class ChatController {
                 return;
             case "accepted":
                 transaction(() -> { engine.accepted(event.getJSONObject("message")); return null; });
+                clearSendTimer(event.getJSONObject("message").optString("clientId"));
                 break;
             case "delivered":
                 String id = event.getString("id");
@@ -825,6 +892,15 @@ final class ChatController {
                 });
                 break;
             case "error":
+                String rejectedId = event.optString("clientId", "");
+                if (!rejectedId.isEmpty() && engine.state().getJSONObject("outbox").has(rejectedId)) {
+                    clearSendTimer(rejectedId);
+                    transaction(() -> {
+                        engine.state().getJSONObject("rejectedOutbox").put(rejectedId,
+                                event.optString("error", "服务器拒绝此消息"));
+                        return null;
+                    });
+                }
                 try { refreshContacts(); } catch (Exception ignored) { }
                 publish(event.optString("error", "服务器错误") + "；未确认的密文仍在本地待发队列");
                 return;
@@ -838,9 +914,46 @@ final class ChatController {
         publish("");
     }
 
-    private void wire(JSONObject frame) {
+    private void refreshAccountDeadline() {
+        try {
+            JSONObject response = requestObject("/api/account/status", "GET", null);
+            AccountStatusCache.Deadline deadline = AccountStatusCache.fromServer(response,
+                    System.currentTimeMillis());
+            accountDeadline = deadline;
+            AccountStatusCache.save(context, server, username, deadline);
+        } catch (Exception ignored) {
+            // Older servers return 404. A deadline from a previous connection remains a hint.
+        }
+    }
+
+    private boolean wire(JSONObject frame) {
         WebSocket current = socket;
-        if (current != null && online) current.send(frame.toString());
+        if (current == null || !online || !current.send(frame.toString())) return false;
+        if ("send".equals(frame.optString("type"))) {
+            String id = frame.optString("clientId");
+            clearSendTimer(id);
+            sendConfirmTimers.put(id, worker.schedule(() -> {
+                sendConfirmTimers.remove(id);
+                if (online && engine != null && engine.state().optJSONObject("outbox") != null
+                        && engine.state().optJSONObject("outbox").has(id)) {
+                    sendTimedOut.add(id);
+                    publish("");
+                }
+            }, 30, TimeUnit.SECONDS));
+        }
+        return true;
+    }
+
+    private void clearSendTimer(String id) {
+        ScheduledFuture<?> timer = sendConfirmTimers.remove(id);
+        if (timer != null) timer.cancel(false);
+        sendTimedOut.remove(id);
+    }
+
+    private void cancelSendTimers() {
+        for (ScheduledFuture<?> timer : sendConfirmTimers.values()) timer.cancel(false);
+        sendConfirmTimers.clear();
+        sendTimedOut.clear();
     }
 
     private JSONObject requestObject(String path, String method, JSONObject body) throws Exception {
@@ -886,6 +999,7 @@ final class ChatController {
     private void clearSession() {
         ++authSession;
         cancelRefresh();
+        cancelSendTimers();
         refreshToken = null; authAccountId = null; tokenExpiresAt = 0;
         MessageNotifier.cancelAll(context);
         main.post(listener::onCallContextLost);
@@ -899,6 +1013,8 @@ final class ChatController {
         socket = null;
         if (old != null) old.close(1000, "logout");
         token = null;
+        connectionNetwork = null;
+        accountDeadline = null;
         username = null;
         server = null;
         engine = null;
@@ -908,17 +1024,20 @@ final class ChatController {
             keys.next(); keys.remove();
         }
         online = false;
+        connecting = false;
         reconnectPending = false;
         status = "未登录";
     }
 
     private void stopConnection(String reason, Exception error) {
         cancelRefresh();
+        cancelSendTimers();
         main.post(listener::onCallContextLost);
         ++generation;
         cancelReconnect();
         cancelAuthTimeout();
         online = false;
+        connecting = false;
         reconnectPending = false;
         stopLiveInternal();
         notifyLocationStopped();
@@ -1008,6 +1127,8 @@ final class ChatController {
                     .put("status", status).put("online", online)
                     .put("selectedPeer", selectedPeer)
                     .put("selectedServer", accounts.lastServer()).put("servers", servers);
+            if (accountDeadline != null) snapshot.put("accountExpiresAtLocal", accountDeadline.localExpiryMillis)
+                    .put("accountLastConnectedAt", accountDeadline.lastConnectedAt);
             if (engine != cachedEngine) refreshMessageCache();
             JSONArray messages = cachedMessages;
             snapshot.put("messagesRevision", messagesRevision).put("messagesBaseRevision",messagesBaseRevision).put("messagesAppendFrom",messagesAppendFrom);
@@ -1016,6 +1137,14 @@ final class ChatController {
             TreeSet<String> contacts = new TreeSet<>();
             TreeSet<String> conversations = new TreeSet<>();
             if (engine != null) {
+                JSONObject pendingIds = new JSONObject();
+                for (Iterator<String> ids = engine.state().getJSONObject("outbox").keys(); ids.hasNext();)
+                    pendingIds.put(ids.next(), true);
+                snapshot.put("pendingClientIds", pendingIds);
+                snapshot.put("rejectedClientIds", new JSONObject(engine.state().getJSONObject("rejectedOutbox").toString()));
+                JSONObject timedOutIds = new JSONObject();
+                for (String id : sendTimedOut) timedOutIds.put(id, true);
+                snapshot.put("timedOutClientIds", timedOutIds);
                 snapshot.put("unread", engine.state().optJSONObject("unread") == null ? new JSONObject() : new JSONObject(engine.state().getJSONObject("unread").toString()));
                 snapshot.put("deletedPeers", new JSONObject(engine.state().getJSONObject("deletedPeers").toString()));
                 snapshot.put("identityChanges", new JSONObject(engine.state().getJSONObject("identityChanges").toString()));

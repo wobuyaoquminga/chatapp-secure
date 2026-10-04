@@ -1,4 +1,4 @@
-const {app,BrowserWindow,Notification,ipcMain,safeStorage,session,shell}=require('electron');
+const {app,BrowserWindow,Notification,ipcMain,safeStorage,session,shell,dialog}=require('electron');
 // Some Windows composite camera drivers deliver black frames through Media Foundation.
 // Use Chromium's DirectShow capture path; rendering and video encoding stay accelerated.
 if(process.platform==='win32'){
@@ -12,6 +12,7 @@ const {pathToFileURL}=require('node:url');
 const {Controller}=require('./controller.cjs');
 const {NativeLocation}=require('./native-location.cjs');
 const {MediaLease}=require('./media-permission.cjs');
+const Updates=require('./updates.cjs');
 const nativeLocation=new NativeLocation();
 const profileArg=process.argv.find(a=>a.startsWith('--profile='));
 const profile=profileArg?profileArg.slice(10):'default';
@@ -42,6 +43,7 @@ const testAppData=profile.startsWith('qa-migrate-')&&process.argv.includes('--te
 app.setPath('userData',userDataRoot(testAppData||app.getPath('appData')));
 if(!app.requestSingleInstanceLock()){app.quit();}else{
   let window,controller,geoUntil=0,geoPeer='',geoGeneration=-1;
+  let updateCheck=null,updateDownload=null,completedUpdate=null;
   let incomingNotice,messageNotice;
   const mediaLease=new MediaLease();
   if(process.platform==='win32')app.setAppUserModelId('Chat');
@@ -81,6 +83,40 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
     window.removeMenu();window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
     window.on('focus',()=>{window.flashFrame(false);controller.setForeground(true);});
     window.webContents.on('will-navigate',event=>event.preventDefault());
+    const trusted=event=>event.sender===window.webContents&&event.senderFrame===window.webContents.mainFrame&&event.senderFrame?.url?.toLowerCase()===entryUrl;
+    const updateServer=()=>Updates.origin(controller.snapshot(false).selectedServer||controller.server);
+    const updateCurrent=server=>{try{return updateServer()===server;}catch{return false;}};
+    const cancelUpdate=()=>{updateCheck?.abort();updateDownload?.abort();completedUpdate=null;};
+    ipcMain.handle('chat:check-update',async event=>{
+      if(!trusted(event))throw Error('IPC sender rejected');
+      cancelUpdate();const server=updateServer(),abort=new AbortController();updateCheck=abort;
+      try{const info=await Updates.checkUpdate(server,app.getVersion(),abort.signal);if(abort.signal.aborted||!updateCurrent(server))throw Error('更新服务器已变化，请重新检查');return info;}
+      finally{if(updateCheck===abort)updateCheck=null;}
+    });
+    ipcMain.handle('chat:download-update',async event=>{
+      if(!trusted(event))throw Error('IPC sender rejected');
+      if(updateDownload)throw Error('已有更新包正在下载');
+      const server=updateServer(),abort=new AbortController();updateDownload=abort;completedUpdate=null;
+      try{
+        const info=await Updates.checkUpdate(server,app.getVersion(),abort.signal);
+        if(!info.available)throw Error('当前已是最新版本');
+        if(!updateCurrent(server))throw Error('更新服务器已变化，请重新检查');
+        const selected=await dialog.showSaveDialog(window,{title:'保存 Windows 更新包',defaultPath:path.join(app.getPath('downloads'),info.fileName),buttonLabel:'下载更新包',filters:[{name:'ZIP 更新包',extensions:['zip']}]});
+        if(selected.canceled||!selected.filePath)return {canceled:true};
+        if(abort.signal.aborted||!updateCurrent(server))throw Error('更新服务器已变化，请重新检查');
+        const saved=await Updates.downloadUpdate(server,info,selected.filePath,{signal:abort.signal,isCurrent:()=>updateCurrent(server),onProgress:progress=>{
+          if(!abort.signal.aborted&&updateCurrent(server)&&window&&!window.isDestroyed())window.webContents.send('chat:update-progress',{server,...progress});
+        }});
+        if(abort.signal.aborted||!updateCurrent(server))throw Error('更新服务器已变化，请重新检查');
+        completedUpdate={server,file:saved};return {server,fileName:path.basename(saved)};
+      }finally{if(updateDownload===abort)updateDownload=null;}
+    });
+    ipcMain.handle('chat:cancel-update',async event=>{if(!trusted(event))throw Error('IPC sender rejected');updateDownload?.abort();return true;});
+    ipcMain.handle('chat:open-download',async event=>{
+      if(!trusted(event))throw Error('IPC sender rejected');
+      if(!completedUpdate||!updateCurrent(completedUpdate.server)||!fs.existsSync(completedUpdate.file))throw Error('没有可打开的更新包');
+      shell.showItemInFolder(completedUpdate.file);return true;
+    });
     ipcMain.handle('chat:open-map',async(event,latitude,longitude)=>{
       if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
       if(typeof latitude!=='number'||!Number.isFinite(latitude)||Math.abs(latitude)>90||
@@ -92,12 +128,16 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
       url.searchParams.set('src','Chat');
       await shell.openExternal(url.href);
     });
+    ipcMain.handle('chat:open-updates',async event=>{
+      if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
+      await shell.openExternal('https://github.com/wobuyaoquminga/chatapp-secure/releases/latest');
+    });
     const geoAllowed=(contents,permission,details)=>['geolocation','geolocation-approximate'].includes(permission)&&contents===window.webContents&&Date.now()<geoUntil&&window.isFocused()&&details?.isMainFrame===true&&details.requestingUrl?.toLowerCase()===entryUrl;
     const mediaAllowed=(contents,permission,details)=>permission==='media'&&contents===window.webContents&&window.isFocused()&&mediaLease.allows({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame,mediaTypes:details?.mediaTypes||(details?.mediaType?[details.mediaType]:null),server:controller.server,generation:controller.generation,call:controller.call});
     session.defaultSession.setPermissionRequestHandler((contents,permission,callback,details)=>callback(geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details)));
     session.defaultSession.setPermissionCheckHandler((contents,permission,_origin,details)=>geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details));
     window.on('blur',()=>{controller.setForeground(false);geoUntil=0;mediaLease.revoke();nativeLocation.cancel();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations()).catch(()=>{});});
-    let closing=false;window.on('close',event=>{geoUntil=0;mediaLease.revoke();nativeLocation.cancel();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).catch(()=>{}).finally(()=>window.destroy());});
+    let closing=false;window.on('close',event=>{cancelUpdate();geoUntil=0;mediaLease.revoke();nativeLocation.cancel();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).catch(()=>{}).finally(()=>window.destroy());});
     ipcMain.handle('chat:command',async(event,{action,payload})=>{
       if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
       if((action==='sendLocation'||action==='send'&&payload?.body?.startsWith(require('./ui/features.js').PREFIX))&&!window.isFocused()&&require('./ui/features.js').parse(payload?.body)?.kind!=='stop')return {ok:false,error:'请在应用前台发送位置'};
@@ -119,7 +159,9 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
         }catch(e){return {ok:false,error:e.message};}
       }
       if(action==='revokeCallMediaPermission'){mediaLease.revoke();return {ok:true,value:true};}
-      if(!['beginCall','approveCall','cancelCall','sendCall','callIce','sendLocation','stopLocations','login','send','history','safety','logout','forgetAccount','forgetServer','saveServer','selectServer','addContact','acceptContact','removeContact','clearConversation','openConversation','refreshContacts','snapshot'].includes(action))throw new Error('Unsupported command');
+      if(action==='appInfo')return {ok:true,value:{version:app.getVersion()}};
+      if(!['beginCall','approveCall','cancelCall','sendCall','callIce','sendLocation','stopLocations','login','send','retryMessage','networkRestored','history','safety','logout','forgetAccount','forgetServer','saveServer','selectServer','addContact','acceptContact','removeContact','clearConversation','openConversation','refreshContacts','snapshot'].includes(action))throw new Error('Unsupported command');
+      if(['saveServer','selectServer','forgetServer'].includes(action))cancelUpdate();
       return controller.serial(async()=>{
         try{if(['logout','login','saveServer','selectServer','forgetServer'].includes(action)){geoUntil=0;mediaLease.revoke();nativeLocation.cancel();await controller.stopLocations();}return {ok:true,value:await controller[action](payload)}}catch(e){return {ok:false,error:e.message}}
       });

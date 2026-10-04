@@ -4,5 +4,11 @@ contextBridge.exposeInMainWorld('chat',{
   onLocationStop:callback=>{const listener=()=>callback();ipcRenderer.on('chat:location-stop',listener);return ()=>ipcRenderer.removeListener('chat:location-stop',listener);},
   command:(action,payload)=>ipcRenderer.invoke('chat:command',{action,payload}),
   openMap:(latitude,longitude)=>ipcRenderer.invoke('chat:open-map',latitude,longitude),
+  openUpdates:()=>ipcRenderer.invoke('chat:open-updates'),
+  checkUpdate:()=>ipcRenderer.invoke('chat:check-update'),
+  downloadUpdate:()=>ipcRenderer.invoke('chat:download-update'),
+  cancelUpdate:()=>ipcRenderer.invoke('chat:cancel-update'),
+  openDownload:()=>ipcRenderer.invoke('chat:open-download'),
+  onUpdateProgress:callback=>{const listener=(_event,data)=>callback(data);ipcRenderer.on('chat:update-progress',listener);return ()=>ipcRenderer.removeListener('chat:update-progress',listener);},
   subscribe:callback=>{const listener=(_event,data)=>callback(data);ipcRenderer.on('chat:event',listener);return ()=>ipcRenderer.removeListener('chat:event',listener);}
 });

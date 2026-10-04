@@ -36,6 +36,18 @@ async function run(){
     await b.serial(()=>b.login({server,username:bob,password,register:true}));
     await until(()=>a.online&&b.online,'both online');
   });
+  await check('真实账号期限接口按账号隔离并写入本机受保护缓存',async()=>{
+    await until(()=>a.snapshot(false).accountStatus?.accountId===a.accountId&&b.snapshot(false).accountStatus?.accountId===b.accountId,'cached account status');
+    const statusA=await a.request('/api/account/status'),statusB=await b.request('/api/account/status');
+    for(const value of [statusA,statusB]){
+      assert.equal(value.retentionDays,7);
+      for(const key of ['serverTime','lastConnectedAt','accountExpiresAt'])assert(Number.isFinite(Date.parse(value[key])),key);
+      assert(Date.parse(value.accountExpiresAt)>Date.parse(value.serverTime));
+    }
+    assert.notEqual(a.accountId,b.accountId);
+    assert.equal(a.vault.read().accountStatus.accountId,a.accountId);
+    assert.equal(b.vault.read().accountStatus.accountId,b.accountId);
+  });
   await check('Signal 首条请求与接受前只能发一条',async()=>{
     await a.serial(()=>a.addContact({peer:bob}));
     await a.serial(()=>a.send({peer:bob,body:'首条加密请求'}));
@@ -54,10 +66,11 @@ async function run(){
     await until(()=>contains(a,'已接受后的真实回复')&&contains(b,'双向消息已接通'),'bidirectional messages');
     await until(()=>messages(a).some(m=>m.body==='双向消息已接通'&&m.status==='对方客户端已接收'),'delivery ACK');
   });
-  await check('超过短令牌有效期后原 WebSocket 自动续期且继续加密发送',async()=>{
+  await check('真实续期接口保持原 WebSocket 并继续加密发送',async()=>{
     assert(a.refreshToken&&b.refreshToken,'new server must issue RAM refresh credentials');
     const socketA=a.socket,socketB=b.socket,tokenA=a.token,tokenB=b.token;
-    await delay(12500);
+    assert.equal(await a.serial(()=>a.refreshSession(a.authEpoch)),true);
+    assert.equal(await b.serial(()=>b.refreshSession(b.authEpoch)),true);
     assert.equal(a.socket,socketA);assert.equal(b.socket,socketB);assert(a.online&&b.online);
     assert.notEqual(a.token,tokenA);assert.notEqual(b.token,tokenB);
     await a.serial(()=>a.send({peer:bob,body:'令牌到期自动续期后的加密消息'}));

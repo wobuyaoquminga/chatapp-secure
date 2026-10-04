@@ -5,13 +5,13 @@ const {SignalEngine}=require('./signal.cjs');
 const {Vault,AccountRegistry}=require('./vault.cjs');
 const Location=require('./ui/features.js');
 const validUser=user=>typeof user==='string'&&/^[a-z0-9_\p{Script=Han}]{2,32}$/u.test(user);
-const DEFAULT_CONNECTION_OPTIONS={readyTimeoutMs:30000,heartbeatIntervalMs:30000,pongTimeoutMs:10000,retryBaseMs:1000,retryMaxMs:30000,random:Math.random};
+const DEFAULT_CONNECTION_OPTIONS={readyTimeoutMs:30000,heartbeatIntervalMs:30000,pongTimeoutMs:10000,retryBaseMs:1000,retryMaxMs:30000,ackTimeoutMs:30000,random:Math.random};
 
 class Controller {
   constructor(directory,safeStorage,notify,connectionOptions={}) {
     this.vaults=path.join(directory,'vaults');this.safeStorage=safeStorage;this.notify=notify;
     this.registry=new AccountRegistry(directory,safeStorage);this.queue=Promise.resolve();this.generation=0;
-    this.connectionOptions={...DEFAULT_CONNECTION_OPTIONS,...connectionOptions};this.retryAttempt=0;this.authEpoch=0;this.refreshAttempts=0;
+    this.connectionOptions={...DEFAULT_CONNECTION_OPTIONS,...connectionOptions};this.retryAttempt=0;this.authEpoch=0;this.refreshAttempts=0;this.outboxAckTimers=new Map();
     this.status='未登录';this.online=false;this.contactState={};this.liveSessions=new Map();
     this.call=null;this.messageRevision=0;this.snapshotRevision=0;this.sessionPeers=new Set();this.messageChanges={};this.pendingMessageChanges={};this.serverMessageKeys=new Map();this.unread={};this.activePeer='';this.foreground=false;
   }
@@ -39,6 +39,8 @@ class Controller {
       deletedPeers:this.engine?.state.deletedPeers||{},
       identityChanges:this.engine?.state.identityChanges||{},
       messageRevision:this.messageRevision,unread:{...this.unread},
+      outboxIds:Object.keys(this.engine?.state.outbox||{}),
+      accountStatus:this.engine?.state.accountStatus?.accountId===this.accountId?this.engine.state.accountStatus:null,
       ...(includeMessages?{messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>m) : []}:{messageChanges:{...this.messageChanges,...this.pendingMessageChanges}})};
   }
   rebuildMessageMetadata(){
@@ -146,12 +148,14 @@ class Controller {
       this.vault=new Vault(this.vaults,this.server,username,this.safeStorage);
       const saved=this.vault.read();this.engine=saved ? new SignalEngine(saved) : await SignalEngine.create(username);this.messageRevision++;
       this.rebuildMessageMetadata();this.messageChanges={};this.pendingMessageChanges={};
+      // A cached server deadline belongs to one account incarnation only.
+      if(this.engine.state.accountStatus?.accountId!==this.accountId)this.engine.state.accountStatus=null;
       let own=await this.request('/api/keys/me');
       await this.recoverIdentity(own,password);
       own=await this.request('/api/keys/me');
       this.vault.write(this.engine.state);
       // Keys for this account are now confirmed to live on this device, so it is safe to remember it.
-      try{this.registry.remember(this.server,username);}catch(e){this.listError='账号列表保存失败：'+e.message;}
+      try{this.registry.remember(this.server,username,this.accountId);}catch(e){this.listError='账号列表保存失败：'+e.message;}
       await this.replenish(own);
       await this.syncAccountEvents();
       // Publish the account's baseline before any newer status/delta frame can
@@ -248,6 +252,7 @@ class Controller {
   }
   clearConnectionTimers() {
     clearTimeout(this.retry);clearTimeout(this.readyTimeout);clearTimeout(this.pongTimeout);clearInterval(this.heartbeat);
+    for(const timer of this.outboxAckTimers.values())clearTimeout(timer);this.outboxAckTimers.clear();
     this.retry=this.readyTimeout=this.pongTimeout=this.heartbeat=null;
     this.pingChallenge=null;
   }
@@ -258,6 +263,7 @@ class Controller {
   }
   connect() {
     if(this.storageFailed||this.authFailed||!this.token||!this.server)return;
+    if(this.socket&&this.socket.readyState!==WebSocket.CLOSED)return;
     this.clearConnectionTimers();
     const epoch=++this.generation;
     this.status='连接中';this.online=false;this.update();
@@ -312,11 +318,49 @@ class Controller {
       if(code===1008&&!this.authFailed&&this.refreshToken){if(await this.refreshSession()){this.connect();return;}}
       if(code===1008||this.authFailed){this.status='认证已失效，请退出后重新登录';this.update();return;}
       this.status='离线，正在重连';this.update();
-      this.retry=setTimeout(()=>{if(epoch===this.generation&&!this.storageFailed&&!this.authFailed)this.connect();},this.retryDelay());
+      const delay=this.reconnectImmediately?0:this.retryDelay();this.reconnectImmediately=false;
+      this.retry=setTimeout(()=>{if(epoch===this.generation&&!this.storageFailed&&!this.authFailed)this.connect();},delay);
     }));
     socket.on('error',()=>{});
   }
-  wire(value) {if(this.socket?.readyState===WebSocket.OPEN)this.socket.send(JSON.stringify(value));}
+  networkRestored() {
+    if(!this.user||this.storageFailed||this.authFailed||this.online)return this.snapshot(false);
+    if(this.socket?.readyState===WebSocket.OPEN&&!this.readyTimeout)return this.snapshot(false);
+    if(this.reconnectImmediately)return this.snapshot(false);
+    if(this.socket&&this.socket.readyState!==WebSocket.CLOSED){
+      // A stale handshake can otherwise consume its full timeout after connectivity returns.
+      this.reconnectImmediately=true;this.socket.terminate();return this.snapshot(false);
+    }
+    clearTimeout(this.retry);this.retry=null;this.retryAttempt=0;this.connect();return this.snapshot(false);
+  }
+  async refreshAccountStatus() {
+    const generation=this.generation,accountId=this.accountId;
+    let status;
+    try{status=await this.request('/api/account/status');}catch(error){if(error.status===404)return;throw error;}
+    if(status.retentionDays!==7||![status.serverTime,status.lastConnectedAt,status.accountExpiresAt].every(value=>typeof value==='string'&&Number.isFinite(Date.parse(value))))throw new Error('账号期限响应无效');
+    const cached={...status,accountId,receivedAt:new Date().toISOString()};
+    await this.serial(async()=>{
+      if(generation!==this.generation||accountId!==this.accountId||!this.engine)return;
+      await this.transaction(()=>{this.engine.state.accountStatus=cached;});
+      try{this.registry.recordStatus(this.server,this.user,accountId,cached);}catch(e){this.listError='账号期限摘要保存失败：'+e.message;}
+      this.update();
+    });
+  }
+  wire(value) {if(this.socket?.readyState!==WebSocket.OPEN)return false;this.socket.send(JSON.stringify(value));return true;}
+  clearOutboxAckTimer(clientId){clearTimeout(this.outboxAckTimers.get(clientId));this.outboxAckTimers.delete(clientId);}
+  sendOutbox(item){
+    try{if(!this.wire(item))return false;}catch{return false;}
+    this.clearOutboxAckTimer(item.clientId);
+    const generation=this.generation,clientId=item.clientId;
+    const timer=setTimeout(()=>this.serial(async()=>{
+      this.outboxAckTimers.delete(clientId);
+      if(generation!==this.generation||!this.online||!this.engine?.state.outbox?.[clientId])return;
+      const key=this.user+':'+clientId;
+      await this.transaction(()=>{const message=this.engine.state.messages[key];if(message&&!message.status?.startsWith('发送失败'))message.status='发送失败 · 服务器确认超时';});
+      this.update('服务器确认超时；可对失败消息手动重试');
+    }).catch(error=>this.update(error.message)),this.connectionOptions.ackTimeoutMs);
+    timer.unref?.();this.outboxAckTimers.set(clientId,timer);return true;
+  }
   callPeer(peer) {
     if(!this.online||this.socket?.readyState!==WebSocket.OPEN)throw new Error('通话需要在线连接');
     if(!validUser(peer)||peer===this.user||this.contactState[peer]?.status!=='accepted'||this.engine?.state.deletedPeers?.[peer]||this.engine?.state.identityChanges?.[peer])throw new Error('只能与已接受且身份未变化的联系人通话');
@@ -428,7 +472,11 @@ class Controller {
       await this.syncAccountEvents();
       await this.refreshContacts();
       this.online=true;this.status='在线 · 消息端到端加密';
-      for(const item of Object.values(this.engine.state.outbox))this.wire(item);
+      for(const item of Object.values(this.engine.state.outbox)){
+        const message=this.engine.state.messages[this.user+':'+item.clientId];
+        if(!message?.status?.startsWith('发送失败'))this.sendOutbox(item);
+      }
+      this.refreshAccountStatus().catch(()=>{});
     } else if(['account_deleted','identity_reset'].includes(event.type)) {
       await this.applyAccountEvent({...event.event,kind:event.type});
       await this.request('/api/account-events/ack','POST',{ids:[event.event.id]});
@@ -446,6 +494,7 @@ class Controller {
       }
     } else if(event.type==='accepted') {
       await this.transaction(()=>this.engine.accepted(event.message));
+      this.clearOutboxAckTimer(event.message.clientId);
     } else if(event.type==='delivered') {
       await this.transaction(()=>{
         const key=this.serverMessageKeys.get(event.id),message=key&&this.engine.state.messages[key];
@@ -466,6 +515,11 @@ class Controller {
       if(this.contactState[event.username])this.contactState[event.username].online=!!event.online;
     } else if(event.type==='error') {
       // Keep the same encrypted outbox entry: never re-encrypt a retry.
+      if(event.clientId)this.clearOutboxAckTimer(event.clientId);
+      if(event.clientId&&this.engine.state.outbox[event.clientId])await this.transaction(()=>{
+        const message=this.engine.state.messages[this.user+':'+event.clientId];
+        if(message)message.status='发送失败 · '+String(event.error||'服务器拒绝').slice(0,120);
+      });
       this.update(event.error+'；未确认的密文仍在本地待发队列');return;
     }
     this.update();
@@ -519,7 +573,16 @@ class Controller {
     });
     if(!status)this.contactState[peer]={username:peer,status:'pending_outgoing',online:false};
     if(this.engine.state.hiddenSessions?.[peer])await this.transaction(()=>{delete this.engine.state.hiddenSessions[peer];});
-    this.wire(envelope);this.update();return this.snapshot(false);
+    this.sendOutbox(envelope);this.update();return this.snapshot(false);
+  }
+  async retryMessage({clientId}) {
+    const item=this.engine?.state.outbox?.[clientId],message=this.engine?.state.messages?.[this.user+':'+clientId];
+    if(!item||!message||item.to!==message.recipient)throw new Error('消息已确认或无法重试');
+    if(!this.online||this.socket?.readyState!==WebSocket.OPEN)throw new Error('连接尚未恢复，请稍后重试');
+    if(this.engine.state.deletedPeers?.[item.to]||this.engine.state.identityChanges?.[item.to])throw new Error('联系人身份已变化，请先处理安全码');
+    if(!message.status?.startsWith('发送失败'))throw new Error('消息正在发送，请等待服务器确认');
+    await this.transaction(()=>{this.engine.state.messages[this.user+':'+clientId].status='发送中 · 等待服务器确认';});
+    this.sendOutbox(item);this.update();return this.snapshot(false);
   }
   clearConversation({peer}) {
     if(!this.engine||!validUser(peer)||peer===this.user)throw new Error('先选择一个会话');
@@ -580,7 +643,7 @@ class Controller {
   }
   logout() {
     ++this.authEpoch;clearTimeout(this.refreshTimer);this.refreshTimer=null;this.refreshToken=null;this.accessExpiresAt=null;this.refreshAttempts=0;
-    this.endCall('账号已退出');this.liveSessions.clear();++this.generation;this.clearConnectionTimers();this.socket?.close();this.socket=null;this.retryAttempt=0;this.authFailed=false;
+    this.endCall('账号已退出');this.liveSessions.clear();++this.generation;this.clearConnectionTimers();this.socket?.close();this.socket=null;this.retryAttempt=0;this.reconnectImmediately=false;this.authFailed=false;
     this.user=null;this.accountId=null;this.server=null;this.token=null;this.engine=null;this.vault=null;this.online=false;this.status='未登录';this.contactState={};this.sessionPeers.clear();this.serverMessageKeys.clear();this.messageChanges={};this.pendingMessageChanges={};this.unread={};this.activePeer='';this.messageRevision++;this.update();
   }
 }

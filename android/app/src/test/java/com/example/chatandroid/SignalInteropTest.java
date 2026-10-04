@@ -221,4 +221,45 @@ public class SignalInteropTest {
         invalid.getJSONObject("signedPreKey").put("signature", java.util.Base64.getEncoder().encodeToString(new byte[64]));
         assertThrows(RuntimeException.class, () -> charlie.establish(BOB, invalid));
     }
+
+    @Test public void rejectedUnconfirmedEnvelopeSurvivesRestartUntilMatchingReceipt() throws Exception {
+        SignalEngine alice = SignalEngine.create(ALICE);
+        NodePeer bob = new NodePeer(BOB);
+        alice.establish(BOB, selectedBundle(BOB, bob.publicBundle(1)));
+        JSONObject original = alice.encrypt(BOB, "retry the saved envelope");
+        String clientId = original.getString("clientId");
+        String ciphertext = original.getString("ciphertext");
+        alice.state().getJSONObject("rejectedOutbox").put(clientId, "server rejected");
+
+        SignalEngine recovered = new SignalEngine(new JSONObject(alice.state().toString()));
+        JSONObject retry = recovered.state().getJSONObject("outbox").getJSONObject(clientId);
+        assertEquals(clientId, retry.getString("clientId"));
+        assertEquals(ciphertext, retry.getString("ciphertext"));
+        assertTrue(recovered.state().getJSONObject("rejectedOutbox").has(clientId));
+        assertEquals("retry the saved envelope", bob.decrypt(delivery(retry, ALICE, BOB)).getString("body"));
+
+        JSONObject wrongReceipt = delivery(retry, ALICE, BOB).put("ciphertext", ciphertext + "tampered");
+        assertThrows(SecurityException.class, () -> recovered.accepted(wrongReceipt));
+        assertTrue(recovered.state().getJSONObject("outbox").has(clientId));
+        assertTrue(recovered.state().getJSONObject("rejectedOutbox").has(clientId));
+
+        recovered.accepted(delivery(retry, ALICE, BOB));
+        assertFalse(recovered.state().getJSONObject("outbox").has(clientId));
+        assertFalse(recovered.state().getJSONObject("rejectedOutbox").has(clientId));
+    }
+
+    @Test public void repeatedServerReceiptCannotDowngradeDeviceDelivery() throws Exception {
+        SignalEngine alice = SignalEngine.create(ALICE);
+        NodePeer bob = new NodePeer(BOB);
+        alice.establish(BOB, selectedBundle(BOB, bob.publicBundle(1)));
+        JSONObject request = alice.encrypt(BOB, "delivery stays delivered");
+        String clientId = request.getString("clientId");
+        assertEquals("delivery stays delivered", bob.decrypt(delivery(request, ALICE, BOB)).getString("body"));
+
+        alice.accepted(delivery(request, ALICE, BOB).put("acknowledged", true));
+        alice.accepted(delivery(request, ALICE, BOB));
+        assertEquals("对方客户端已接收", alice.state().getJSONObject("messages")
+                .getJSONObject(ALICE + ":" + clientId).getString("status"));
+        assertFalse(alice.state().getJSONObject("outbox").has(clientId));
+    }
 }

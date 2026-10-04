@@ -204,6 +204,18 @@ class ChatIntegrationTest {
         }
         assertThat(history(a, b.name()).size()).isEqualTo(1);
     }
+    @Test void retryAfterReconnectReturnsOriginalMessageWithoutAnotherDelivery() throws Exception {
+        var a = account(); var b = account(); String clientId = UUID.randomUUID().toString(); String first;
+        try (var alice = new Client(a)) { first = send(alice, b, "retry after lost acceptance", clientId); }
+        try (var alice = new Client(a)) {
+            assertThat(send(alice, b, "retry after lost acceptance", clientId)).isEqualTo(first);
+        }
+        assertThat(history(a, b.name()).size()).isEqualTo(1);
+        try (var bob = new Client(b)) {
+            assertThat(bob.await("message").path("message").path("id").asText()).isEqualTo(first);
+            assertThat(bob.events.poll(400, TimeUnit.MILLISECONDS)).isNull();
+        }
+    }
     @Test void thirdPartyCannotReadOrAckAndSenderCannotBeSpoofed() throws Exception {
         var a = account(); var b = account(); var c = account();
         try (var alice = new Client(a); var attacker = new Client(c)) {

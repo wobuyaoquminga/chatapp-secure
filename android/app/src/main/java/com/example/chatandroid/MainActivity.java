@@ -52,6 +52,11 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private static final int BG = Color.rgb(246, 248, 247);
     private static final int BORDER = Color.rgb(228, 233, 230);
     private ChatController controller;
+    private ServerUpdates serverUpdates;
+    private UpdatePolicy.Release updateRelease;
+    private String updateServer = "", updateMessage = "", updatePhase = "";
+    private int updatePercent = -1;
+    private boolean updateReady;
     private WebRtcCall call;
     private static final int CALL_PERMISSION = 502;
     private String pendingCallMode = "", pendingCallPeer = "";
@@ -69,6 +74,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private final Runnable expiryRefresh = new Runnable() {
         @Override public void run() {
             if (!destroyed && conversationStream != null) refreshLocationCards();
+            if (!destroyed && accountDeadlineView != null) accountDeadlineView.setText(accountDeadlineText());
             if (!destroyed) main.postDelayed(this, 15000);
         }
     };
@@ -93,6 +99,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private LinearLayout conversationStream, messageResults, contactResults;
     private final Map<String, View> messageRows = new HashMap<>(), contactRows = new HashMap<>();
     private TextView conversationStatus;
+    private TextView accountDeadlineView;
     private final Map<String, View> messageViews = new HashMap<>();
     private final Map<String, String> drafts = new HashMap<>();
     private final Map<String, Long> draftRevisions = new HashMap<>();
@@ -134,6 +141,16 @@ public final class MainActivity extends Activity implements ChatController.Liste
         shell.requestApplyInsets();
         render();
         controller = new ChatController(this, this);
+        serverUpdates = new ServerUpdates(this, (generation, address, message, release, percent, ready) -> main.post(() -> {
+            if (destroyed || generation != serverUpdates.generation() || !address.equals(server())) return;
+            updateServer = address;
+            updateMessage = message;
+            updateRelease = release;
+            updatePercent = percent;
+            updateReady = ready;
+            updatePhase = percent >= 0 && !ready ? "downloading" : "";
+            if (page.equals("settings")) render();
+        }));
         call = new WebRtcCall(this, controller);
         locationSharing = new LocationSharing(this, controller, (live, peer, notice) -> main.post(() -> {
             if (!destroyed && notice != null && !notice.isEmpty() && !notice.startsWith("正在分享实时位置")) Toast.makeText(this, notice, Toast.LENGTH_LONG).show();
@@ -189,6 +206,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     @Override protected void onDestroy() {
         if (call != null) call.finish("", true, "hangup");
         destroyed = true;
+        if (serverUpdates != null) serverUpdates.close();
         snapshotGeneration++;
         uiPreparation.shutdownNow();
         main.removeCallbacksAndMessages(null);
@@ -238,6 +256,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         conversationScroll = null;
         conversationStream = null;
         conversationStatus = null;
+        accountDeadlineView = null;
         messageResults = null;
         contactResults = null;
         messageRows.clear();
@@ -357,6 +376,20 @@ public final class MainActivity extends Activity implements ChatController.Liste
             notice.setBackgroundColor(Color.rgb(255, 239, 235));
             header.addView(notice);
         }
+        if (signed && !state.optBoolean("online") && !state.optString("status").equals("连接中")) {
+            TextView reconnect = button("连接失败？检查网络或服务器地址；网络恢复后会自动重连", 12, GREEN,
+                    v -> { page = "settings"; detailPeer = ""; render(); });
+            reconnect.setBackground(rounded(Color.rgb(237, 246, 241), 10, BORDER));
+            header.addView(reconnect);
+        }
+        if (signed && !state.optBoolean("online")) {
+            long expiry = accountDeadlineMillis();
+            if (expiry > 0 && expiry - System.currentTimeMillis() <= 2L * 86400000L) {
+                TextView deadline = hint(accountDeadlineText());
+                deadline.setBackground(rounded(Color.rgb(255, 248, 230), 10, BORDER));
+                header.addView(deadline);
+            }
+        }
     }
 
     private void renderFirstUse() {
@@ -379,7 +412,11 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (accounts.length() == 0) body.addView(hint("此服务器上还没有保存在本设备的账号。"));
         for (int i = 0; i < accounts.length(); i++) {
             String user = accounts.optString(i);
-            if (!user.isEmpty()) body.addView(rowItem(user, "输入密码登录", () -> { loginUser = user; render(); }));
+            if (!user.isEmpty()) {
+                AccountStatusCache.Deadline cached = AccountStatusCache.load(this, server(), user);
+                String note = cached == null ? "输入密码登录" : deadlineText(cached.localExpiryMillis, false);
+                body.addView(rowItem(user, note, () -> { loginUser = user; render(); }));
+            }
         }
         body.addView(space(16));
         body.addView(primary("注册新账号", v -> { loginUser = "__new__"; render(); }), new LinearLayout.LayoutParams(-1, dp(50)));
@@ -586,6 +623,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
             notice.setPadding(dp(16), dp(10), dp(16), dp(10));
             notice.setBackgroundColor(Color.rgb(255, 248, 230));
             body.addView(notice);
+            body.addView(button("打开安全码并核对  ›", 14, GREEN,
+                    v -> controller.safety(detailPeer, false, null)));
         }
         if (relation.equals("pending_incoming")) {
             LinearLayout request = row();
@@ -596,7 +635,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             request.addView(button("同意", 15, GREEN, v -> controller.acceptContact(detailPeer)));
             body.addView(request);
         } else if (relation.equals("pending_outgoing")) {
-            TextView pending = hint("首条消息已发出，等待对方同意后可继续聊天。");
+            TextView pending = hint("首条消息已发出，等待对方在“联系人”页接受；接受后即可继续聊天。");
             pending.setPadding(dp(16), dp(8), dp(16), dp(8));
             body.addView(pending);
         }
@@ -671,6 +710,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         boolean atBottom = conversationAtBottom;
         int previousY = conversationScrollY;
         scroll.post(() -> {
+            if (scroll != conversationScroll) return;
             if (atBottom) scroll.fullScroll(View.FOCUS_DOWN);
             else scroll.scrollTo(0, previousY);
         });
@@ -681,7 +721,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         StringBuilder key = new StringBuilder().append(history.size()).append(':')
                 .append(historyWindow.start).append(':').append(historyWindow.end).append(':');
         for (int i = historyWindow.start; i < Math.min(historyWindow.end, history.size()); i++)
-            key.append(messageIndex.rowKey(detailPeer, i)).append(':');
+            key.append(messageViewKey(i)).append(':');
         return key.toString();
     }
 
@@ -784,7 +824,16 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private String messageViewKey(int index) {
         MessageIndex.LocationCard card = messageIndex.card(detailPeer, index);
-        return index + ":" + messageIndex.rowKey(detailPeer, index) + (card == null ? "" : ":" + card.key());
+        JSONObject item = messageIndex.messages(detailPeer).get(index);
+        JSONObject pending = state.optJSONObject("pendingClientIds");
+        String delivery = pending != null && pending.optBoolean(item.optString("clientId"))
+                ? ":pending:" + state.optBoolean("online") + ':'
+                        + (state.optJSONObject("rejectedClientIds") != null
+                        && state.optJSONObject("rejectedClientIds").has(item.optString("clientId"))) + ':'
+                        + (state.optJSONObject("timedOutClientIds") != null
+                        && state.optJSONObject("timedOutClientIds").has(item.optString("clientId"))) : "";
+        return index + ":" + messageIndex.rowKey(detailPeer, index) + delivery
+                + (card == null ? "" : ":" + card.key());
     }
 
     private View messageBubble(JSONObject item, MessageIndex.LocationCard location) {
@@ -798,9 +847,26 @@ public final class MainActivity extends Activity implements ChatController.Liste
         sentTime.setPadding(0, dp(5), 0, 0);
         bubble.addView(sentTime);
         String status = item.optString("status");
+        String clientId = item.optString("clientId");
+        JSONObject pendingIds = state.optJSONObject("pendingClientIds");
+        boolean pending = outgoing && pendingIds != null && pendingIds.optBoolean(clientId);
+        JSONObject rejectedIds = state.optJSONObject("rejectedClientIds");
+        boolean rejected = pending && rejectedIds != null && rejectedIds.has(clientId);
+        JSONObject timedOutIds = state.optJSONObject("timedOutClientIds");
+        boolean timedOut = pending && timedOutIds != null && timedOutIds.has(clientId);
+        if (rejected) status = "发送失败 · 服务器拒绝（点按重试）";
+        else if (timedOut && state.optBoolean("online")) status = "发送失败 · 未获确认（点按重试）";
+        else if (pending) status = state.optBoolean("online") ? "发送中 · 未确认（点按重试）"
+                : "等待连接恢复 · 将自动重试";
+        else if (outgoing && status.equals("服务器已保存密文")) status = "已送达服务器";
+        else if (outgoing && status.equals("对方客户端已接收")) status = "已送达对方设备";
         if (outgoing && !status.isEmpty()) {
             TextView delivery = text(status, 11, false, MUTED);
             delivery.setPadding(0, dp(5), 0, 0);
+            if (pending) {
+                delivery.setTextColor(GREEN);
+                delivery.setOnClickListener(v -> controller.retryPending(clientId));
+            }
             bubble.addView(delivery);
         }
         LinearLayout line = row();
@@ -1059,6 +1125,9 @@ public final class MainActivity extends Activity implements ChatController.Liste
             body.addView(space(24));
             body.addView(section("当前账号"));
             body.addView(rowItem(state.optString("username"), state.optString("status"), null));
+            accountDeadlineView = hint(accountDeadlineText());
+            body.addView(accountDeadlineView);
+            body.addView(hint("成功连接服务器会续期；离线时显示的是上次查询的预计期限。"));
             body.addView(space(15));
             body.addView(secondary("退出登录", v -> {
                 detailPeer = "";
@@ -1070,16 +1139,114 @@ public final class MainActivity extends Activity implements ChatController.Liste
             }), new LinearLayout.LayoutParams(-1, dp(48)));
         }
         body.addView(space(24));
+        body.addView(section("更新"));
+        body.addView(hint("当前版本 " + BuildConfig.VERSION_NAME + "（" + BuildConfig.VERSION_CODE + "）。服务器安装包会核对大小、SHA256、包名、版本码和签名；安装由系统确认，应用数据会保留。"));
+        body.addView(secondary("检查当前服务器更新", v -> checkServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
+        if (!updateMessage.isEmpty() && server().equals(updateServer)) {
+            body.addView(hint(updateMessage));
+            if (updatePercent >= 0 && !updateReady) body.addView(hint("下载进度：" + updatePercent + "%"));
+        }
+        if (updateRelease != null && server().equals(updateServer)) {
+            if (updateReady) body.addView(primary("安装已验证的更新包", v -> installServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
+            else if ("downloading".equals(updatePhase))
+                body.addView(secondary("取消下载", v -> cancelServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
+            else body.addView(primary("下载 " + updateRelease.version, v -> downloadServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
+        }
+        body.addView(space(8));
+        body.addView(secondary("查看官方最新版本", v -> {
+            Intent link = new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://github.com/wobuyaoquminga/chatapp-secure/releases/latest"));
+            try { startActivity(link); }
+            catch (RuntimeException error) { Toast.makeText(this, "无法打开更新页面", Toast.LENGTH_LONG).show(); }
+        }), new LinearLayout.LayoutParams(-1, dp(48)));
+        body.addView(space(24));
         body.addView(section("使用说明"));
         addGuideItem(body, "开始使用", "首次打开先添加服务器地址，再注册账号或输入密码登录。可在这里保存、切换多个服务器；切换后需登录该服务器的账号。");
         addGuideItem(body, "密码、本机密钥与重新登录", "密码用于登录。私钥和已解密的历史保存在本机，卸载或清除应用数据后无法恢复。只要服务器账号尚未被清理，仍可凭原用户名和密码登录；本机密钥丢失或换设备时会重建加密身份，旧设备会退出。联系人会收到身份更新提示，重新核对并确认安全码后才能继续发送；新身份无法解密旧身份的历史密文。");
         addGuideItem(body, "服务器保存的内容", "服务器仍保存用户名、密码验证信息、公钥和密文消息，直到相应数据按保留规则被清理。服务器不保存本机私钥，也无法解密聊天记录。");
         addGuideItem(body, "开始聊天", "在“消息”页点＋输入对方用户名。首次只能先发一条消息，等对方在“联系人”页同意后才能继续聊天。");
         addGuideItem(body, "联系人与会话", "删除联系人会撤销双方聊天许可，原聊天记录仍保留；再次发消息需要重新同意。“清除”只把会话从列表隐藏，新消息到来或重新打开时会显示。");
-        addGuideItem(body, "在线、接收与离线", "显示“在线”表示已连上服务器。消息标为“对方客户端已接收”表示收到接收确认，不代表对方已阅读。离线时会自动尝试重连；重新连上后领取离线消息。");
+        addGuideItem(body, "在线、接收与离线", "显示“在线”表示已连上服务器。“已送达对方设备”表示收到接收确认，不代表对方已阅读。离线时会自动尝试重连；重新连上后领取离线消息。系统强制停止应用或停止进程后，无法保证新消息和来电提醒；请重新打开应用并确认在线。");
         addGuideItem(body, "核对安全码", "打开聊天中的“安全码”，通过其他可信渠道与对方逐位核对；一致后再确认身份。对方重建身份后旧确认失效，需要重新核对；确认前会暂停向对方发送消息。");
         addGuideItem(body, "7 天未连接清理", "连续 7 天没有成功认证并连上服务器，服务器会删除该账号、服务器保存的公钥和密文消息。登录后显示“在线”才算成功连接；仅打开应用但连接失败不算。本机历史和私钥可能仍在，但无法从服务器恢复已删除的数据。");
         content.addView(scroll);
+    }
+
+    private void checkServerUpdate() {
+        String address = server();
+        if (address.isEmpty() || serverUpdates == null) {
+            Toast.makeText(this, "请先选择服务器", Toast.LENGTH_LONG).show();
+            return;
+        }
+        updateServer = address; updateMessage = "正在检查当前服务器…";
+        updateRelease = null; updateReady = false; updatePercent = -1; updatePhase = "";
+        render();
+        serverUpdates.check(address);
+    }
+
+    private void downloadServerUpdate() {
+        if (serverUpdates == null || updateRelease == null || !server().equals(updateServer)) return;
+        updateMessage = "正在连接下载…"; updatePercent = 0; updatePhase = "downloading";
+        render();
+        serverUpdates.download(updateServer);
+    }
+
+    private void cancelServerUpdate() {
+        if (serverUpdates != null) serverUpdates.cancel();
+        updateMessage = "下载已取消"; updateRelease = null; updateReady = false;
+        updatePercent = -1; updatePhase = "";
+        render();
+    }
+
+    private void installServerUpdate() {
+        if (!updateReady || updateRelease == null || serverUpdates == null || !server().equals(updateServer)) return;
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            updateMessage = "请在系统设置中允许此应用安装更新包，然后返回点击安装。";
+            render();
+            try {
+                startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (RuntimeException error) {
+                Toast.makeText(this, "请在系统设置中允许此应用安装未知应用", Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        final String address = updateServer;
+        final UpdatePolicy.Release release = updateRelease;
+        updateMessage = "正在重新核验安装包…";
+        render();
+        serverUpdates.verifyForInstall(address, release, () -> main.post(() -> {
+            if (destroyed || !address.equals(server()) || !updateReady || updateRelease != release) return;
+            Intent install = new Intent(Intent.ACTION_VIEW);
+            install.setDataAndType(UpdateInstallProvider.uri(this), "application/vnd.android.package-archive");
+            install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            try { startActivity(install); }
+            catch (RuntimeException error) { Toast.makeText(this, "无法打开系统安装界面", Toast.LENGTH_LONG).show(); }
+        }));
+    }
+
+    private String accountDeadlineText() {
+        long expiry = accountDeadlineMillis();
+        return expiry <= 0 ? "暂无法查询账号清理期限；请连接支持查询的服务器。"
+                : deadlineText(expiry, state.optBoolean("online"));
+    }
+
+    private long accountDeadlineMillis() {
+        long expiry = state.optLong("accountExpiresAtLocal", 0);
+        if (expiry <= 0) {
+            AccountStatusCache.Deadline cached = AccountStatusCache.load(this,
+                    server(), state.optString("username"));
+            expiry = cached == null ? 0 : cached.localExpiryMillis;
+        }
+        return expiry;
+    }
+
+    private static String deadlineText(long expiry, boolean online) {
+        long remaining = expiry - System.currentTimeMillis();
+        if (remaining <= 0) return "按上次服务器报告，账号可能已到期；请连接服务器核实。";
+        long hours = (remaining + 3599999L) / 3600000L;
+        String time = hours < 24 ? hours + " 小时" : (hours / 24) + " 天 " + (hours % 24) + " 小时";
+        return "预计距账号清理还有 " + time + (online ? "；保持连接会续期。" : "；离线估算，请重新连接核实。");
     }
 
     private void addGuideItem(LinearLayout body, String title, String description) {
@@ -1235,6 +1402,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
                     lanTest = test.isChecked();
                     loginUser = "";
                     page = "messages";
+                    resetServerUpdate();
                     if (locationSharing != null) locationSharing.stopLive();
                     controller.setServer(value, lanTest);
                 }).create();
@@ -1242,6 +1410,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     private void switchServer(String address) {
+        resetServerUpdate();
         detailPeer = "";
         loginUser = "";
         draft = "";
@@ -1254,7 +1423,20 @@ public final class MainActivity extends Activity implements ChatController.Liste
         new AlertDialog.Builder(this).setTitle("移除服务器？")
                 .setMessage("将从服务器列表移除此地址及本机保存的账号入口。")
                 .setNegativeButton("取消", null)
-                .setPositiveButton("移除", (d, w) -> controller.removeServer(address)).show();
+                .setPositiveButton("移除", (d, w) -> {
+                    if (address.equals(server())) resetServerUpdate();
+                    controller.removeServer(address);
+                }).show();
+    }
+
+    private void resetServerUpdate() {
+        if (serverUpdates != null) serverUpdates.cancel();
+        updateRelease = null;
+        updateServer = "";
+        updateMessage = "";
+        updatePercent = -1;
+        updateReady = false;
+        updatePhase = "";
     }
 
     private JSONArray accounts() {
@@ -1363,7 +1545,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (!detailPeer.isEmpty()) return relation(detailPeer) + ':' + isDeleted(detailPeer) + ':' + identityChanged(detailPeer);
         if (page.equals("contacts") && signedIn()) return messageIndex.contactRows;
         if (page.equals("messages") && signedIn()) return messageIndex.messageRows;
-        if (page.equals("settings")) return state.optString("status") + ':' + state.optJSONArray("servers");
+        if (page.equals("settings")) return state.optString("status") + ':' + state.optJSONArray("servers")
+                + ':' + state.optLong("accountExpiresAtLocal", 0);
         // Background connection notices must not recreate username/password fields.
         return String.valueOf(state.optJSONArray("servers"));
     }
@@ -1383,6 +1566,10 @@ public final class MainActivity extends Activity implements ChatController.Liste
         JSONObject oldChanges = state.optJSONObject("identityChanges");
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
+        if (!previousServer.equals(server())) {
+            if (serverUpdates != null) serverUpdates.cancel();
+            updateRelease = null; updateMessage = ""; updateServer = ""; updatePercent = -1; updateReady = false; updatePhase = "";
+        }
         if (foreground && !wasSigned && signedIn()) { CallNotifier.ensurePermission(this); openNotifiedConversation(); }
         if (call != null && call.busy()) {
             CallSession active = call.session();
@@ -1441,7 +1628,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
             if (messageResults != null) populateMessages(messageResults);
             if (contactResults != null) populateContacts(contactResults);
         }
-        if (conversationStream != null && !oldHistory.equals(visibleHistoryKey())) updateConversationStream(true);
+        if (conversationStream != null && (!oldHistory.equals(visibleHistoryKey())
+                || wasOnline != state.optBoolean("online"))) updateConversationStream(true);
         if (conversationStatus != null) conversationStatus.setText(state.optString("status"));
     }
 

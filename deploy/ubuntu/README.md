@@ -2,20 +2,20 @@
 
 ## 从本机源码构建
 
-源码仓库不包含服务器 JAR。在包含服务器 0.2.3 源码的工作树根目录安装 Java 17 后执行：
+源码仓库不包含服务器 JAR。在包含服务器 0.2.5 源码的工作树根目录安装 Java 17 后执行：
 
 ```sh
 cd server
 bash mvnw -B -ntp clean verify
 cd ..
-cp server/target/chat-server-0.2.3.jar deploy/ubuntu/chat-server.jar
+cp server/target/chat-server-0.2.5.jar deploy/ubuntu/chat-server.jar
 ```
 
 将 `deploy/ubuntu` 整个目录上传到服务器，再执行以下安装步骤。使用发布包中的 `Chat-Ubuntu-Deploy.tar.gz` 时无需重复构建；先按[升级说明](UPGRADE.md)校验同目录 `SHA256.txt`。
 
 如有可绑定的公网 IPv4 地址但暂无域名，安装 Chat 后可运行 `sudo bash enable-ip-https.sh --email admin@example.com --ip 203.0.113.10` 启用可信 IP HTTPS；将示例邮箱和文档专用 IP 换成自己的真实值，详见 [IP HTTPS 说明](IP-HTTPS说明.md)。无需为此购买域名。脚本需要安全组放行 80、443，申请失败须先排查输出，不能当作已上线。
 
-语音和视频通话需要服务器的临时信令接口。只使用默认 STUN 时，严格 NAT 或不同运营商网络可能无法直连；生产环境按根目录[通话说明](../../语音与视频通话.md)运行 `enable-turn.sh`，并在云安全组放行 TCP/UDP 3478、UDP 49160–49200。TURN 不需要开放 Chat 的 8082 端口。重复运行 `enable-turn.sh` 会保留现有共享密钥，避免正在使用的临时凭据提前失效。现有服务器升级到 0.2.3 见[升级说明](UPGRADE.md)；本次升级不要求重配 TURN。
+语音和视频通话需要服务器的临时信令接口。只使用默认 STUN 时，严格 NAT 或不同运营商网络可能无法直连；生产环境按根目录[通话说明](../../语音与视频通话.md)运行 `enable-turn.sh`，并在云安全组放行 TCP/UDP 3478、UDP 49160–49200。TURN 不需要开放 Chat 的 8082 端口。重复运行 `enable-turn.sh` 会保留现有共享密钥，避免正在使用的临时凭据提前失效。现有服务器升级到 0.2.5 见[升级说明](UPGRADE.md)；本次升级不要求重配 TURN。
 
 验证范围和已完成的检查见根目录 `VALIDATION.md`。首次在自己的服务器安装后，还需自行核对证书、公网访问和两个客户端的实际通信。
 
@@ -55,7 +55,7 @@ nginx-https.conf.example 提供 HTTPS 和 WebSocket /ws 反向代理模板。需
 
 ## 维护与更新
 
-日志：`sudo journalctl -u chat -n 80 --no-pager`。重启：`sudo systemctl restart chat`。更新：替换本包 chat-server.jar 后再次运行安装脚本。脚本会短暂停服替换 jar；默认 H2 路径会先保存静止数据快照，启动检查失败时同时恢复数据库、原 jar、服务文件和 chat.env。自定义数据库不提供自动数据回滚，须按升级指南手动恢复后启动原服务。本次 0.2.3 升级会执行 V8–V10 数据库迁移，但安装前仍需停服备份 /var/lib/chat/data 和 /etc/chat/chat.env 到受保护位置，并在备份后恢复旧服务再运行安装脚本，以便安装检查失败时自动恢复原服务。H2 只允许单个服务进程使用同一数据文件，不可复制到另一台服务器后并行写入。不要将 chat.env、数据库或私钥上传到公开位置。
+日志：`sudo journalctl -u chat -n 80 --no-pager`。重启：`sudo systemctl restart chat`。更新：替换本包 chat-server.jar 后再次运行安装脚本。脚本会短暂停服替换 jar；默认 H2 路径会先保存静止数据快照，启动检查失败时同时恢复数据库、原 jar、服务文件和 chat.env。自定义数据库不提供自动数据回滚，须按升级指南手动恢复后启动原服务。本次 0.2.5 升级会执行 V8–V10 数据库迁移，但安装前仍需停服备份 /var/lib/chat/data 和 /etc/chat/chat.env 到受保护位置，并在备份后恢复旧服务再运行安装脚本，以便安装检查失败时自动恢复原服务。H2 只允许单个服务进程使用同一数据文件，不可复制到另一台服务器后并行写入。不要将 chat.env、数据库或私钥上传到公开位置。
 
 首次送达 ACK 满七天的密文每小时分批删除；未送达消息保留到原账号清理规则触发，本机历史不受影响。磁盘空间低于 512 MiB 或 10% 时写入不含消息正文的告警日志。服务器为单实例架构。
 

@@ -39,7 +39,7 @@ public final class SignalEngine {
             throw new IllegalArgumentException("不支持的本地加密状态");
         data = state;
         for (String field : new String[] {"signed", "pre", "kyber", "usedKyber", "sessions",
-                "trusted", "verified", "messages", "outbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents", "identityChanges"}) {
+                "trusted", "verified", "messages", "outbox", "rejectedOutbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents", "identityChanges"}) {
             if (data.optJSONObject(field) == null) put(data, field, new JSONObject());
         }
         if (data.optJSONArray("pendingUpload") == null)
@@ -66,7 +66,7 @@ public final class SignalEngine {
         put(signedMap, "1", encode(signed.serialize()));
         put(state, "signed", signedMap);
         for (String field : new String[] {"pre", "kyber", "usedKyber", "sessions", "trusted",
-                "verified", "messages", "outbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents", "identityChanges"}) put(state, field, new JSONObject());
+                "verified", "messages", "outbox", "rejectedOutbox", "hiddenContacts", "hiddenConversations", "peerAccountIds", "deletedPeers", "appliedAccountEvents", "identityChanges"}) put(state, field, new JSONObject());
         put(state, "nextKey", 1);
         put(state, "pendingUpload", new JSONArray());
         return new SignalEngine(state);
@@ -343,9 +343,12 @@ public final class SignalEngine {
                 !string(local, "recipient").equals(string(message, "recipient")))
             throw new SecurityException("服务器确认与本地消息不一致");
         put(local, "id", message.opt("id"));
-        put(local, "status", message.optBoolean("acknowledged", false)
-                ? "对方客户端已接收" : "服务器已保存密文");
+        // A replayed server receipt must not hide an already observed delivery receipt.
+        if (!"对方客户端已接收".equals(local.optString("status")))
+            put(local, "status", message.optBoolean("acknowledged", false)
+                    ? "对方客户端已接收" : "服务器已保存密文");
         object(data, "outbox").remove(clientId);
+        object(data, "rejectedOutbox").remove(clientId);
     }
 
     /** Only a server deletion proof permits retiring a pinned identity. */

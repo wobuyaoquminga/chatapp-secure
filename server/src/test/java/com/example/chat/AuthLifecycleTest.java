@@ -29,6 +29,37 @@ class AuthLifecycleTest {
         var result=rest.postForEntity("/api/auth/register",Map.of("username","audit_"+UUID.randomUUID().toString().replace("-","").substring(0,14),"password","audit_password_123"),JsonNode.class);
         assertThat(result.getStatusCode()).isEqualTo(HttpStatus.CREATED);return result.getBody();
     }
+    private ResponseEntity<JsonNode> status(String token) {
+        var headers=new HttpHeaders();headers.setBearerAuth(token);
+        return rest.exchange("/api/account/status",HttpMethod.GET,new HttpEntity<>(headers),JsonNode.class);
+    }
+    @Test void accountStatusReadsPersistedDeadlineWithoutRenewingIt() {
+        JsonNode account=account();String user=account.path("username").asText();
+        Instant connected=Instant.now().minusSeconds(3*86400L).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        db.update("UPDATE app_users SET last_connected_at=? WHERE username=?",Timestamp.from(connected),user);
+        String token=account.path("token").asText();
+        for(int i=0;i<2;i++) {
+            var response=status(token);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            JsonNode body=response.getBody();
+            assertThat(body.path("retentionDays").asInt()).isEqualTo(7);
+            assertThat(Instant.parse(body.path("lastConnectedAt").asText())).isEqualTo(connected);
+            assertThat(Instant.parse(body.path("accountExpiresAt").asText())).isEqualTo(connected.plusSeconds(7*86400L));
+            assertThat(Instant.parse(body.path("serverTime").asText())).isBetween(Instant.now().minusSeconds(5),Instant.now().plusSeconds(5));
+        }
+        assertThat(db.queryForObject("SELECT last_connected_at FROM app_users WHERE username=?",Timestamp.class,user).toInstant()).isEqualTo(connected);
+        assertThat(rest.getForEntity("/api/account/status",String.class).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+    @Test void oldTokenCannotReadStatusAfterInactiveAccountIsRecreated() {
+        JsonNode old=account();String user=old.path("username").asText();
+        db.update("UPDATE app_users SET last_connected_at=? WHERE username=?",Timestamp.from(Instant.now().minusSeconds(8*86400L)),user);
+        assertThat(store.deleteIfInactive(user)).isPresent();
+        var replacement=rest.postForEntity("/api/auth/register",Map.of("username",user,"password","replacement_password_123"),JsonNode.class);
+        assertThat(replacement.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(replacement.getBody().path("accountId")).isNotEqualTo(old.path("accountId"));
+        assertThat(status(old.path("token").asText()).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(status(replacement.getBody().path("token").asText()).getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
     @Test void refreshRotatesHashedCredentialAndPreservesIdentity() {
         JsonNode original=account();String credential=original.path("refreshToken").asText();
         assertThat(credential).matches("[A-Za-z0-9_-]{43}");

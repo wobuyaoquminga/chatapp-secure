@@ -16,10 +16,11 @@ fi
 base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -f "$base/chat-server.jar" ]] || { echo '缺少 chat-server.jar' >&2; exit 1; }
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jre-headless openssl curl
+DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jre-headless openssl curl python3
 if ! id chat >/dev/null 2>&1; then useradd --system --home-dir /var/lib/chat --shell /usr/sbin/nologin chat; fi
-install -d -m 0755 /opt/chat
+install -d -o root -g root -m 0755 /opt/chat
 install -d -o chat -g chat -m 0700 /var/lib/chat /var/lib/chat/data
+install -d -o root -g root -m 0755 /opt/chat/updates /opt/chat/updates/releases
 install -d -o root -g root -m 0700 /etc/chat
 if [[ ! -f /etc/chat/chat.env ]]; then
   jwt=$(openssl rand -hex 32)
@@ -33,6 +34,7 @@ DB_USER=sa
 DB_PASSWORD=$dbpass
 JWT_SECRET=$jwt
 CHAT_ALLOWED_ORIGINS=http://localhost:8082,http://127.0.0.1:8082,http://127.0.0.1:18082,http://localhost:18082
+CHAT_UPDATES_DIRECTORY=/opt/chat/updates
 EOF
   unset jwt dbpass
 fi
@@ -93,6 +95,9 @@ rollback() {
   exit "$status"
 }
 trap rollback EXIT
+if ! grep -q '^CHAT_UPDATES_DIRECTORY=' /etc/chat/chat.env; then
+  printf '\nCHAT_UPDATES_DIRECTORY=/opt/chat/updates\n' >> /etc/chat/chat.env
+fi
 if [[ -n "$origin" ]]; then
   sed -i "s|^CHAT_ALLOWED_ORIGINS=.*|CHAT_ALLOWED_ORIGINS=$origin|" /etc/chat/chat.env
 fi

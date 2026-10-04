@@ -35,6 +35,21 @@ test('account registry keeps one entry per server and account, most recent first
     assert.deepEqual(new AccountRegistry(dir,fake).list().map(a=>a.server),['https://chat.example.com']);
   }finally{for(const f of fs.readdirSync(dir))fs.unlinkSync(path.join(dir,f));fs.rmdirSync(dir);}
 });
+test('protected account index preserves deadline summary only for the same account incarnation',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'chat-vault-'));
+  try{
+    const registry=new AccountRegistry(dir,fake),server='https://chat.example.com',status={serverTime:'2026-10-03T00:00:00Z',lastConnectedAt:'2026-10-03T00:00:00Z',accountExpiresAt:'2026-10-10T00:00:00Z',retentionDays:7,receivedAt:'2026-10-03T00:00:01Z'};
+    registry.remember(server,'alice','account-one');
+    assert.equal(registry.recordStatus(server,'alice','wrong-account',status),false);
+    assert.equal(registry.list()[0].accountStatus,undefined);
+    assert.equal(registry.recordStatus(server,'alice','account-one',status),true);
+    registry.saveServer('https://other.example');
+    registry.remember(server,'alice','account-one');
+    assert.equal(new AccountRegistry(dir,fake).list()[0].accountStatus.accountExpiresAt,status.accountExpiresAt);
+    registry.remember(server,'alice','account-two');
+    assert.equal(registry.list()[0].accountStatus,undefined,'new registration clears old deadline');
+  }finally{for(const f of fs.readdirSync(dir))fs.unlinkSync(path.join(dir,f));fs.rmdirSync(dir);}
+});
 test('a corrupt account list never blocks the keys of an account vault',()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'chat-vault-'));
   try{
