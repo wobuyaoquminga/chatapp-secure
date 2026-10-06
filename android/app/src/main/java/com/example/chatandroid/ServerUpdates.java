@@ -49,7 +49,8 @@ final class ServerUpdates {
         this.listener = listener;
     }
 
-    void check(String server) {
+    synchronized void check(String server) {
+        if (closed) return;
         cancel();
         final long task = generation;
         worker.execute(() -> {
@@ -64,7 +65,9 @@ final class ServerUpdates {
                 String platform = UpdatePolicy.platform(BuildConfig.DEBUG);
                 URI endpoint = UpdatePolicy.endpoint(origin, "/api/updates/latest?platform=" + platform);
                 Request request = new Request.Builder().url(endpoint.toString()).header("Accept", "application/json").build();
-                Call call = http.newCall(request); active = call;
+                Call call = http.newCall(request);
+                call.timeout().timeout(30, TimeUnit.SECONDS);
+                activate(task, call);
                 try (Response response = call.execute()) {
                     ensureCurrent(task);
                     if (response.code() == 404) { report(task, server, "当前服务器暂无此渠道更新包", null, -1, false); return; }
@@ -82,8 +85,11 @@ final class ServerUpdates {
                         int installed = (int) installedVersion();
                         UpdatePolicy.Release release = UpdatePolicy.parse(new JSONObject(new String(raw, java.nio.charset.StandardCharsets.UTF_8)), platform, installed);
                         UpdatePolicy.endpoint(origin, release.downloadPath);
-                        available = release;
-                        availableServer = server;
+                        synchronized (this) {
+                            ensureCurrent(task);
+                            available = release;
+                            availableServer = server;
+                        }
                         String notes = release.notes.isEmpty() ? "" : "\n" + release.notes;
                         report(task, server, "发现新版本 " + release.version + "（" + release.versionCode + "）" + notes, release, -1, false);
                     }
@@ -92,7 +98,8 @@ final class ServerUpdates {
         });
     }
 
-    void download(String server) {
+    synchronized void download(String server) {
+        if (closed) return;
         UpdatePolicy.Release release = available;
         if (release == null || !server.equals(availableServer)) return;
         cancelCallOnly();
@@ -106,7 +113,8 @@ final class ServerUpdates {
                 if (!folder().isDirectory() && !folder().mkdirs()) throw new Exception("无法创建下载目录");
                 if (temporary.exists() && !temporary.delete()) throw new Exception("无法清理旧下载文件");
                 Request request = new Request.Builder().url(url.toString()).header("Accept", "application/vnd.android.package-archive").build();
-                Call call = http.newCall(request); active = call;
+                Call call = http.newCall(request);
+                activate(task, call);
                 try (Response response = call.execute()) {
                     ensureCurrent(task);
                     if (!response.isSuccessful() || response.body() == null) throw new Exception("下载失败：HTTP " + response.code());
@@ -136,7 +144,8 @@ final class ServerUpdates {
                         ensureCurrent(task);
                         File target = installedFile();
                         Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                        context.getSharedPreferences("verified_update", 0).edit().putString("sha256", release.sha256).commit();
+                        if (!context.getSharedPreferences("verified_update", 0).edit().putString("sha256", release.sha256).commit())
+                            throw new Exception("无法保存安装包验证结果，请重新下载");
                     }
                     report(task, server, "已验证安装包：" + release.version + "。点击安装后由系统确认。", release, 100, true);
                 } finally { if (active == call) active = null; }
@@ -153,7 +162,8 @@ final class ServerUpdates {
         availableServer = "";
     }
 
-    void verifyForInstall(String server, UpdatePolicy.Release release, Runnable success) {
+    synchronized void verifyForInstall(String server, UpdatePolicy.Release release, Runnable success) {
+        if (closed) return;
         if (release == null || available != release || !server.equals(availableServer)) return;
         final long task = generation;
         worker.execute(() -> {
@@ -166,8 +176,12 @@ final class ServerUpdates {
         });
     }
 
+    private synchronized void activate(long task, Call call) throws Exception {
+        ensureCurrent(task);
+        active = call;
+    }
     private void cancelCallOnly() { Call call = active; if (call != null) call.cancel(); }
-    void close() { closed = true; generation++; cancelCallOnly(); worker.shutdownNow(); }
+    synchronized void close() { closed = true; generation++; cancelCallOnly(); worker.shutdownNow(); }
     File installedFile() { return new File(folder(), "verified-update.apk"); }
     private File folder() { return new File(context.getFilesDir(), "updates"); }
 

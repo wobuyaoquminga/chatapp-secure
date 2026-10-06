@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.widget.Toast;
 import android.app.AlertDialog;
 import android.graphics.Color;
+import android.graphics.Bitmap;
 import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -30,16 +31,24 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.ImageView;
+import android.widget.VideoView;
+import android.widget.MediaController;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.io.File;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.Collections;
+import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -66,6 +75,17 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private long pendingReadyContext;
     private boolean callToolsExpanded, callPreparing;
     private LinearLayout callActions;
+    private LinearLayout fileActions;
+    private TextView fileSendButton, fileStatusView;
+    private final Set<TextView> fileSaveButtons = Collections.newSetFromMap(new WeakHashMap<>());
+    private boolean fileBusy;
+    private long fileUiContext;
+    private String fileNotice = "";
+    private AlertDialog mediaDialog;
+    private static final int PICK_FILE = 503, SAVE_FILE = 504;
+    private String pendingFilePeer = "", pendingFileServer = "", pendingFileUser = "", pendingFileBody = "";
+    private String pendingFileType = "*/*";
+    private long pendingFileContext;
     private LocationSharing locationSharing;
     private String pendingLocationPeer = "", pendingLocationAction = "";
     private static final int LOCATION_PERMISSION = 501;
@@ -100,6 +120,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private final Map<String, View> messageRows = new HashMap<>(), contactRows = new HashMap<>();
     private TextView conversationStatus;
     private TextView accountDeadlineView;
+    private TextView settingsAccountStatus, updateMessageView, updateCheckButton, updateActionButton, updateCancelButton;
+    private ProgressBar updateProgressView;
     private final Map<String, View> messageViews = new HashMap<>();
     private final Map<String, String> drafts = new HashMap<>();
     private final Map<String, Long> draftRevisions = new HashMap<>();
@@ -149,7 +171,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             updatePercent = percent;
             updateReady = ready;
             updatePhase = percent >= 0 && !ready ? "downloading" : "";
-            if (page.equals("settings")) render();
+            refreshUpdatePanel();
         }));
         call = new WebRtcCall(this, controller);
         locationSharing = new LocationSharing(this, controller, (live, peer, notice) -> main.post(() -> {
@@ -206,6 +228,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
     @Override protected void onDestroy() {
         if (call != null) call.finish("", true, "hangup");
         destroyed = true;
+        dismissMedia();
+        pendingFilePeer = pendingFileBody = "";
         if (serverUpdates != null) serverUpdates.close();
         snapshotGeneration++;
         uiPreparation.shutdownNow();
@@ -257,6 +281,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
         conversationStream = null;
         conversationStatus = null;
         accountDeadlineView = null;
+        settingsAccountStatus = updateMessageView = updateCheckButton = updateActionButton = updateCancelButton = null;
+        updateProgressView = null;
         messageResults = null;
         contactResults = null;
         messageRows.clear();
@@ -689,6 +715,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         TextView callToggle = button("＋", 27, GREEN, v -> {
             callToolsExpanded = !callToolsExpanded;
             if (callActions != null) callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
+            if (fileActions != null) fileActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
         });
         callToggle.setContentDescription("展开聊天功能");
         bar.addView(callToggle, new LinearLayout.LayoutParams(dp(48), dp(48)));
@@ -706,6 +733,22 @@ public final class MainActivity extends Activity implements ChatController.Liste
                 new LinearLayout.LayoutParams(0, dp(48), 1));
         callActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
         body.addView(callActions);
+        fileActions = row();
+        fileActions.setBackgroundColor(BG);
+        fileActions.setPadding(dp(12), 0, dp(12), dp(8));
+        boolean maySendFile = "accepted".equals(relation) && !deleted && !identityChanged(detailPeer)
+                && state.optBoolean("online") && !fileBusy;
+        fileSendButton = button("发送文件", 13, GREEN, v -> new AlertDialog.Builder(this)
+                .setItems(new String[]{"文件", "图片", "视频"}, (dialog, choice) -> pickFile(choice == 0 ? "*/*" : choice == 1 ? "image/*" : "video/*"))
+                .show());
+        fileSendButton.setEnabled(maySendFile);
+        fileSendButton.setTextColor(maySendFile ? GREEN : MUTED);
+        fileActions.addView(fileSendButton, new LinearLayout.LayoutParams(dp(100), dp(44)));
+        fileStatusView = text(fileNotice, 12, false, MUTED);
+        fileStatusView.setGravity(Gravity.CENTER_VERTICAL);
+        fileActions.addView(fileStatusView, new LinearLayout.LayoutParams(0, dp(44), 1));
+        fileActions.setVisibility(callToolsExpanded ? View.VISIBLE : View.GONE);
+        body.addView(fileActions);
         content.addView(body);
         boolean atBottom = conversationAtBottom;
         int previousY = conversationScrollY;
@@ -841,7 +884,26 @@ public final class MainActivity extends Activity implements ChatController.Liste
         LinearLayout bubble = column();
         bubble.setPadding(dp(13), dp(9), dp(13), dp(9));
         bubble.setBackground(rounded(outgoing ? Color.rgb(214, 246, 220) : Color.WHITE, 14, BORDER));
-        if (location == null) bubble.addView(text(item.optString("body"), 16, false, INK));
+        String body = item.optString("body");
+        FilePayload file = FilePayload.parse(body);
+        if (file != null) {
+            MediaPayload.Kind kind = MediaPayload.kind(file.name);
+            bubble.addView(text((kind == MediaPayload.Kind.IMAGE ? "图片 · "
+                    : kind == MediaPayload.Kind.VIDEO ? "视频 · " : "文件 · ")
+                    + file.name + " · " + file.size + " 字节", 15, false, INK));
+            if (kind != MediaPayload.Kind.FILE) {
+                TextView preview = button(kind == MediaPayload.Kind.IMAGE ? "查看图片" : "播放视频", 13, GREEN,
+                        v -> previewFile(body));
+                preview.setEnabled(!fileBusy);
+                fileSaveButtons.add(preview);
+                bubble.addView(preview);
+            }
+            TextView save = button("保存文件", 13, GREEN, v -> saveFile(file, body));
+            save.setEnabled(!fileBusy);
+            fileSaveButtons.add(save);
+            bubble.addView(save);
+        } else if (body.startsWith(FilePayload.PREFIX)) bubble.addView(text("文件消息无效", 15, false, MUTED));
+        else if (location == null) bubble.addView(text(body, 16, false, INK));
         else addLocationCard(bubble, location);
         TextView sentTime = text(MessageTime.format(item.optString("createdAt", "")), 11, false, MUTED);
         sentTime.setPadding(0, dp(5), 0, 0);
@@ -1124,12 +1186,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (signedIn()) {
             body.addView(space(24));
             body.addView(section("当前账号"));
-            body.addView(rowItem(state.optString("username"), state.optString("status"), null));
+            View accountRow = rowItem(state.optString("username"), state.optString("status"), null);
+            settingsAccountStatus = (TextView) ((LinearLayout) ((LinearLayout) accountRow).getChildAt(1)).getChildAt(1);
+            body.addView(accountRow);
             accountDeadlineView = hint(accountDeadlineText());
             body.addView(accountDeadlineView);
             body.addView(hint("成功连接服务器会续期；离线时显示的是上次查询的预计期限。"));
             body.addView(space(15));
             body.addView(secondary("退出登录", v -> {
+                dismissMedia();
                 detailPeer = "";
                 loginUser = "";
                 draft = "";
@@ -1141,17 +1206,21 @@ public final class MainActivity extends Activity implements ChatController.Liste
         body.addView(space(24));
         body.addView(section("更新"));
         body.addView(hint("当前版本 " + BuildConfig.VERSION_NAME + "（" + BuildConfig.VERSION_CODE + "）。服务器安装包会核对大小、SHA256、包名、版本码和签名；安装由系统确认，应用数据会保留。"));
-        body.addView(secondary("检查当前服务器更新", v -> checkServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
-        if (!updateMessage.isEmpty() && server().equals(updateServer)) {
-            body.addView(hint(updateMessage));
-            if (updatePercent >= 0 && !updateReady) body.addView(hint("下载进度：" + updatePercent + "%"));
-        }
-        if (updateRelease != null && server().equals(updateServer)) {
-            if (updateReady) body.addView(primary("安装已验证的更新包", v -> installServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
-            else if ("downloading".equals(updatePhase))
-                body.addView(secondary("取消下载", v -> cancelServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
-            else body.addView(primary("下载 " + updateRelease.version, v -> downloadServerUpdate()), new LinearLayout.LayoutParams(-1, dp(48)));
-        }
+        updateCheckButton = secondary("检查当前服务器更新", v -> checkServerUpdate());
+        body.addView(updateCheckButton, new LinearLayout.LayoutParams(-1, dp(48)));
+        updateMessageView = hint("");
+        body.addView(updateMessageView);
+        updateProgressView = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        updateProgressView.setMax(100);
+        body.addView(updateProgressView, new LinearLayout.LayoutParams(-1, dp(8)));
+        updateActionButton = primary("", v -> {
+            if (updateReady) installServerUpdate();
+            else downloadServerUpdate();
+        });
+        body.addView(updateActionButton, new LinearLayout.LayoutParams(-1, dp(48)));
+        updateCancelButton = secondary("取消下载", v -> cancelServerUpdate());
+        body.addView(updateCancelButton, new LinearLayout.LayoutParams(-1, dp(48)));
+        refreshUpdatePanel();
         body.addView(space(8));
         body.addView(secondary("查看官方最新版本", v -> {
             Intent link = new Intent(Intent.ACTION_VIEW,
@@ -1168,8 +1237,135 @@ public final class MainActivity extends Activity implements ChatController.Liste
         addGuideItem(body, "联系人与会话", "删除联系人会撤销双方聊天许可，原聊天记录仍保留；再次发消息需要重新同意。“清除”只把会话从列表隐藏，新消息到来或重新打开时会显示。");
         addGuideItem(body, "在线、接收与离线", "显示“在线”表示已连上服务器。“已送达对方设备”表示收到接收确认，不代表对方已阅读。离线时会自动尝试重连；重新连上后领取离线消息。系统强制停止应用或停止进程后，无法保证新消息和来电提醒；请重新打开应用并确认在线。");
         addGuideItem(body, "核对安全码", "打开聊天中的“安全码”，通过其他可信渠道与对方逐位核对；一致后再确认身份。对方重建身份后旧确认失效，需要重新核对；确认前会暂停向对方发送消息。");
+        addGuideItem(body, "文件传输", "在聊天的＋菜单发送文件，最大 10 MiB；文件在服务器保留 7 天。发送前需双方接受联系人请求并核对安全码。收到文件后点“保存文件”选择系统保存位置。");
         addGuideItem(body, "7 天未连接清理", "连续 7 天没有成功认证并连上服务器，服务器会删除该账号、服务器保存的公钥和密文消息。登录后显示“在线”才算成功连接；仅打开应用但连接失败不算。本机历史和私钥可能仍在，但无法从服务器恢复已删除的数据。");
         content.addView(scroll);
+    }
+
+    private void pickFile(String type) {
+        if (fileBusy || !signedIn() || !"accepted".equals(relation(detailPeer))
+                || isDeleted(detailPeer) || identityChanged(detailPeer)) return;
+        pendingFilePeer = detailPeer;
+        pendingFileServer = server();
+        pendingFileUser = state.optString("username");
+        pendingFileBody = "";
+        pendingFileType = type;
+        pendingFileContext = controller.locationContext();
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.setType("media".equals(type) ? "*/*" : type);
+        if ("media".equals(type)) intent.putExtra(Intent.EXTRA_MIME_TYPES,
+                new String[]{"image/jpeg", "image/png", "image/gif", "image/webp", "video/mp4", "video/webm"});
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        try { startActivityForResult(intent, PICK_FILE); }
+        catch (Exception unavailable) { pendingFilePeer = ""; showError("无法打开系统文件选择器"); }
+    }
+
+    private void previewFile(String body) {
+        if (fileBusy || !signedIn()) return;
+        dismissMedia();
+        controller.previewFile(detailPeer, body, controller.locationContext());
+    }
+
+    @Override public void onMediaReady(Bitmap image, File video, long context, String peer) {
+        if (destroyed || !signedIn() || context != controller.locationContext() || !peer.equals(detailPeer)) {
+            if (image != null) image.recycle();
+            controller.releaseMedia(video);
+            return;
+        }
+        dismissMedia();
+        if (image != null) {
+            ImageView view = new ImageView(this);
+            view.setImageBitmap(image);
+            view.setAdjustViewBounds(true);
+            view.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            view.setMaxHeight(dp(520));
+            mediaDialog = new AlertDialog.Builder(this).setTitle("图片预览").setView(view)
+                    .setPositiveButton("关闭", null).create();
+            AlertDialog imageDialog = mediaDialog;
+            imageDialog.setOnDismissListener(dialog -> {
+                view.setImageDrawable(null);
+                if (!image.isRecycled()) image.recycle();
+                if (mediaDialog == imageDialog) mediaDialog = null;
+            });
+            mediaDialog.show();
+            return;
+        }
+        if (video == null) return;
+        VideoView player = new VideoView(this);
+        player.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(300)));
+        MediaController controls = new MediaController(this);
+        controls.setAnchorView(player);
+        player.setMediaController(controls);
+        mediaDialog = new AlertDialog.Builder(this).setTitle("视频播放")
+                .setView(player).setPositiveButton("关闭", null).create();
+        AlertDialog videoDialog = mediaDialog;
+        videoDialog.setOnDismissListener(dialog -> {
+            player.stopPlayback();
+            controller.releaseMedia(video);
+            if (mediaDialog == videoDialog) mediaDialog = null;
+        });
+        player.setOnPreparedListener(media -> {
+            if (mediaDialog == videoDialog && videoDialog.isShowing()) player.start();
+        });
+        player.setOnErrorListener((media, what, extra) -> {
+            if (mediaDialog == videoDialog && videoDialog.isShowing()) {
+                Toast.makeText(this, "无法播放此格式，可另存文件", Toast.LENGTH_LONG).show();
+                videoDialog.dismiss();
+            }
+            return true;
+        });
+        mediaDialog.show();
+        player.setVideoURI(Uri.fromFile(video));
+    }
+
+    private void dismissMedia() {
+        if (mediaDialog != null) mediaDialog.dismiss();
+    }
+
+    private void saveFile(FilePayload file, String body) {
+        if (fileBusy || !signedIn()) return;
+        pendingFilePeer = detailPeer;
+        pendingFileServer = server();
+        pendingFileUser = state.optString("username");
+        pendingFileBody = body;
+        pendingFileContext = controller.locationContext();
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.setType("application/octet-stream");
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.putExtra(Intent.EXTRA_TITLE, file.name);
+        try { startActivityForResult(intent, SAVE_FILE); }
+        catch (Exception unavailable) { pendingFilePeer = pendingFileBody = ""; showError("无法打开系统保存位置选择器"); }
+    }
+
+    @Override public void onFileState(String notice, boolean busy) {
+        if (destroyed) return;
+        if (!busy && (notice.contains("格式不支持") || notice.contains("尺寸不支持")))
+            Toast.makeText(this, notice, Toast.LENGTH_LONG).show();
+        fileBusy = busy;
+        if (busy) fileUiContext = controller.locationContext();
+        fileNotice = notice;
+        if (fileStatusView != null) fileStatusView.setText(notice);
+        if (fileSendButton != null) {
+            boolean enabled = !busy && state.optBoolean("online") && "accepted".equals(relation(detailPeer))
+                    && !identityChanged(detailPeer) && !isDeleted(detailPeer);
+            fileSendButton.setEnabled(enabled);
+            fileSendButton.setTextColor(enabled ? GREEN : MUTED);
+        }
+        for (TextView save : fileSaveButtons) save.setEnabled(!busy);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_FILE && requestCode != SAVE_FILE) return;
+        String peer = pendingFilePeer, body = pendingFileBody;
+        boolean same = !destroyed && !peer.isEmpty() && pendingFileContext == controller.locationContext()
+                && pendingFileServer.equals(server()) && pendingFileUser.equals(state.optString("username"))
+                && peer.equals(detailPeer);
+        pendingFilePeer = pendingFileBody = "";
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if (!same) { showError("账号或会话已改变，请重新选择文件"); return; }
+        if (requestCode == PICK_FILE) controller.sendFile(peer, data.getData(), pendingFileContext, pendingFileType);
+        else controller.saveFile(peer, body, data.getData(), pendingFileContext);
     }
 
     private void checkServerUpdate() {
@@ -1178,16 +1374,17 @@ public final class MainActivity extends Activity implements ChatController.Liste
             Toast.makeText(this, "请先选择服务器", Toast.LENGTH_LONG).show();
             return;
         }
+        if (updateBusy()) return;
         updateServer = address; updateMessage = "正在检查当前服务器…";
-        updateRelease = null; updateReady = false; updatePercent = -1; updatePhase = "";
-        render();
+        updateRelease = null; updateReady = false; updatePercent = -1; updatePhase = "checking";
+        refreshUpdatePanel();
         serverUpdates.check(address);
     }
 
     private void downloadServerUpdate() {
-        if (serverUpdates == null || updateRelease == null || !server().equals(updateServer)) return;
+        if (serverUpdates == null || updateRelease == null || !server().equals(updateServer) || updateBusy()) return;
         updateMessage = "正在连接下载…"; updatePercent = 0; updatePhase = "downloading";
-        render();
+        refreshUpdatePanel();
         serverUpdates.download(updateServer);
     }
 
@@ -1195,14 +1392,14 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (serverUpdates != null) serverUpdates.cancel();
         updateMessage = "下载已取消"; updateRelease = null; updateReady = false;
         updatePercent = -1; updatePhase = "";
-        render();
+        refreshUpdatePanel();
     }
 
     private void installServerUpdate() {
-        if (!updateReady || updateRelease == null || serverUpdates == null || !server().equals(updateServer)) return;
+        if (!updateReady || updateRelease == null || serverUpdates == null || !server().equals(updateServer) || updateBusy()) return;
         if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
             updateMessage = "请在系统设置中允许此应用安装更新包，然后返回点击安装。";
-            render();
+            refreshUpdatePanel();
             try {
                 startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                         Uri.parse("package:" + getPackageName())));
@@ -1214,15 +1411,43 @@ public final class MainActivity extends Activity implements ChatController.Liste
         final String address = updateServer;
         final UpdatePolicy.Release release = updateRelease;
         updateMessage = "正在重新核验安装包…";
-        render();
+        updatePhase = "verifying";
+        refreshUpdatePanel();
         serverUpdates.verifyForInstall(address, release, () -> main.post(() -> {
             if (destroyed || !address.equals(server()) || !updateReady || updateRelease != release) return;
+            updatePhase = "";
+            refreshUpdatePanel();
             Intent install = new Intent(Intent.ACTION_VIEW);
             install.setDataAndType(UpdateInstallProvider.uri(this), "application/vnd.android.package-archive");
             install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
             try { startActivity(install); }
             catch (RuntimeException error) { Toast.makeText(this, "无法打开系统安装界面", Toast.LENGTH_LONG).show(); }
         }));
+    }
+
+    private boolean updateBusy() {
+        return "checking".equals(updatePhase) || "downloading".equals(updatePhase)
+                || "verifying".equals(updatePhase);
+    }
+
+    private void refreshUpdatePanel() {
+        if (updateCheckButton == null) return;
+        boolean current = server().equals(updateServer);
+        updateCheckButton.setEnabled(!updateBusy());
+        updateMessageView.setText(current ? updateMessage : "");
+        updateMessageView.setVisibility(current && !updateMessage.isEmpty() ? View.VISIBLE : View.GONE);
+        boolean downloading = current && "downloading".equals(updatePhase);
+        updateProgressView.setVisibility(downloading ? View.VISIBLE : View.GONE);
+        if (downloading) {
+            updateProgressView.setIndeterminate(updatePercent < 0);
+            if (updatePercent >= 0) updateProgressView.setProgress(updatePercent);
+        }
+        boolean action = current && updateRelease != null;
+        updateActionButton.setVisibility(action && !downloading ? View.VISIBLE : View.GONE);
+        updateCancelButton.setVisibility(action && downloading ? View.VISIBLE : View.GONE);
+        if (!action) return;
+        updateActionButton.setText(updateReady ? "安装已验证的更新包" : "下载 " + updateRelease.version);
+        updateActionButton.setEnabled(!"checking".equals(updatePhase) && !"verifying".equals(updatePhase));
     }
 
     private String accountDeadlineText() {
@@ -1402,6 +1627,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
                     lanTest = test.isChecked();
                     loginUser = "";
                     page = "messages";
+                    dismissMedia();
                     resetServerUpdate();
                     if (locationSharing != null) locationSharing.stopLive();
                     controller.setServer(value, lanTest);
@@ -1410,6 +1636,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     private void switchServer(String address) {
+        dismissMedia();
         resetServerUpdate();
         detailPeer = "";
         loginUser = "";
@@ -1545,9 +1772,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (!detailPeer.isEmpty()) return relation(detailPeer) + ':' + isDeleted(detailPeer) + ':' + identityChanged(detailPeer);
         if (page.equals("contacts") && signedIn()) return messageIndex.contactRows;
         if (page.equals("messages") && signedIn()) return messageIndex.messageRows;
-        if (page.equals("settings")) return state.optString("status") + ':' + state.optJSONArray("servers")
-                + ':' + state.optLong("accountExpiresAtLocal", 0);
-        // Background connection notices must not recreate username/password fields.
+        // Background connection notices must not recreate Settings or authentication fields.
         return String.valueOf(state.optJSONArray("servers"));
     }
 
@@ -1566,6 +1791,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         JSONObject oldChanges = state.optJSONObject("identityChanges");
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
+        if (fileBusy && fileUiContext != controller.locationContext()) onFileState("", false);
         if (!previousServer.equals(server())) {
             if (serverUpdates != null) serverUpdates.cancel();
             updateRelease = null; updateMessage = ""; updateServer = ""; updatePercent = -1; updateReady = false; updatePhase = "";
@@ -1595,6 +1821,10 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (error != null && !error.isEmpty()) try { state.put("uiError", error); } catch (Exception ignored) { }
         if ((!wasSigned && signedIn()) || !previousServer.equals(server()) || wasSigned && !signedIn()
                 || !previousUsername.equals(state.optString("username"))) {
+            dismissMedia();
+            pendingFilePeer = pendingFileBody = "";
+            fileBusy = false;
+            fileNotice = "";
             if (locationSharing != null) locationSharing.stopLive();
             pendingLocationPeer = pendingLocationAction = "";
             historySearchGeneration++;
@@ -1628,6 +1858,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
             if (messageResults != null) populateMessages(messageResults);
             if (contactResults != null) populateContacts(contactResults);
         }
+        if (settingsAccountStatus != null) settingsAccountStatus.setText(state.optString("status"));
+        if (accountDeadlineView != null) accountDeadlineView.setText(accountDeadlineText());
         if (conversationStream != null && (!oldHistory.equals(visibleHistoryKey())
                 || wasOnline != state.optBoolean("online"))) updateConversationStream(true);
         if (conversationStatus != null) conversationStatus.setText(state.optString("status"));

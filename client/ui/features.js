@@ -1,6 +1,7 @@
 (function(root,factory){const api=factory();if(typeof module==='object')module.exports=api;else root.ChatFeatures=api;})(globalThis,()=>{
 'use strict';
 const PREFIX='CHAT_LOCATION_V1:',HOUR=3600000;
+const Files=typeof module==='object'?require('./file-format.js'):globalThis.ChatFiles;
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function parse(body){
  if(typeof body!=='string'||!body.startsWith(PREFIX)||body.length>1500)return null;
@@ -16,7 +17,7 @@ function parse(body){
  return p;}catch{return null;}
 }
 function encode(p){const body=PREFIX+JSON.stringify(p);if(!parse(body))throw new Error('位置数据无效');return body;}
-function summary(body){const p=parse(body);return p?(p.kind==='pin'?'[位置] '+'':`[实时位置${p.kind==='stop'?'已停止':''}] `)+(p.latitude===undefined?'':p.latitude.toFixed(5)+', '+p.longitude.toFixed(5)):body;}
+function summary(body){const file=Files.parseCard(body);if(file)return '[文件] '+file.name;if(typeof body==='string'&&body.startsWith(Files.PREFIX))return '[文件]';const p=parse(body);return p?(p.kind==='pin'?'[位置] '+'':`[实时位置${p.kind==='stop'?'已停止':''}] `)+(p.latitude===undefined?'':p.latitude.toFixed(5)+', '+p.longitude.toFixed(5)):body;}
 function sessions(messages,now=Date.now()){
  const result=new Map();for(const m of messages){const p=parse(m.body);if(!p||p.kind==='pin')continue;const key=m.sender+'\0'+p.sessionId,old=result.get(key);
  if(old&&(old.stopped||(p.kind!=='stop'&&(p.seq<=old.value.seq||Date.parse(p.expiresAt)>old.deadline))))continue;
@@ -83,7 +84,7 @@ function messageIndex(messages,user,server){
     if(!q){matches.push(row.message);continue;}
     if(row.summaryLower===null){
      const body=row.message.body;
-     if(body.startsWith(PREFIX))row.summaryLower=summary(body).toLocaleLowerCase();
+     if(body.startsWith(PREFIX)||body.startsWith(Files.CARD))row.summaryLower=summary(body).toLocaleLowerCase();
      else row.summaryLower=lowerBody(row.message);
     }
     if(row.summaryLower.includes(q))matches.push(row.message);

@@ -28,6 +28,7 @@ jobs:
         working-directory: client
       - run: npm test
         working-directory: client
+      - run: node --test scripts/verify-packaged-client.test.cjs
       - run: node node_modules/electron/install.js
         working-directory: client
       - run: node test/ui-smoke.cjs
@@ -36,6 +37,10 @@ jobs:
           CHAT_UI_QA_DIR: ${{ runner.temp }}/chat-ui-qa
       - run: npm run package
         working-directory: client
+      - run: node scripts/verify-packaged-client.cjs
+      - run: node client/test/packaged-startup-smoke.cjs
+        env:
+          CHAT_STARTUP_QA_DIR: ${{ runner.temp }}/chat-startup-qa
   android:
     runs-on: ubuntu-latest
     steps:

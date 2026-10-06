@@ -1,5 +1,7 @@
 # Android 安装与更新
 
+本版 Android 0.5.5（versionCode 21）属于 Chat v0.6.6 发布组合。先将服务器升级到 0.2.7，再发布客户端更新包；0.2.6 的文件上传限制配置继续保留。客户端续认证后会刷新账号期限。文件另存取消、已保存文件保留和孤立上传清理的修复仍需真机交互验收，见[验证范围](VALIDATION.md)。
+
 ## 从当前服务器更新
 
 在设置中选择“检查当前服务器更新”，下载与当前安装相同渠道的 APK。大小、SHA-256、包名、版本码及证书校验通过后，点击安装并按系统提示确认。首次可能需要允许此应用安装未知来源应用。管理员操作见 [发布客户端更新](../deploy/ubuntu/CLIENT-UPDATES.md)。本轮服务器下载包支持 arm64-v8a；其他架构及 QA 渠道暂无适配包。
@@ -22,7 +24,7 @@ Chat 提供正式签名版和旧调试版兼容更新包。两者的安装包名
 
 ```powershell
 # 更新旧调试版；指定版本时从对应成品目录选择，不使用旧构建结果。
-.\install-usb.ps1 -Version 0.6.1 -Variant Debug
+.\install-usb.ps1 -Version 0.6.6 -Variant Debug
 
 # 正式版首次安装或同渠道更新。
 .\install-usb.ps1 -ApkPath 'C:\path\to\Chat-Android-arm64-v8a-release.apk' -Variant Release

@@ -7,7 +7,7 @@ const vm=require('node:vm');
 function fixture(){
   const elements=new Map(),pending=[];
   const element=id=>{
-    if(!elements.has(id))elements.set(id,{value:'',hidden:false,textContent:'',setAttribute(){},addEventListener(){},focus(){}});
+    if(!elements.has(id))elements.set(id,{value:'',hidden:false,textContent:'',setAttribute(){},addEventListener(){},focus(){},querySelector(){return null;},replaceChildren(){}});
     return elements.get(id);
   };
   const sandbox={

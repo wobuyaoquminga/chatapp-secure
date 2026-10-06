@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; media-src 'self' blob:; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' blob:; media-src 'self' blob:; base-uri 'none'; form-action 'none'">
   <title>Chat</title>
-  <link rel="stylesheet" href="style.css"><script defer src="features.js"></script><script defer src="calls.js"></script><script defer src="app.js"></script>
+  <link rel="stylesheet" href="style.css"><script defer src="file-format.js"></script><script defer src="features.js"></script><script defer src="calls.js"></script><script defer src="app.js"></script>
 </head>
 <body>
 <main>
@@ -54,7 +54,7 @@
         <div id="messages" role="log" aria-live="polite"></div>
         <button id="olderMessages" type="button" class="textButton" hidden>查看更早消息</button>
         <form id="sendForm" class="composer"><label for="body" class="srOnly">消息</label><textarea id="body" maxlength="4000" rows="2" required placeholder="发送消息…"></textarea><button id="send" type="submit">发送</button><button id="toggleCallActions" type="button" class="secondary" aria-label="更多操作" aria-expanded="false" aria-controls="callActions">＋</button></form>
-        <div id="callActions" class="callActions" hidden><button id="startAudioCall" type="button" class="secondary">语音通话</button><button id="startVideoCall" type="button" class="secondary">视频通话</button><button id="sendPositionEntry" type="button" class="secondary">发送位置</button><button id="startLiveEntry" type="button" class="secondary">实时共享位置</button></div>
+        <div id="callActions" class="callActions" hidden><button id="startAudioCall" type="button" class="secondary">语音通话</button><button id="startVideoCall" type="button" class="secondary">视频通话</button><button id="sendPositionEntry" type="button" class="secondary">发送位置</button><button id="startLiveEntry" type="button" class="secondary">实时共享位置</button><button id="sendImageEntry" type="button" class="secondary">图片</button><button id="sendVideoEntry" type="button" class="secondary">视频</button><button id="sendFileEntry" type="button" class="secondary">文件</button></div>
         <p class="deliveryNote">“服务器已保存密文”不等于送达；“对方客户端已接收”不代表已读。</p>
       </div>
     </div>
@@ -77,12 +77,13 @@
         <li>首次向某人发起聊天时，只能先发一条消息；等对方接受后，才能继续发送。</li>
         <li>删除联系人会撤销对方继续向你发消息的权限，已有聊天记录仍保留；“清除会话”只把它从会话列表隐藏。</li>
         <li>“在线”表示你已成功连上服务器。对方不在线时，服务器暂存加密消息，等对方连接后再送达。“服务器已保存密文”不代表对方收到；“对方客户端已接收”也不代表已读。</li>
-        <li>聊天按 Enter 发送，Shift+Enter 换行；输入中文选词时不会误发。发送按钮右侧“＋”可发起通话、发送位置或实时共享位置；右上角“···”可查找本机聊天记录、核对安全码和管理联系人。实时位置最多共享一小时，应用离开前台、断线或退出时停止。定位失败可手动发送固定坐标。</li>
+        <li>聊天按 Enter 发送，Shift+Enter 换行；输入中文选词时不会误发。发送按钮右侧“＋”可发起通话、发送位置、实时共享位置或发送不超过 10 MiB 的文件；发文件前须接受联系人并核对安全码。右上角“···”可查找本机聊天记录、核对安全码和管理联系人。实时位置最多共享一小时，应用离开前台、断线或退出时停止。定位失败可手动发送固定坐标。</li>
         <li>聊天前可通过见面或可信通话，和对方比较完整的安全码；一致后点击“已通过可信渠道核对一致”。</li>
         <li>账号连续 7 天未成功连接服务器，服务器会删除该账号及服务器上的密钥、加密消息，无法从服务器恢复。成功连接后期限从该次连接重新计算；打开应用或输入密码但连接失败不算成功。请至少每周登录并确认显示“在线”。期限提示来自最近一次服务器记录，离线时仅供参考；软件不会在后台提醒。本机历史记录可能仍在。</li>
       </ul>
     </section>
   </section>
+  <section id="mediaPanel" class="mediaPanel" role="dialog" aria-modal="true" aria-label="媒体预览" hidden><div class="mediaCard"><div class="mediaHeading"><strong id="mediaName"></strong><button id="closeMedia" type="button" class="secondary">关闭</button></div><p id="mediaStatus" role="status"></p><div id="mediaContent"></div><button id="mediaSave" type="button" class="secondary">保存文件</button></div></section>
   <p id="notice" role="status"></p>
 </main>
 </body></html>

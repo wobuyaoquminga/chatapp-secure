@@ -403,6 +403,23 @@ class ChatIntegrationTest {
         }
     }
 
+    @Test void reauthenticationRenewsTheConnectedAccountDeadline() throws Exception {
+        var user = account();
+        try (var client = new Client(user)) {
+            expire(user); // Simulate a socket that has stayed open for longer than seven days.
+            var old = rest.exchange("/api/account/status", HttpMethod.GET, auth(user), JsonNode.class).getBody();
+            assertThat(Instant.parse(old.path("accountExpiresAt").asText())).isBefore(Instant.now());
+            client.send(Map.of("type", "auth", "token", user.token()));
+            client.await("reauthenticated");
+            var renewed = rest.exchange("/api/account/status", HttpMethod.GET, auth(user), JsonNode.class).getBody();
+            assertThat(Instant.parse(renewed.path("lastConnectedAt").asText())).isAfter(Instant.now().minusSeconds(30));
+            assertThat(Instant.parse(renewed.path("accountExpiresAt").asText())).isAfter(Instant.now().plusSeconds(6 * 86400));
+            cleanup.removeInactiveAccounts();
+            assertThat(accountId(user)).isNotBlank();
+            client.send(Map.of("type", "ping")); client.await("pong");
+        }
+    }
+
     @Test void oneHundredLargePendingMessagesDrainWithinTheByteBudgetWithoutDisconnecting() throws Exception {
         var sender = account(); var recipient = account();
         String ciphertext = json.writeValueAsString(Map.of("v", 1, "type", 2,
@@ -450,7 +467,8 @@ class ChatIntegrationTest {
             assertThat(event.path("username").asText()).isEqualTo(deleted.name());
             assertThat(event.path("accountId").asText()).isEqualTo(generation);
             assertThat(event.path("identityKey").asText()).isEqualTo(identity);
-            assertThat(Instant.parse(event.path("deletedAt").asText())).isBeforeOrEqualTo(Instant.now());
+            // SQL timestamps round to microseconds; allow only that precision difference.
+            assertThat(Instant.parse(event.path("deletedAt").asText())).isBeforeOrEqualTo(Instant.now().plusNanos(1000));
             receiver.awaitContactStatus(deleted.name(), "removed");
             assertThat(old.closed.get(5, TimeUnit.SECONDS)).isEqualTo(1008);
             assertThat(accountEvents(peer).get(0)).isEqualTo(event);

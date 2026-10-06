@@ -1,6 +1,6 @@
 # 从服务器下载客户端更新
 
-Chat server 0.2.5 提供安装包查询与下载。客户端设置中的“服务器更新”使用当前选择的服务器；Windows 下载完整 ZIP，Android 按当前包名选择正式版或调试版。检查与下载无需登录。服务器没有发布包时显示暂无更新；旧服务器需要先升级。
+Chat server 从 0.2.5 起提供安装包查询与下载；当前发布组合使用服务器 0.2.7。客户端设置中的“服务器更新”使用当前选择的服务器；Windows 下载完整 ZIP，Android 按当前包名选择正式版或调试版。检查与下载无需登录。服务器没有发布包时显示暂无更新；旧服务器需要先升级。
 
 ## 管理员发布
 
@@ -9,7 +9,7 @@ Chat server 0.2.5 提供安装包查询与下载。客户端设置中的“服�
 以下目录仅为示例。在 PowerShell 上传：
 
 ```powershell
-$bundle = 'C:\path\to\Chat-v0.6.1'
+$bundle = 'C:\path\to\Chat-v0.6.5'
 scp "$bundle\Chat-Client-Updates.tar.gz" "$bundle\SHA256.txt" ecs-user@203.0.113.10:/home/ecs-user/
 ```
 

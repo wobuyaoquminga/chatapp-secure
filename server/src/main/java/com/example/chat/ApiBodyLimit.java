@@ -24,7 +24,8 @@ public class ApiBodyLimit extends OncePerRequestFilter {
     static final class TooLarge extends IOException { TooLarge(){super("Request body limit exceeded");} }
     @Override protected void doFilterInternal(HttpServletRequest request,HttpServletResponse response,FilterChain chain)
             throws ServletException,IOException {
-        if (!request.getRequestURI().startsWith("/api/") || !java.util.Set.of("POST","PUT","PATCH").contains(request.getMethod())) {
+        if (!request.getRequestURI().startsWith("/api/") || !java.util.Set.of("POST","PUT","PATCH").contains(request.getMethod())
+                || ("PUT".equals(request.getMethod()) && request.getRequestURI().matches("/api/files/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))) {
             chain.doFilter(request,response);return;
         }
         if (request.getContentLengthLong()>MAX_BYTES) { reject(response);return; }

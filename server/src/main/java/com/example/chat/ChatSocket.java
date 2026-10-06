@@ -117,6 +117,11 @@ public class ChatSocket extends TextWebSocketHandler {
                         || token.getExpiresAt() == null || !Instant.now().isBefore(token.getExpiresAt())) {
                         close(c, "invalid token"); return;
                     }
+                    // A continuously connected client renews its token without reconnecting.
+                    // Count that authenticated connection before the inactive-account sweep.
+                    if (!store.recordConnection(c.user, c.accountId)) {
+                        close(c, "identity reset"); return;
+                    }
                     c.expires = token.getExpiresAt();
                     emit(c, Map.of("type", "reauthenticated"));
                 }

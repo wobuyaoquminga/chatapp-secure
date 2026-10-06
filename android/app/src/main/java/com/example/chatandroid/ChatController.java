@@ -1,6 +1,10 @@
 package com.example.chatandroid;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.provider.OpenableColumns;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -12,6 +16,14 @@ import org.json.JSONObject;
 
 import java.net.InetAddress;
 import java.net.URI;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.security.MessageDigest;
+import java.time.Instant;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -20,13 +32,16 @@ import java.util.List;
 import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
+import org.signal.libsignal.protocol.SignalProtocolAddress;
 
 import okhttp3.MediaType;
+import okhttp3.Call;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -44,6 +59,8 @@ final class ChatController {
         void onCall(JSONObject frame, long context);
         void onCallReady(CallSession session, JSONArray iceServers, long context);
         void onCallContextLost();
+        default void onFileState(String notice, boolean busy) { }
+        default void onMediaReady(Bitmap image, File video, long context, String peer) { }
     }
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
@@ -55,6 +72,14 @@ final class ChatController {
     private Network connectionNetwork;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService fileIo = Executors.newSingleThreadExecutor();
+    private Call fileCall;
+    private InputStream fileInput;
+    private OutputStream fileOutput;
+    private final Object fileCallLock = new Object();
+    private volatile long fileGeneration;
+    private boolean fileBusy;
+    private volatile File previewTemp;
     private final OkHttpClient client = new OkHttpClient.Builder()
             .followRedirects(false).followSslRedirects(false)
             .connectTimeout(10, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
@@ -65,7 +90,8 @@ final class ChatController {
     private String username;
     private String token; // Never persisted.
     private String refreshToken, authAccountId;
-    private long tokenExpiresAt, authSession;
+    private long tokenExpiresAt;
+    private volatile long authSession;
     private ScheduledFuture<?> refreshTask, refreshAckTimeout;
     private AccountStatusCache.Deadline accountDeadline;
     private boolean foreground;
@@ -121,7 +147,7 @@ final class ChatController {
                         throw new Exception("连接续期发送失败");
                     if (refreshAckTimeout != null) refreshAckTimeout.cancel(false);
                     refreshAckTimeout = worker.schedule(() -> {
-                        if (epoch == authSession && socket == active)
+                        if (!closed && epoch == authSession && socket == active)
                             stopConnection("连接续期未获确认，请重新登录", new Exception("续期确认超时"));
                     }, 20, TimeUnit.SECONDS);
                 }
@@ -176,14 +202,14 @@ final class ChatController {
             CallSession session = new CallSession(java.util.UUID.randomUUID().toString(), peer, account, mode, true);
             JSONArray ice = iceServers();
             long context = generation;
-            main.post(() -> listener.onCallReady(session, ice, context));
+            postMain(() -> { if (context == generation) listener.onCallReady(session, ice, context); });
         });
     }
     void prepareIncomingCall(CallSession session, long expectedContext) {
         execute(() -> {
             if (expectedContext != generation || !session.accountId.equals(requireCallPeer(session.peer))) return;
             JSONArray ice = iceServers();
-            main.post(() -> listener.onCallReady(session, ice, expectedContext));
+            postMain(() -> { if (expectedContext == generation) listener.onCallReady(session, ice, expectedContext); });
         });
     }
     private JSONArray iceServers() {
@@ -231,7 +257,7 @@ final class ChatController {
                 liveExpiry = System.currentTimeMillis() + LocationPayload.MAX_DURATION;
                 liveSeq = 0; lastLiveSent = 0;
                 String session = liveSession;
-                liveTimeout = worker.schedule(() -> { if (session.equals(liveSession)) { stopLiveInternal(); publish(""); } }, LocationPayload.MAX_DURATION, TimeUnit.MILLISECONDS);
+                liveTimeout = worker.schedule(() -> { if (!closed && session.equals(liveSession)) { stopLiveInternal(); publish(""); } }, LocationPayload.MAX_DURATION, TimeUnit.MILLISECONDS);
                 publish("");
             } catch (Exception error) { notifyLocationStopped(); throw error; }
         });
@@ -277,6 +303,9 @@ final class ChatController {
     ChatController(Context context, Listener listener) {
         this.context = context.getApplicationContext();
         this.listener = listener;
+        File previous = new File(this.context.getCacheDir(), "media-preview");
+        File[] stale = previous.listFiles();
+        if (stale != null) for (File file : stale) if (file.isFile()) file.delete();
         this.accounts = new AccountRegistry(this.context);
         connectivity = (ConnectivityManager) this.context.getSystemService(Context.CONNECTIVITY_SERVICE);
         networkCallback = new ConnectivityManager.NetworkCallback() {
@@ -299,12 +328,11 @@ final class ChatController {
         NetworkCapabilities capabilities = active == null ? null : connectivity.getNetworkCapabilities(active);
         boolean usable = capabilities != null
                 && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
-        if (!java.util.Objects.equals(active, connectionNetwork)) {
-            connectionNetwork = active;
-            if (socket != null && (online || connecting)) {
-                socket.cancel();
-                disconnected(generation, 0);
-            }
+        boolean changed = !java.util.Objects.equals(active, connectionNetwork);
+        connectionNetwork = active;
+        if ((changed || !usable) && socket != null && (online || connecting)) {
+            socket.cancel();
+            disconnected(generation, 0);
         }
         // A new default network can arrive during a long backoff. Keep one socket attempt.
         if (usable && reconnectPending && !connecting) connect();
@@ -443,6 +471,410 @@ final class ChatController {
         execute(() -> sendBody(peer, body, false, draftKey, draftRevision));
     }
 
+    private static final class FileContext {
+        final String server, owner, peer, peerAccount, token;
+        final long session, transfer;
+        FileContext(String server, String owner, String peer, String peerAccount, String token,
+                    long session, long transfer) {
+            this.server = server; this.owner = owner; this.peer = peer;
+            this.peerAccount = peerAccount; this.token = token;
+            this.session = session; this.transfer = transfer;
+        }
+    }
+
+    private String requireFilePeer(String peer, boolean needsOnline) throws Exception {
+        requirePeer(peer);
+        if (!"accepted".equals(relationship(peer)) || needsOnline && !online)
+            throw new Exception("文件仅能与已接受且在线的联系人传输");
+        if (engine.isDeleted(peer) || engine.state().getJSONObject("identityChanges").has(peer))
+            throw new Exception("请先核对联系人设备身份");
+        JSONObject data = engine.state();
+        String account = data.getJSONObject("peerAccountIds").optString(peer);
+        String trusted = data.getJSONObject("trusted").optString(new SignalProtocolAddress(peer, 1).toString());
+        if (account.isEmpty() || trusted.isEmpty() ||
+                !trusted.equals(data.getJSONObject("verified").optString(peer)))
+            throw new Exception("请先在安全码页面核对并确认联系人身份");
+        return account;
+    }
+
+    private FileContext fileContext(String peer, long expectedContext, boolean needsOnline) throws Exception {
+        if (expectedContext != generation || token == null || authAccountId == null || authAccountId.isEmpty())
+            throw new Exception("账号已改变，请重新选择文件");
+        String target;
+        if (needsOnline) target = requireFilePeer(peer, true);
+        else {
+            requirePeer(peer);
+            target = engine.state().getJSONObject("peerAccountIds").optString(peer);
+        }
+        if (fileBusy) throw new Exception("已有文件正在传输，请稍后再试");
+        fileBusy = true;
+        FileContext context = new FileContext(server, authAccountId, peer, target, token, authSession, ++fileGeneration);
+        fileState("正在处理文件…", true, context);
+        return context;
+    }
+
+    private boolean currentFile(FileContext context) {
+        return !closed && context.transfer == fileGeneration && context.session == authSession;
+    }
+
+    private boolean publishFileCall(FileContext context, Call call) {
+        synchronized (fileCallLock) {
+            if (!currentFile(context)) { call.cancel(); return false; }
+            call.timeout().timeout(180, TimeUnit.SECONDS);
+            fileCall = call;
+            return true;
+        }
+    }
+
+    private void clearFileCall(Call call) {
+        synchronized (fileCallLock) { if (fileCall == call) fileCall = null; }
+    }
+
+    private void cancelFileCall() {
+        Call call;
+        InputStream input;
+        OutputStream output;
+        synchronized (fileCallLock) {
+            call = fileCall; fileCall = null;
+            input = fileInput; fileInput = null;
+            output = fileOutput; fileOutput = null;
+        }
+        if (call != null) call.cancel();
+        if (input != null) try { input.close(); } catch (Exception ignored) { }
+        if (output != null) try { output.close(); } catch (Exception ignored) { }
+    }
+
+    private boolean publishFileInput(FileContext context, InputStream input) {
+        synchronized (fileCallLock) {
+            if (!currentFile(context)) return false;
+            fileInput = input;
+            return true;
+        }
+    }
+
+    private void clearFileInput(InputStream input) {
+        synchronized (fileCallLock) { if (fileInput == input) fileInput = null; }
+    }
+
+    private boolean publishFileOutput(FileContext context, OutputStream output) {
+        synchronized (fileCallLock) {
+            if (!currentFile(context)) return false;
+            fileOutput = output;
+            return true;
+        }
+    }
+
+    private void clearFileOutput(OutputStream output) {
+        synchronized (fileCallLock) { if (fileOutput == output) fileOutput = null; }
+    }
+
+    private void fileState(String notice, boolean busy, FileContext context) {
+        postMain(() -> { if (context.transfer == fileGeneration) listener.onFileState(notice, busy); });
+    }
+
+    private void fileFailure(FileContext context, Exception error) {
+        post(() -> {
+            if (!currentFile(context)) return;
+            fileBusy = false;
+            String message = readable(error);
+            fileState(error instanceof SecurityException || error instanceof javax.crypto.AEADBadTagException
+                    ? "文件校验失败，已停止保存"
+                    : message.contains("10 MiB") || message.contains("文件已过期")
+                    || message.contains("格式不支持") || message.contains("尺寸不支持") ? message
+                    : "文件处理失败，请重试", false, context);
+        });
+    }
+
+    void sendFile(String peer, Uri uri, long expectedContext) {
+        sendFile(peer, uri, expectedContext, "*/*");
+    }
+
+    void sendFile(String peer, Uri uri, long expectedContext, String selectedType) {
+        execute(() -> {
+            if (uri == null || !"content".equals(uri.getScheme())) throw new Exception("请选择系统提供的文件");
+            FileContext context = fileContext(peer, expectedContext, true);
+            fileIo.execute(() -> {
+                if (!currentFile(context)) return;
+                String id = java.util.UUID.randomUUID().toString();
+                boolean uploadStarted = false;
+                try {
+                    String name = "文件";
+                    try (android.database.Cursor cursor = this.context.getContentResolver().query(uri,
+                            new String[] { OpenableColumns.DISPLAY_NAME }, null, null, null)) {
+                        if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
+                    }
+                    name = FilePayload.safeName(name);
+                    if (!"*/*".equals(selectedType)) {
+                        name = MediaPayload.mediaName(name, this.context.getContentResolver().getType(uri), selectedType);
+                    }
+                    byte[] plain;
+                    try (InputStream input = this.context.getContentResolver().openInputStream(uri)) {
+                        if (input == null) throw new Exception("无法读取所选文件");
+                        if (!publishFileInput(context, input)) return;
+                        try { plain = readBounded(input, FilePayload.MAX_SIZE); }
+                        finally { clearFileInput(input); }
+                    }
+                    if (!currentFile(context)) return;
+                    FilePayload.Encrypted encrypted;
+                    try {
+                        if (!"*/*".equals(selectedType) && !MediaPayload.matches(name, plain))
+                            throw new Exception("媒体格式不支持，可使用文件入口发送");
+                        encrypted = FilePayload.encrypt(id, name, plain,
+                                Instant.ofEpochMilli(System.currentTimeMillis() + 7L * 86400000L).toString());
+                    } finally { java.util.Arrays.fill(plain, (byte) 0); }
+                    Request request = new Request.Builder().url(context.server + "/api/files/" + id
+                                    + "?to=" + java.net.URLEncoder.encode(peer, "UTF-8")
+                                    + "&toAccountId=" + java.net.URLEncoder.encode(context.peerAccount, "UTF-8"))
+                            .header("Authorization", "Bearer " + context.token)
+                            .put(RequestBody.create(encrypted.bytes, MediaType.get("application/octet-stream"))).build();
+                    Call call = client.newCall(request);
+                    if (!publishFileCall(context, call)) return;
+                    uploadStarted = true;
+                    try (Response response = call.execute()) {
+                        if (!response.isSuccessful()) throw new Exception("服务器拒绝上传（" + response.code() + "）");
+                        String responseBody = response.body() == null ? ""
+                                : new String(readBounded(response.body().byteStream(), 65536), StandardCharsets.UTF_8);
+                        JSONObject result = new JSONObject(responseBody);
+                        if (!id.equals(result.optString("id"))) throw new Exception("服务器文件编号不匹配");
+                        String expiry = result.getString("expiresAt");
+                        if (Instant.parse(expiry).isBefore(Instant.now())) throw new Exception("服务器文件已过期");
+                        encrypted = FilePayload.encryptDescriptor(encrypted, expiry);
+                    } finally { clearFileCall(call); }
+                    if (!currentFile(context)) { deleteUploaded(context, id); return; }
+                    FilePayload.Encrypted finalEncrypted = encrypted;
+                    cacheFile(context, finalEncrypted.payload, finalEncrypted.bytes);
+                    try { worker.execute(() -> {
+                        if (!currentFile(context)) { deleteUploaded(context, id); return; }
+                        try {
+                            if (!context.peerAccount.equals(requireFilePeer(peer, true)))
+                                throw new Exception("联系人身份已改变，请重新发送");
+                            sendBody(peer, finalEncrypted.payload.body(), false, null, 0, true);
+                            fileBusy = false;
+                            fileState("文件已发送", false, context);
+                        } catch (Exception error) {
+                            if (!hasFileInHistory(peer, finalEncrypted.payload)) deleteUploaded(context, id);
+                            fileFailure(context, error);
+                        }
+                    }); }
+                    catch (RejectedExecutionException closing) { deleteUploaded(context, id); }
+                } catch (Exception error) {
+                    if (uploadStarted) deleteUploaded(context, id);
+                    fileFailure(context, error);
+                }
+            });
+        });
+    }
+
+    void saveFile(String peer, String body, Uri destination, long expectedContext) {
+        execute(() -> {
+            if (destination == null || !"content".equals(destination.getScheme()))
+                throw new Exception("请选择系统提供的保存位置");
+            FilePayload payload = historyFile(peer, body);
+            FileContext context = fileContext(peer, expectedContext, false);
+            fileIo.execute(() -> {
+                if (!currentFile(context)) return;
+                try {
+                    byte[] plain = loadFile(context, payload);
+                    try {
+                        if (!currentFile(context)) return;
+                        try (OutputStream output = this.context.getContentResolver().openOutputStream(destination, "wt")) {
+                            if (output == null) throw new Exception("无法写入所选位置");
+                            if (!publishFileOutput(context, output)) return;
+                            try {
+                                for (int offset = 0; offset < plain.length; offset += 65536) {
+                                    if (!currentFile(context)) return;
+                                    output.write(plain, offset, Math.min(65536, plain.length - offset));
+                                }
+                            } finally { clearFileOutput(output); }
+                        }
+                    } finally { if (plain != null) java.util.Arrays.fill(plain, (byte) 0); }
+                    post(() -> { if (currentFile(context)) { fileBusy = false; fileState("文件已保存", false, context); } });
+                } catch (Exception error) { fileFailure(context, error); }
+            });
+        });
+    }
+
+    private FilePayload historyFile(String peer, String body) throws Exception {
+        FilePayload payload = FilePayload.parse(body);
+        if (payload == null) throw new Exception("文件描述无效，无法打开");
+        requirePeer(peer);
+        JSONObject messages = engine.state().getJSONObject("messages");
+        for (Iterator<String> ids = messages.keys(); ids.hasNext();) {
+            JSONObject message = messages.optJSONObject(ids.next());
+            if (message != null && body.equals(message.optString("body"))
+                    && (peer.equals(message.optString("sender")) || peer.equals(message.optString("recipient"))))
+                return payload;
+        }
+        throw new Exception("此文件消息已不在当前账号的聊天记录中");
+    }
+
+    private boolean hasFileInHistory(String peer, FilePayload payload) {
+        try { historyFile(peer, payload.body()); return true; }
+        catch (Exception missing) { return false; }
+    }
+
+    private byte[] loadFile(FileContext context, FilePayload payload) throws Exception {
+        byte[] encrypted = cachedFile(context, payload);
+        if (encrypted == null) {
+            if (Instant.parse(payload.expiresAt).isBefore(Instant.now()))
+                throw new Exception("文件已过期，且本机没有已下载副本");
+            if (!currentFile(context)) return null;
+            Request request = new Request.Builder().url(context.server + "/api/files/" + payload.id)
+                    .header("Authorization", "Bearer " + context.token).get().build();
+            Call call = client.newCall(request);
+            if (!publishFileCall(context, call)) return null;
+            try (Response response = call.execute()) {
+                if (!response.isSuccessful()) throw new Exception("无法下载文件（" + response.code() + "）");
+                if (response.body() == null) throw new Exception("服务器未返回文件");
+                encrypted = readBounded(response.body().byteStream(), payload.size + 16);
+            } finally { clearFileCall(call); }
+            payload.decrypt(encrypted); // Hash and GCM tag must pass before caching.
+            if (!currentFile(context)) return null;
+            cacheFile(context, payload, encrypted);
+        }
+        return payload.decrypt(encrypted);
+    }
+
+    void previewFile(String peer, String body, long expectedContext) {
+        execute(() -> {
+            FilePayload payload = historyFile(peer, body);
+            MediaPayload.Kind kind = MediaPayload.kind(payload.name);
+            if (kind == MediaPayload.Kind.FILE) throw new Exception("此文件不能预览");
+            FileContext context = fileContext(peer, expectedContext, false);
+            fileIo.execute(() -> {
+                if (!currentFile(context)) return;
+                File temporary = null;
+                byte[] plain = null;
+                try {
+                    plain = loadFile(context, payload);
+                    if (plain == null || !currentFile(context)) return;
+                    if (!MediaPayload.matches(payload.name, plain))
+                        throw new Exception("媒体格式不支持，可另存文件");
+                    Bitmap image = null;
+                    if (kind == MediaPayload.Kind.IMAGE) {
+                        BitmapFactory.Options bounds = new BitmapFactory.Options();
+                        bounds.inJustDecodeBounds = true;
+                        BitmapFactory.decodeByteArray(plain, 0, plain.length, bounds);
+                        int sample = MediaPayload.imageSampleSize(bounds.outWidth, bounds.outHeight);
+                        if (sample == 0)
+                            throw new Exception("图片尺寸不支持，可另存文件");
+                        BitmapFactory.Options options = new BitmapFactory.Options();
+                        options.inSampleSize = sample;
+                        image = BitmapFactory.decodeByteArray(plain, 0, plain.length, options);
+                        if (image == null) throw new Exception("图片格式不支持，可另存文件");
+                    } else {
+                        File directory = new File(this.context.getCacheDir(), "media-preview");
+                        if (!directory.isDirectory() && !directory.mkdirs()) throw new Exception("无法创建播放缓存");
+                        String suffix = payload.name.toLowerCase(java.util.Locale.ROOT).endsWith(".webm") ? ".webm" : ".mp4";
+                        temporary = File.createTempFile("preview-", suffix, directory);
+                        try (FileOutputStream output = new FileOutputStream(temporary)) { output.write(plain); }
+                    }
+                    if (!currentFile(context)) {
+                        if (temporary != null) temporary.delete();
+                        if (image != null) image.recycle();
+                        return;
+                    }
+                    File video = temporary;
+                    Bitmap preview = image;
+                    try {
+                        worker.execute(() -> {
+                            synchronized (fileCallLock) {
+                                if (!currentFile(context)) { disposePreview(preview, video); return; }
+                                if (previewTemp != null) previewTemp.delete();
+                                previewTemp = video;
+                            }
+                            // Resource delivery must dispose stale results, not silently drop them.
+                            if (!main.post(() -> {
+                                if (!currentFile(context)) { disposePreview(preview, video); return; }
+                                listener.onMediaReady(preview, video, expectedContext, peer);
+                            })) disposePreview(preview, video);
+                            if (currentFile(context)) { fileBusy = false; fileState("", false, context); }
+                        });
+                    } catch (RejectedExecutionException closing) { disposePreview(preview, video); }
+                } catch (Exception error) {
+                    if (temporary != null) temporary.delete();
+                    fileFailure(context, error);
+                } finally { if (plain != null) java.util.Arrays.fill(plain, (byte) 0); }
+            });
+        });
+    }
+
+    void releaseMedia(File video) {
+        synchronized (fileCallLock) {
+            if (video != null) {
+                if (video.equals(previewTemp)) previewTemp = null;
+                video.delete();
+            }
+        }
+    }
+
+    private void disposePreview(Bitmap image, File video) {
+        if (image != null && !image.isRecycled()) image.recycle();
+        releaseMedia(video);
+    }
+
+    private void clearMediaTemp() {
+        synchronized (fileCallLock) {
+            if (previewTemp != null) previewTemp.delete();
+            previewTemp = null;
+        }
+    }
+
+    private static byte[] readBounded(InputStream input, int max) throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        byte[] block = new byte[65536]; int count;
+        while ((count = input.read(block)) != -1) {
+            if (bytes.size() > max - count) throw new Exception("文件超过 10 MiB 限制");
+            bytes.write(block, 0, count);
+        }
+        return bytes.toByteArray();
+    }
+
+    private File cachePath(FileContext context, String id) throws Exception {
+        byte[] input = (context.server + "\0" + context.owner + "\0" + id)
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(input);
+        StringBuilder name = new StringBuilder();
+        for (byte b : hash) name.append(String.format(java.util.Locale.ROOT, "%02x", b & 255));
+        File directory = new File(this.context.getCacheDir(), "encrypted-files");
+        if (!directory.isDirectory() && !directory.mkdirs()) throw new Exception("无法创建文件缓存");
+        return new File(directory, name + ".bin");
+    }
+
+    private void cacheFile(FileContext context, FilePayload payload, byte[] encrypted) throws Exception {
+        File target = cachePath(context, payload.id), temp = new File(target.getPath() + ".part");
+        try (FileOutputStream output = new FileOutputStream(temp)) { output.write(encrypted); }
+        if (!currentFile(context)) { temp.delete(); return; }
+        if (!temp.renameTo(target)) { temp.delete(); throw new Exception("保存加密缓存失败"); }
+    }
+
+    private byte[] cachedFile(FileContext context, FilePayload payload) throws Exception {
+        File file = cachePath(context, payload.id);
+        if (!file.isFile()) return null;
+        try (InputStream input = new FileInputStream(file)) {
+            byte[] bytes = readBounded(input, payload.size + 16);
+            payload.decrypt(bytes);
+            return bytes;
+        } catch (Exception invalid) { file.delete(); return null; }
+    }
+
+    private void deleteUploaded(FileContext context, String id) {
+        try { cachePath(context, id).delete(); } catch (Exception ignored) { }
+        try {
+            Request request = new Request.Builder().url(context.server + "/api/files/" + id)
+                    .header("Authorization", "Bearer " + context.token).delete().build();
+            // Cleanup must not block the single message/login worker on a slow network.
+            Call cleanup = client.newCall(request);
+            cleanup.timeout().timeout(5, TimeUnit.SECONDS);
+            cleanup.enqueue(new okhttp3.Callback() {
+                @Override public void onFailure(Call call, java.io.IOException error) {
+                    // The server retention job remains the fallback for orphaned ciphertext.
+                }
+                @Override public void onResponse(Call call, Response response) { response.close(); }
+            });
+        } catch (Exception ignored) { }
+    }
+
     void retryPending(String clientId) {
         execute(() -> {
             if (engine == null || clientId == null || clientId.isEmpty()) return;
@@ -461,6 +893,10 @@ final class ChatController {
 
     private void sendBody(String peer, String body, boolean transientLocation,
                           String draftKey, long draftRevision) throws Exception {
+        sendBody(peer, body, transientLocation, draftKey, draftRevision, false);
+    }
+    private void sendBody(String peer, String body, boolean transientLocation,
+                          String draftKey, long draftRevision, boolean fileDescriptor) throws Exception {
             requirePeer(peer);
             if (!online) throw new Exception("请等待连接恢复");
             if (engine.isDeleted(peer)) throw new Exception("该用户已销户，无法向不存在的账号发送消息");
@@ -471,6 +907,8 @@ final class ChatController {
             if (relation.equals("pending_incoming")) throw new Exception("请先同意对方的聊天请求");
             if (body == null || body.trim().isEmpty() || body.length() > 4000)
                 throw new Exception("消息须为 1–4000 字符");
+            if (body.startsWith(FilePayload.PREFIX) && (!fileDescriptor || FilePayload.parse(body) == null))
+                throw new Exception("文件消息只能通过发送文件功能创建");
             JSONObject identity = requestObject("/api/keys/" + Usernames.path(peer), "GET", null);
             transaction(() -> {
                 engine.bindPeer(peer, identity, false);
@@ -491,9 +929,9 @@ final class ChatController {
             });
             if (relation.isEmpty()) relationships.put(peer, new JSONObject()
                     .put("username", peer).put("status", "pending_outgoing").put("online", false));
-            if (!body.startsWith(LocationPayload.PREFIX)) selectedPeer = peer;
+            if (!body.startsWith(LocationPayload.PREFIX) && !fileDescriptor) selectedPeer = peer;
             wire(envelope);
-            if (draftKey != null) main.post(() -> listener.onSent(draftKey, body, draftRevision));
+            if (draftKey != null) postMain(() -> listener.onSent(draftKey, body, draftRevision));
             publish("");
     }
 
@@ -514,7 +952,7 @@ final class ChatController {
                 return checked;
             });
             selectedPeer = peer;
-            main.post(() -> listener.onSafety(peer, result));
+            postMain(() -> listener.onSafety(peer, result));
             publish("");
         });
     }
@@ -647,6 +1085,10 @@ final class ChatController {
     synchronized void close() {
         if (closed) return;
         closed = true;
+        ++fileGeneration;
+        cancelFileCall();
+        clearMediaTemp();
+        fileIo.shutdownNow();
         if (connectivity != null) {
             try { connectivity.unregisterNetworkCallback(networkCallback); }
             catch (RuntimeException ignored) { /* Registration may have failed. */ }
@@ -654,6 +1096,7 @@ final class ChatController {
         notifyLocationStopped();
         worker.execute(this::clearSession);
         worker.shutdown();
+        client.dispatcher().cancelAll();
         client.dispatcher().executorService().shutdown();
         client.connectionPool().evictAll();
     }
@@ -750,7 +1193,7 @@ final class ChatController {
             }
         });
         authTimeout = worker.schedule(() -> {
-            if (epoch == generation && !online && socket != null) {
+            if (!closed && epoch == generation && !online && socket != null) {
                 socket.cancel();
                 disconnected(epoch, 0);
             }
@@ -759,11 +1202,12 @@ final class ChatController {
 
     private void disconnected(long epoch, int code) {
         if (epoch != generation || reconnectPending || token == null) return;
+        long nextEpoch = ++generation; // Ignore queued frames from the retired socket.
         cancelAuthTimeout();
         cancelSendTimers();
         connecting = false;
         online = false;
-        main.post(listener::onCallContextLost);
+        postMain(listener::onCallContextLost);
         stopLiveInternal();
         notifyLocationStopped();
         socket = null;
@@ -783,7 +1227,7 @@ final class ChatController {
         long delay = backoff.nextDelayMillis(ThreadLocalRandom.current().nextDouble());
         reconnectTask = worker.schedule(() -> {
             reconnectTask = null;
-            if (!closed && epoch == generation && reconnectPending) connect();
+            if (!closed && nextEpoch == generation && reconnectPending) connect();
         }, delay, TimeUnit.MILLISECONDS);
     }
 
@@ -792,6 +1236,10 @@ final class ChatController {
         switch (type) {
             case "reauthenticated":
                 if (refreshAckTimeout != null) { refreshAckTimeout.cancel(false); refreshAckTimeout = null; }
+                if (online) {
+                    refreshAccountDeadline();
+                    publish("");
+                }
                 return;
             case "ready":
                 cancelAuthTimeout();
@@ -868,11 +1316,12 @@ final class ChatController {
                         && event.optString("fromAccountId").equals(
                             engine.state().getJSONObject("peerAccountIds").optString(caller))) {
                     long context = generation;
-                    main.post(() -> listener.onCall(event, context));
+                    postMain(() -> { if (context == generation) listener.onCall(event, context); });
                 }
                 return;
             case "call_error":
-                main.post(() -> listener.onCall(event, generation));
+                long callContext = generation;
+                postMain(() -> { if (callContext == generation) listener.onCall(event, callContext); });
                 return;
             case "accepted":
                 transaction(() -> { engine.accepted(event.getJSONObject("message")); return null; });
@@ -934,7 +1383,7 @@ final class ChatController {
             clearSendTimer(id);
             sendConfirmTimers.put(id, worker.schedule(() -> {
                 sendConfirmTimers.remove(id);
-                if (online && engine != null && engine.state().optJSONObject("outbox") != null
+                if (!closed && online && engine != null && engine.state().optJSONObject("outbox") != null
                         && engine.state().optJSONObject("outbox").has(id)) {
                     sendTimedOut.add(id);
                     publish("");
@@ -997,12 +1446,16 @@ final class ChatController {
     }
 
     private void clearSession() {
+        ++fileGeneration;
+        fileBusy = false;
+        cancelFileCall();
+        clearMediaTemp();
         ++authSession;
         cancelRefresh();
         cancelSendTimers();
         refreshToken = null; authAccountId = null; tokenExpiresAt = 0;
         MessageNotifier.cancelAll(context);
-        main.post(listener::onCallContextLost);
+        postMain(listener::onCallContextLost);
         cancelReconnect();
         cancelAuthTimeout();
         backoff.reset();
@@ -1032,7 +1485,7 @@ final class ChatController {
     private void stopConnection(String reason, Exception error) {
         cancelRefresh();
         cancelSendTimers();
-        main.post(listener::onCallContextLost);
+        postMain(listener::onCallContextLost);
         ++generation;
         cancelReconnect();
         cancelAuthTimeout();
@@ -1075,8 +1528,13 @@ final class ChatController {
 
     private void post(Runnable task) {
         if (closed) return;
-        try { worker.execute(task); }
+        try { worker.execute(() -> { if (!closed) task.run(); }); }
         catch (RejectedExecutionException ignored) { /* Activity is closing. */ }
+    }
+
+    private void postMain(Runnable task) {
+        long session = authSession;
+        main.post(() -> { if (!closed && session == authSession) task.run(); });
     }
 
     private void refreshMessageCache() throws Exception {
@@ -1182,7 +1640,7 @@ final class ChatController {
             error = "本地会话读取失败：" + readable(internal);
         }
         final String notice = error;
-        main.post(() -> listener.onState(snapshot, notice));
+        postMain(() -> listener.onState(snapshot, notice));
     }
 
     private static boolean validUser(String value) {

@@ -39,6 +39,10 @@ final class HistorySearch {
     }
     static String preview(JSONObject item) {
         String body = item.optString("body");
+        if (body.startsWith(FilePayload.PREFIX)) {
+            FilePayload file = FilePayload.parse(body);
+            return file == null ? "[文件] 无效描述" : "[文件] " + file.name;
+        }
         LocationPayload location = LocationPayload.parse(body, System.currentTimeMillis());
         if (location == null) return body;
         if (location.kind.equals("stop")) return "实时位置 · 已停止";

@@ -1,7 +1,7 @@
 {
-  "bundle": "0.6.1",
-  "windows": "0.6.1",
-  "android": "0.5.1",
-  "androidCode": 17,
-  "server": "0.2.5"
+  "android": "0.5.5",
+  "windows": "0.6.5",
+  "server": "0.2.7",
+  "androidCode": 21,
+  "bundle": "0.6.6"
 }

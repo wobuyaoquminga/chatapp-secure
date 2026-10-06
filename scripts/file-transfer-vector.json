@@ -1,0 +1,12 @@
+{
+  "description": "Public deterministic interoperability fixture; keys are test data only",
+  "id": "12345678-1234-4234-8234-123456789abc",
+  "name": "example.txt",
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "iv": "ICEiIyQlJicoKSor",
+  "plain": "Q2hhdCBmaWxlIGludGVyb3BlcmFiaWxpdHkK5L2g5aW9Cg==",
+  "ciphertext": "kVLHBEz+c2J/XCugtX2GlqAsnv3l6Q+HGI9m9vQqu6zIhLMAK4LRSlb47vkbsLWk8h8=",
+  "size": 34,
+  "sha256": "e90d3599549fc31a06aca2f4849131a9a65206e021f6e32ad898dff122a51b4e",
+  "expiresAt": "2030-01-01T00:00:00Z"
+}

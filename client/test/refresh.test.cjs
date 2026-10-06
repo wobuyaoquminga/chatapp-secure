@@ -9,10 +9,31 @@ test('RAM refresh tokens rotate and existing WebSocket is reauthenticated withou
  const f=fixture(),server=new WebSocket.Server({host:'127.0.0.1',port:0});await once(server,'listening');let peer;
  server.on('connection',s=>{peer=s;s.on('message',data=>{const event=JSON.parse(data);if(event.type==='auth')s.send(JSON.stringify({type:event.token==='old'?'ready':'reauthenticated'}));});});
  try{
-  const c=f.c;c.server='http://127.0.0.1:'+server.address().port;c.engine={state:{messages:{},outbox:{},verified:{}}};c.request=async endpoint=>endpoint==='/api/auth/refresh'?auth():[];c.adoptAuth(auth('old'));c.connect();
+  const c=f.c;c.server='http://127.0.0.1:'+server.address().port;c.engine={state:{messages:{},outbox:{},verified:{}}};c.vault={write:()=>{}};
+  let deadlineReads=0,lastConnectedAt='';
+  c.request=async endpoint=>{
+   if(endpoint==='/api/auth/refresh')return auth();
+   if(endpoint==='/api/account/status'){
+    deadlineReads++;
+    const now=new Date().toISOString();
+    lastConnectedAt=new Date(Date.now()+deadlineReads*1000).toISOString();
+    return {retentionDays:7,serverTime:now,lastConnectedAt,accountExpiresAt:new Date(Date.now()+7*86400000).toISOString()};
+   }
+   return [];
+  };
+  c.adoptAuth(auth('old'));c.connect();
   for(let i=0;!c.online&&i<100;i++)await new Promise(r=>setTimeout(r,5));assert(c.online);
-  const socket=c.socket,call={callId:'call',peer:'bob'};c.call=call;
-  assert(await c.refreshSession());await new Promise(r=>setTimeout(r,10));
+  for(let i=0;!c.snapshot().accountStatus&&i<100;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(deadlineReads,1,'initial ready records an account deadline');
+  const socket=c.socket,peerAccountId='2f1c8d0e-6f1b-4a3c-9d2e-1b0a7c4f5e60';
+  c.contactState.bob={username:'bob',status:'accepted',accountId:peerAccountId};
+  c.engine.state.peerAccountIds={bob:peerAccountId};
+  const call={callId:'call',peer:'bob',accountId:peerAccountId};c.call=call;
+  assert(await c.refreshSession());
+  for(let i=0;deadlineReads<2&&i<100;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(deadlineReads,2,'reauthentication refreshes the cached deadline');
+  for(let i=0;c.snapshot().accountStatus?.lastConnectedAt!==lastConnectedAt&&i<100;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(c.snapshot().accountStatus.lastConnectedAt,lastConnectedAt,'new deadline is saved in the current account');
   assert.equal(c.socket,socket);assert.equal(c.call,call);assert.equal(c.token,'new');assert.equal(c.refreshToken,'n'.repeat(43));assert(c.online);
  }finally{f.close();peer?.terminate();await new Promise(r=>server.close(r));}
 });

@@ -4,6 +4,7 @@ const WebSocket=require('ws');
 const {SignalEngine}=require('./signal.cjs');
 const {Vault,AccountRegistry}=require('./vault.cjs');
 const Location=require('./ui/features.js');
+const Files=require('./ui/file-format.js');
 const validUser=user=>typeof user==='string'&&/^[a-z0-9_\p{Script=Han}]{2,32}$/u.test(user);
 const DEFAULT_CONNECTION_OPTIONS={readyTimeoutMs:30000,heartbeatIntervalMs:30000,pongTimeoutMs:10000,retryBaseMs:1000,retryMaxMs:30000,ackTimeoutMs:30000,random:Math.random};
 
@@ -40,8 +41,8 @@ class Controller {
       identityChanges:this.engine?.state.identityChanges||{},
       messageRevision:this.messageRevision,unread:{...this.unread},
       outboxIds:Object.keys(this.engine?.state.outbox||{}),
-      accountStatus:this.engine?.state.accountStatus?.accountId===this.accountId?this.engine.state.accountStatus:null,
-      ...(includeMessages?{messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>m) : []}:{messageChanges:{...this.messageChanges,...this.pendingMessageChanges}})};
+      accountStatus:this.accountId&&this.engine?.state.accountStatus?.accountId===this.accountId?this.engine.state.accountStatus:null,
+      ...(includeMessages?{messages:this.engine ? Object.values(this.engine.state.messages).map(({ciphertext,...m})=>({...m,body:Files.publicBody(m.body)})) : []}:{messageChanges:Object.fromEntries(Object.entries({...this.messageChanges,...this.pendingMessageChanges}).map(([key,m])=>[key,m&&({...m,body:Files.publicBody(m.body)})]))})};
   }
   rebuildMessageMetadata(){
     this.sessionPeers.clear();this.serverMessageKeys.clear();
@@ -79,7 +80,7 @@ class Controller {
       state.messages=messages;
       const changes={};for(const key of touched.keys())changes[key]=messages[key]||null;
       try{this.vault.write(state,changes);}catch(e){this.storageFailed=true;throw e;}
-      Object.assign(this.pendingMessageChanges,Object.fromEntries(Object.entries(changes).map(([key,value])=>[key,value&&(({ciphertext,...message})=>message)(value)])));
+      Object.assign(this.pendingMessageChanges,Object.fromEntries(Object.entries(changes).map(([key,value])=>[key,value&&(({ciphertext,...message})=>({...message,body:Files.publicBody(message.body)}))(value)])));
       for(const [key,value] of Object.entries(changes)){
         const old=touched.get(key);if(old?.id)this.serverMessageKeys.delete(old.id);
         if(value){const peer=value.sender===this.user?value.recipient:value.sender;if(peer&&peer!==this.user)this.sessionPeers.add(peer);if(value.id)this.serverMessageKeys.set(value.id,key);}
@@ -464,7 +465,7 @@ class Controller {
       await this.request('/api/account-events/ack','POST',{ids:events.slice(start,start+1000).map(event=>event.id)});
   }
   async event(event) {
-    if(event.type==='reauthenticated')return;
+    if(event.type==='reauthenticated'){this.refreshAccountStatus().catch(()=>{});return;}
     if(event.type==='call'){this.receiveCall(event);return;}
     if(event.type==='call_error'){if(this.call&&event.callId===this.call.callId){this.notify({type:'call_error',event});this.endCall(event.error||'通话信令失败');}return;}
     if(event.type==='ready') {
@@ -545,12 +546,18 @@ class Controller {
     }
     this.liveSessions.clear();
   }
-  async send({peer,body,ephemeral=false,location=false}) {
+  filePeer(peer){
+    if(!this.engine||!this.online||this.contactState[peer]?.status!=='accepted'||this.engine.state.deletedPeers?.[peer]||this.engine.state.identityChanges?.[peer]||!this.engine.state.verified?.[peer])throw Error('文件只能发给已接受且身份已核对的联系人');
+    return this.callPeer(peer);
+  }
+  async sendFileDescriptor({peer,body}){if(!Files.parse(body))throw Error('文件信息无效');this.filePeer(peer);return this.send({peer,body,file:true});}
+  async send({peer,body,ephemeral=false,location=false,file=false}) {
     if(!location&&typeof body==='string'&&body.startsWith(Location.PREFIX))return this.sendLocation({peer,body});
+    if(typeof body==='string'&&(body.startsWith(Files.PREFIX)||body.startsWith(Files.CARD))&&!file)throw Error('文件消息必须通过文件选择器发送');
     const generation=this.generation;
     if(!this.engine||!this.online)throw new Error('请等待连接恢复');
     if(!validUser(peer)||peer===this.user)throw new Error('请输入另一位有效用户');
-    if(typeof body!=='string'||!body.trim()||body.length>4000)throw new Error('消息须为 1–4000 字符');
+    if(typeof body!=='string'||!body.trim()||body.length>=4000)throw new Error('消息须为 1–3999 字符');
     if(this.engine.state.identityChanges?.[peer])throw new Error('设备身份已更新，请先核对新的安全码');
     const status=this.contactState[peer]?.status;
     if(status==='pending_incoming')throw new Error('请先接受对方的聊天请求');

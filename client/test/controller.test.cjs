@@ -13,6 +13,31 @@ function fixture(){
   controller.contactState={'小红':{username:'小红',status:'accepted',online:true}};
   return {controller,close:()=>fs.rmSync(dir,{recursive:true,force:true})};
 }
+test('a new controller and logout expose no account status without an engine',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'chat-controller-'));
+  try{
+    const controller=new Controller(dir,fakeStorage,()=>{});
+    assert.equal(controller.snapshot().accountStatus,null);
+    assert.equal(controller.snapshot(false).accountStatus,null);
+    controller.logout();
+    assert.equal(controller.snapshot().accountStatus,null);
+    assert.equal(controller.snapshot(false).accountStatus,null);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
+test('account status belongs only to the current account id',()=>{
+  const {controller,close}=fixture();
+  try{
+    const status={accountId:'account-one',accountExpiresAt:'2026-11-01T00:00:00Z'};
+    controller.engine.state.accountStatus=status;
+    assert.equal(controller.snapshot().accountStatus,null,'missing current account id cannot expose a saved deadline');
+    controller.accountId='account-one';
+    assert.equal(controller.snapshot().accountStatus,status);
+    controller.accountId='account-two';
+    assert.equal(controller.snapshot().accountStatus,null);
+    controller.accountId=null;
+    assert.equal(controller.snapshot().accountStatus,null);
+  }finally{close();}
+});
 test('All usernames allow two characters',()=>{
   for(const name of ['ab','小明','张三_1','alice','abc_123'])assert.equal(validUser(name),true);
   for(const name of ['a','Aaa','小','小 明','a-b','😀😀','a'.repeat(33)])assert.equal(validUser(name),false);
