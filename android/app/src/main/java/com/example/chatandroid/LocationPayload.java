@@ -11,16 +11,16 @@ import java.util.UUID;
 public final class LocationPayload {
     public static final String PREFIX = "CHAT_LOCATION_V1:";
     public static final long MAX_DURATION = 3600000L;
-    public final String kind, sessionId, recordedAt, expiresAt;
+    public final String kind, sessionId, recordedAt, expiresAt, address;
     public final int seq;
     public final double latitude, longitude, accuracy;
     public final long recordedMillis, expiresMillis;
     public final boolean expired;
     private LocationPayload(JSONObject json, long now) throws Exception {
-        if (json.length() != (json.has("latitude") ? 9 : 6)) throw new Exception("Invalid location fields");
+        if (json.length() != (json.has("latitude") ? 9 : 6) + (json.has("address") ? 1 : 0)) throw new Exception("Invalid location fields");
         for (Iterator<String> it = json.keys(); it.hasNext();) {
             String key = it.next();
-            if (!java.util.Arrays.asList("v","kind","sessionId","seq","latitude","longitude","accuracy","recordedAt","expiresAt").contains(key)) throw new Exception("Unknown field");
+            if (!java.util.Arrays.asList("v","kind","sessionId","seq","latitude","longitude","accuracy","address","recordedAt","expiresAt").contains(key)) throw new Exception("Unknown field");
         }
         if (integer(json.opt("v")) != 1) throw new Exception("Version");
         kind = string(json, "kind");
@@ -39,6 +39,9 @@ public final class LocationPayload {
         latitude = coords ? number(json, "latitude", -90, 90) : Double.NaN;
         longitude = coords ? number(json, "longitude", -180, 180) : Double.NaN;
         accuracy = coords ? number(json, "accuracy", 0, 100000) : Double.NaN;
+        address = json.has("address") ? string(json,"address") : "";
+        if (!address.isEmpty() && (!kind.equals("pin") && !kind.equals("live") || !validAddress(address))) throw new Exception("Invalid address");
+        if (json.has("address") && address.isEmpty()) throw new Exception("Empty address");
         expired = now >= expiresMillis;
     }
     public static LocationPayload parse(String body, long now) {
@@ -47,12 +50,21 @@ public final class LocationPayload {
         catch (Exception ignored) { return null; }
     }
     public static String encode(String kind, String session, int seq, double latitude, double longitude, double accuracy, long now, long expiry) throws Exception {
+        return encode(kind,session,seq,latitude,longitude,accuracy,now,expiry,"");
+    }
+    public static String encode(String kind, String session, int seq, double latitude, double longitude, double accuracy, long now, long expiry, String address) throws Exception {
         JSONObject json = new JSONObject().put("v",1).put("kind",kind).put("sessionId",session).put("seq",seq)
                 .put("recordedAt",Instant.ofEpochMilli(now).toString()).put("expiresAt",Instant.ofEpochMilli(expiry).toString());
         if (!kind.equals("stop")) json.put("latitude",latitude).put("longitude",longitude).put("accuracy",accuracy);
+        if (address != null && !address.isEmpty()) json.put("address",address);
         String body = PREFIX + json;
         if (parse(body,now) == null) throw new IllegalArgumentException("位置数据无效");
         return body;
+    }
+    public static boolean validAddress(String value) {
+        if (value == null || value.isEmpty() || value.length() > 256 || value.trim().isEmpty()) return false;
+        for (int i=0; i<value.length(); i++) { char c=value.charAt(i); if (c < 32 || c >= 127 && c <= 159) return false; }
+        return true;
     }
     private static long strictInstant(String value) throws Exception {
         Instant instant = Instant.parse(value);

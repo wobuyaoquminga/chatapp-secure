@@ -92,7 +92,10 @@ final class MessageIndex {
         String deleted = String.valueOf(state.optJSONObject("deletedPeers"));
         String identityChanges = String.valueOf(state.optJSONObject("identityChanges"));
         StringBuilder rows = new StringBuilder(index.conversations.toString());
-        for (String peer : index.conversations) rows.append(index.latest.get(peer));
+        for (String peer : index.conversations) {
+            List<String> keys = index.rowKeys.get(peer);
+            rows.append(keys == null || keys.isEmpty() ? "null" : keys.get(keys.size() - 1));
+        }
         index.messageRows = rows.append(state.optJSONObject("unread")).append(relations).append(deleted).append(identityChanges).toString();
         index.contactRows = index.contacts.toString() + relations + deleted + identityChanges;
         return index;

@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('chat',{
   previewFile:(clientId,peer)=>ipcRenderer.invoke('chat:preview-file',clientId,peer),
   cancelFilePreview:()=>ipcRenderer.invoke('chat:cancel-file-preview'),
   openMap:(latitude,longitude)=>ipcRenderer.invoke('chat:open-map',latitude,longitude),
+  reverseLocation:(latitude,longitude,peer)=>ipcRenderer.invoke('chat:reverse-location',latitude,longitude,peer),
   openUpdates:()=>ipcRenderer.invoke('chat:open-updates'),
   checkUpdate:()=>ipcRenderer.invoke('chat:check-update'),
   downloadUpdate:()=>ipcRenderer.invoke('chat:download-update'),

@@ -5,6 +5,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.os.Build;
+import android.os.SystemClock;
 
 import org.json.JSONObject;
 
@@ -102,18 +103,24 @@ final class ServerUpdates {
         if (closed) return;
         UpdatePolicy.Release release = available;
         if (release == null || !server.equals(availableServer)) return;
+        download(server, release);
+    }
+
+    synchronized void download(String server, UpdatePolicy.Release release) {
+        if (closed || release == null) return;
         cancelCallOnly();
         final long task = ++generation;
         worker.execute(() -> {
-            File temporary = new File(folder(), "download.tmp.apk");
+            File temporary = null;
             try {
                 ensureCurrent(task);
                 URI origin = UpdatePolicy.origin(server);
                 URI url = UpdatePolicy.endpoint(origin, release.downloadPath);
                 if (!folder().isDirectory() && !folder().mkdirs()) throw new Exception("无法创建下载目录");
-                if (temporary.exists() && !temporary.delete()) throw new Exception("无法清理旧下载文件");
+                temporary = File.createTempFile("download-", ".tmp.apk", folder());
                 Request request = new Request.Builder().url(url.toString()).header("Accept", "application/vnd.android.package-archive").build();
                 Call call = http.newCall(request);
+                call.timeout().timeout(30, TimeUnit.MINUTES);
                 activate(task, call);
                 try (Response response = call.execute()) {
                     ensureCurrent(task);
@@ -125,7 +132,7 @@ final class ServerUpdates {
                     long total = 0;
                     try (InputStream input = response.body().byteStream(); FileOutputStream output = new FileOutputStream(temporary)) {
                         byte[] buffer = new byte[64 * 1024];
-                        int previousPercent = -1;
+                        long lastTime = SystemClock.elapsedRealtime(), lastBytes = 0;
                         for (int n; (n = input.read(buffer)) != -1;) {
                             ensureCurrent(task);
                             total += n;
@@ -133,10 +140,18 @@ final class ServerUpdates {
                             output.write(buffer, 0, n);
                             hash.update(buffer, 0, n);
                             int percent = (int) (total * 100 / release.size);
-                            if (percent != previousPercent) { report(task, server, "正在下载 " + percent + "%", release, percent, false); previousPercent = percent; }
+                            long now = SystemClock.elapsedRealtime();
+                            if (lastBytes == 0 || now - lastTime >= 1000) {
+                                report(task, server, UpdateProgress.message(total, release.size,
+                                        total - lastBytes, now - lastTime), release, percent, false);
+                                lastTime = now;
+                                lastBytes = total;
+                            }
                         }
                         output.getFD().sync();
                     }
+                    report(task, server, "下载完成，正在校验…（" + UpdateProgress.size(total) + "/"
+                            + UpdateProgress.size(release.size) + "）", release, 100, false);
                     if (total != release.size || !hex(hash.digest()).equals(release.sha256)) throw new Exception("下载文件大小或 SHA256 校验失败");
                     verifyPackage(temporary, release);
                     ensureCurrent(task);
@@ -150,7 +165,7 @@ final class ServerUpdates {
                     report(task, server, "已验证安装包：" + release.version + "。点击安装后由系统确认。", release, 100, true);
                 } finally { if (active == call) active = null; }
             } catch (Exception error) { report(task, server, message(error), release, -1, false); }
-            finally { if (temporary.exists()) temporary.delete(); }
+            finally { if (temporary != null && temporary.exists()) temporary.delete(); }
         });
     }
 
@@ -164,7 +179,9 @@ final class ServerUpdates {
 
     synchronized void verifyForInstall(String server, UpdatePolicy.Release release, Runnable success) {
         if (closed) return;
-        if (release == null || available != release || !server.equals(availableServer)) return;
+        boolean downloaded = release != null && release.sha256.equals(context.getSharedPreferences("verified_update", 0)
+                .getString("sha256", ""));
+        if (release == null || !(available == release && server.equals(availableServer) || downloaded)) return;
         final long task = generation;
         worker.execute(() -> {
             try {

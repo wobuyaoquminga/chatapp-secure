@@ -5,6 +5,9 @@ const msg=p=>({sender:'alice',recipient:'bob',body:F.encode(p),createdAt:p.recor
 test('location parser rejects malformed, range, future, illegal fields and normalized dates',()=>{
  for(const change of [{v:2},{seq:0.5},{seq:2147483648},{latitude:91},{longitude:Infinity},{accuracy:100001},{manual:true},{sessionId:'x'},{recordedAt:'2026-02-30T00:00:00Z',expiresAt:'2026-02-30T00:30:00Z'},{recordedAt:new Date(Date.now()+301000).toISOString()},{expiresAt:new Date(Date.now()+7200000).toISOString()}])assert.equal(F.parse(F.PREFIX+JSON.stringify(payload(change))),null);
  assert.equal(F.parse(F.PREFIX+'{'),null);assert.ok(F.parse(F.encode(payload())));
+ assert.equal(F.parse(F.encode(payload({address:'南京东路 1 号附近'}))).address,'南京东路 1 号附近');
+ for(const address of ['', ' '.repeat(2),'x'.repeat(257),'路\n口','路\u0085口',23])assert.equal(F.parse(F.PREFIX+JSON.stringify(payload({address}))),null);
+ assert.equal(F.parse(F.PREFIX+JSON.stringify(payload({kind:'stop',latitude:undefined,longitude:undefined,accuracy:undefined,address:'路口'}))),null);
  assert.ok(F.parse(F.encode(payload({kind:'stop',latitude:undefined,longitude:undefined,accuracy:undefined}))));
 });
 test('session reducers isolate senders, reject late seq, stop tombstones and expiry extension',()=>{
@@ -19,6 +22,8 @@ test('local search isolates current peer, paginates inclusive local dates and su
  const messages=Array.from({length:45},(_,i)=>({sender:'alice',recipient:'bob',clientId:String(i),body:'find '+i,createdAt:'2026-06-02T10:00:00Z'}));messages.push({sender:'alice',recipient:'eve',body:'find secret',createdAt:'2026-06-02T10:00:00Z'});
  const first=F.search(messages,'alice','bob',{query:'find',from:'2026-06-01',to:'2026-06-03'}),second=F.search(messages,'alice','bob',{query:'find',page:1});assert.equal(first.total,45);assert.equal(first.items.length,20);assert.equal(second.items.length,20);assert.equal(first.items.some(m=>m.recipient==='eve'),false);assert.equal(F.search(messages,'eve','bob').total,0);
  assert.ok(F.summary(F.encode(payload({kind:'pin'}))).startsWith('[位置]'));assert.ok(!F.summary(F.encode(payload())).includes(F.PREFIX));
+ assert.equal(F.summary(F.encode(payload({address:'南京东路附近'}))),'[实时位置] 南京东路附近');
+ assert.equal(F.summary(F.encode(payload({kind:'pin'}))),'[位置] 暂无详细地址');
 });
 test('location body travels only in libsignal ciphertext, caches survive engine reload',async()=>{
  const a=await SignalEngine.create('alice'),b=await SignalEngine.create('bob'),bundle=await b.publicBundle(2);bundle.username='bob';bundle.preKey=bundle.preKeys[0];await a.establish('bob',bundle);

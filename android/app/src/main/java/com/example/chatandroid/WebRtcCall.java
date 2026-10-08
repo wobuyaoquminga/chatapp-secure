@@ -4,9 +4,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.media.AudioManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -143,6 +145,11 @@ final class WebRtcCall {
                     ((MainActivity) activity).requestCallPermissions(incoming.mode);
                 })
                 .setOnCancelListener(d -> finish("", true, "reject")).show();
+        android.widget.Button reject = ringDialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+        if (reject != null) {
+            reject.setTextColor(Color.WHITE);
+            reject.setBackgroundResource(R.drawable.dialog_destructive_button);
+        }
     }
 
     void onBackgrounded() {
@@ -345,8 +352,9 @@ final class WebRtcCall {
             if (event.getAction() == KeyEvent.ACTION_UP) setMinimized(true);
             return true;
         });
-        dialog.show();
         Window window = dialog.getWindow();
+        if (window != null) window.setWindowAnimations(R.style.ChatCallAnimation);
+        dialog.show();
         if (window != null) {
             window.setBackgroundDrawableResource(android.R.color.transparent);
             window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
@@ -560,9 +568,14 @@ final class WebRtcCall {
     private void addButton(LinearLayout row, String label, Runnable action) {
         TextView button = new TextView(activity);
         button.setText(label); button.setTextColor(Color.WHITE); button.setTextSize(15);
-        button.setGravity(Gravity.CENTER); button.setPadding(10, 20, 10, 20);
+        button.setGravity(Gravity.CENTER); button.setPadding(dp(4), dp(10), dp(4), dp(10));
+        int fill = label.equals("挂断") ? Color.rgb(184, 53, 48) : Color.rgb(49, 74, 73);
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.rgb(144, 178, 162)),
+                roundBackground(fill, dp(11)), null));
         button.setOnClickListener(v -> action.run());
-        row.addView(button, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(48), 1);
+        params.setMargins(dp(2), 0, dp(2), 0);
+        row.addView(button, params);
     }
 
     private int dp(int size) { return Math.round(size * activity.getResources().getDisplayMetrics().density); }

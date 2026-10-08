@@ -107,7 +107,10 @@ final class UpdatePolicy {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         try (InputStream input = new FileInputStream(file)) {
             byte[] buffer = new byte[64 * 1024];
-            for (int n; (n = input.read(buffer)) != -1;) digest.update(buffer, 0, n);
+            for (int n; (n = input.read(buffer)) != -1;) {
+                if (Thread.currentThread().isInterrupted()) throw new InterruptedException("下载已取消");
+                digest.update(buffer, 0, n);
+            }
         }
         StringBuilder result = new StringBuilder(64);
         for (byte b : digest.digest()) result.append(String.format(Locale.ROOT, "%02x", b & 255));

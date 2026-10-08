@@ -8,6 +8,30 @@
   function create({command,notice,getState,getPeer}) {
     const $=id=>document.getElementById(id);
     let current=null,actionsOpen=false;
+    const cameraKey='chatPreferredCamera';
+    const cameraSelect=$('cameraSelect');
+    async function cameras() {
+      return (await navigator.mediaDevices.enumerateDevices()).filter(device=>device.kind==='videoinput'&&device.deviceId);
+    }
+    function preferredCamera(devices) {
+      const saved=localStorage.getItem(cameraKey);
+      if(saved){const selected=devices.find(device=>device.deviceId===saved);if(selected)return selected;}
+      return devices.find(device=>/usb.*(?:webcam|camera)|(?:webcam|camera).*usb|integrated|built.in|内置摄像头/i.test(device.label)&&!/virtual|虚拟/i.test(device.label))
+        ||devices.find(device=>!/virtual|虚拟|手机|前置|后置/i.test(device.label))||devices[0];
+    }
+    async function refreshCameras() {
+      try {
+        const devices=await cameras(),saved=localStorage.getItem(cameraKey);
+        cameraSelect.replaceChildren();
+        const automatic=document.createElement('option');automatic.value='';automatic.textContent='自动选择本机摄像头';cameraSelect.append(automatic);
+        devices.forEach((device,index)=>{const option=document.createElement('option');option.value=device.deviceId;option.textContent=device.label||`摄像头 ${index+1}`;cameraSelect.append(option);});
+        cameraSelect.value=devices.some(device=>device.deviceId===saved)?saved:'';
+        cameraSelect.disabled=!devices.length;
+      }catch{cameraSelect.disabled=true;}
+    }
+    cameraSelect.onchange=()=>{if(cameraSelect.value)localStorage.setItem(cameraKey,cameraSelect.value);else localStorage.removeItem(cameraKey);};
+    navigator.mediaDevices?.addEventListener?.('devicechange',refreshCameras);
+    refreshCameras();
     function updateVideo(item) {
       if(!same(item))return;
       $('callVideos').classList.toggle('hasLocalVideo',!!item.stream);
@@ -111,9 +135,14 @@
       if(!same(item))return;
       try{
         if(!navigator.mediaDevices?.getUserMedia)throw new Error('此设备无法使用麦克风或摄像头');
-        item.stream=await navigator.mediaDevices.getUserMedia({audio:true,video:item.mode==='video'});
+        let video=false;
+        if(item.mode==='video'){
+          const selected=preferredCamera(await cameras().catch(()=>[]));
+          video=selected?{deviceId:{exact:selected.deviceId}}:true;
+        }
+        item.stream=await navigator.mediaDevices.getUserMedia({audio:true,video});
       }catch(error){
-        if(error.name==='NotFoundError'||error.name==='DevicesNotFoundError')throw new Error(item.mode==='video'?'未找到可用的麦克风或摄像头':'未找到可用的麦克风');
+        if(['NotFoundError','DevicesNotFoundError','OverconstrainedError'].includes(error.name))throw new Error(item.mode==='video'?'所选摄像头或麦克风不可用，请在设置中重新选择摄像头':'未找到可用的麦克风');
         if(error.name==='NotAllowedError'||error.name==='PermissionDeniedError'||error.name==='SecurityError')throw new Error(item.mode==='video'?'麦克风或摄像头权限被拒绝，请检查 Windows 隐私设置':'麦克风权限被拒绝，请检查 Windows 隐私设置');
         if(error.name==='NotReadableError'||error.name==='TrackStartError')throw new Error(item.mode==='video'?'麦克风或摄像头正被其他程序占用，请关闭占用程序后重试':'麦克风正被其他程序占用，请关闭占用程序后重试');
         throw error;

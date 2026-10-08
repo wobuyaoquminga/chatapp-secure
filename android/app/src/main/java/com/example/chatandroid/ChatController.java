@@ -238,12 +238,15 @@ final class ChatController {
     }
     void sendPin(String peer, double latitude, double longitude, double accuracy) { sendPin(peer,latitude,longitude,accuracy,generation); }
     void sendPin(String peer, double latitude, double longitude, double accuracy, long expectedContext) {
+        sendPin(peer,latitude,longitude,accuracy,expectedContext,"");
+    }
+    void sendPin(String peer, double latitude, double longitude, double accuracy, long expectedContext, String address) {
         execute(() -> {
             if (expectedContext != generation) throw new Exception("账号或连接已改变，请重新获取位置");
             requireLocationPeer(peer);
             long now = System.currentTimeMillis();
             sendBody(peer, LocationPayload.encode("pin", java.util.UUID.randomUUID().toString(),
-                    0, latitude, longitude, accuracy, now, now + LocationPayload.MAX_DURATION), false);
+                    0, latitude, longitude, accuracy, now, now + LocationPayload.MAX_DURATION,address), false);
         });
     }
     void startLive(String peer) { startLive(peer,generation); }
@@ -263,6 +266,9 @@ final class ChatController {
         });
     }
     void sendLiveLocation(double latitude, double longitude, double accuracy) {
+        sendLiveLocation(latitude,longitude,accuracy,"");
+    }
+    void sendLiveLocation(double latitude, double longitude, double accuracy, String address) {
         execute(() -> {
             long now = System.currentTimeMillis();
             if (liveSession.isEmpty()) return;
@@ -270,7 +276,7 @@ final class ChatController {
             if (now - lastLiveSent < 10000) return;
             try {
                 requireLocationPeer(livePeer);
-                sendBody(livePeer, LocationPayload.encode("live", liveSession, liveSeq++, latitude, longitude, accuracy, now, liveExpiry), true);
+                sendBody(livePeer, LocationPayload.encode("live", liveSession, liveSeq++, latitude, longitude, accuracy, now, liveExpiry,address), true);
                 lastLiveSent = now;
             } catch (Exception error) { stopLiveInternal(); throw error; }
         });

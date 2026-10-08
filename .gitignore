@@ -36,3 +36,6 @@ docs/verification/
 **/credentials.json
 **/logcat*.txt
 **/logcat*.log
+
+# Local map-service credentials
+**/geocoding.json

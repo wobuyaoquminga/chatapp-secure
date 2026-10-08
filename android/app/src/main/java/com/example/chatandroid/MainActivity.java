@@ -12,6 +12,7 @@ import android.graphics.Bitmap;
 import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.InsetDrawable;
 import android.content.res.ColorStateList;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
@@ -58,6 +59,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private static final int INK = Color.rgb(29, 39, 42);
     private static final int MUTED = Color.rgb(106, 117, 119);
     private static final int GREEN = Color.rgb(9, 132, 78);
+    private static final int RED = Color.rgb(184, 53, 48);
     private static final int BG = Color.rgb(246, 248, 247);
     private static final int BORDER = Color.rgb(228, 233, 230);
     private ChatController controller;
@@ -185,6 +187,16 @@ public final class MainActivity extends Activity implements ChatController.Liste
         super.onNewIntent(intent);
         setIntent(intent);
         openNotifiedConversation();
+        openNotifiedUpdates();
+    }
+
+    private void openNotifiedUpdates() {
+        if (getIntent().getBooleanExtra("openUpdates", false)) {
+            getIntent().removeExtra("openUpdates");
+            detailPeer = "";
+            page = "settings";
+            render();
+        }
     }
 
     private void openNotifiedConversation() {
@@ -198,6 +210,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        UpdateDownloadService.attach(this);
         if (controller != null) controller.setVisibleConversation(true, detailPeer);
         if (signedIn()) CallNotifier.ensurePermission(this);
         openNotifiedConversation();
@@ -213,10 +226,12 @@ public final class MainActivity extends Activity implements ChatController.Liste
         }
         main.removeCallbacks(expiryRefresh);
         main.post(expiryRefresh);
+        openNotifiedUpdates();
     }
 
     @Override protected void onStop() {
         foreground = false;
+        UpdateDownloadService.detach(this);
         if (controller != null) controller.setVisibleConversation(false, "");
         if (call != null) call.onBackgrounded();
         main.removeCallbacks(expiryRefresh);
@@ -369,7 +384,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
         bar.setPadding(dp(16), dp(11), dp(12), dp(11));
         bar.setBackgroundColor(Color.WHITE);
         if (!detailPeer.isEmpty() || !loginUser.isEmpty() && !signed || page.equals("settings") && !signed)
-            bar.addView(button("‹", 30, INK, v -> onBackPressed()), new LinearLayout.LayoutParams(dp(40), dp(44)));
+            bar.addView(button("‹", 30, INK, v -> onBackPressed()), new LinearLayout.LayoutParams(dp(48), dp(48)));
         LinearLayout labels = column();
         String title = !detailPeer.isEmpty() ? detailPeer : page.equals("settings") ? "设置" :
                 signed ? page.equals("contacts") ? "联系人" : "消息" :
@@ -385,13 +400,13 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (signed && !detailPeer.isEmpty()) {
             TextView more = button("⋮", 27, INK, v -> showChatMenu());
             more.setContentDescription("聊天菜单");
-            bar.addView(more, new LinearLayout.LayoutParams(dp(44), dp(44)));
+            bar.addView(more, new LinearLayout.LayoutParams(dp(48), dp(48)));
             JSONObject sharing = state.optJSONObject("locationSharing");
             if (sharing != null && sharing.optBoolean("active"))
-                bar.addView(button("停止共享", 13, GREEN, v -> locationSharing.stopLive()));
+                bar.addView(button("停止共享", 13, RED, v -> locationSharing.stopLive()));
         }
         if (signed && detailPeer.isEmpty() && !page.equals("settings"))
-            bar.addView(button("＋", 27, INK, v -> promptPeer()), new LinearLayout.LayoutParams(dp(44), dp(44)));
+            bar.addView(button("＋", 27, INK, v -> promptPeer()), new LinearLayout.LayoutParams(dp(48), dp(48)));
         if (!signed && page.equals("messages") && !server().isEmpty() && loginUser.isEmpty())
             bar.addView(button("设置", 14, GREEN, v -> { page = "settings"; render(); }));
         header.addView(bar);
@@ -743,7 +758,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
                 .show());
         fileSendButton.setEnabled(maySendFile);
         fileSendButton.setTextColor(maySendFile ? GREEN : MUTED);
-        fileActions.addView(fileSendButton, new LinearLayout.LayoutParams(dp(100), dp(44)));
+        fileActions.addView(fileSendButton, new LinearLayout.LayoutParams(dp(100), dp(48)));
         fileStatusView = text(fileNotice, 12, false, MUTED);
         fileStatusView.setGravity(Gravity.CENTER_VERTICAL);
         fileActions.addView(fileStatusView, new LinearLayout.LayoutParams(0, dp(44), 1));
@@ -969,7 +984,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             // Offline drawn preview: no external tiles, geocoding or automatic coordinate requests.
             LocationPreview preview = new LocationPreview(this, point.latitude, point.longitude);
             bubble.addView(preview, new LinearLayout.LayoutParams(dp(235), dp(116)));
-            bubble.addView(text(String.format(java.util.Locale.ROOT, "纬度 %.6f · 经度 %.6f", point.latitude, point.longitude), 12, false, INK));
+            bubble.addView(text(point.address.isEmpty() ? "暂无详细地址" : point.address, 14, false, INK));
             bubble.addView(text((point.accuracy > 0 ? "精度约 " + Math.round(point.accuracy) + " 米" : "精度未提供") + " · " + MessageTime.format(point.recordedAt), 12, false, MUTED));
             TextView open = button("用地图应用打开", 13, GREEN, v -> openLocationInMap(point));
             bubble.addView(open);
@@ -1006,10 +1021,10 @@ public final class MainActivity extends Activity implements ChatController.Liste
 
     private void promptLiveLocation() {
         if (locationSharing.isLive()) {
-            new AlertDialog.Builder(this).setTitle("实时位置共享中")
+            showDestructiveDialog(new AlertDialog.Builder(this).setTitle("实时位置共享中")
                     .setMessage("正在与 " + locationSharing.peer() + " 共享位置。")
                     .setNegativeButton("继续共享", null)
-                    .setPositiveButton("停止共享", (dialog, which) -> locationSharing.stopLive()).show();
+                    .setPositiveButton("停止共享", (dialog, which) -> locationSharing.stopLive()));
             return;
         }
         if (!canSendLocation(detailPeer)) {
@@ -1178,7 +1193,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             LinearLayout line = row();
             line.addView(rowItem(address, address.equals(server()) ? "当前服务器" : "点击切换",
                     () -> switchServer(address)), new LinearLayout.LayoutParams(0, -2, 1));
-            line.addView(button("移除", 13, MUTED, v -> confirmRemove(address)));
+            line.addView(button("移除", 13, RED, v -> confirmRemove(address)));
             body.addView(line);
         }
         body.addView(space(14));
@@ -1375,6 +1390,7 @@ public final class MainActivity extends Activity implements ChatController.Liste
             return;
         }
         if (updateBusy()) return;
+        UpdateDownloadService.clearResult();
         updateServer = address; updateMessage = "正在检查当前服务器…";
         updateRelease = null; updateReady = false; updatePercent = -1; updatePhase = "checking";
         refreshUpdatePanel();
@@ -1385,13 +1401,35 @@ public final class MainActivity extends Activity implements ChatController.Liste
         if (serverUpdates == null || updateRelease == null || !server().equals(updateServer) || updateBusy()) return;
         updateMessage = "正在连接下载…"; updatePercent = 0; updatePhase = "downloading";
         refreshUpdatePanel();
-        serverUpdates.download(updateServer);
+        UpdateDownloadService.start(this, updateServer, updateRelease);
     }
 
     private void cancelServerUpdate() {
+        UpdateDownloadService.cancel(this);
         if (serverUpdates != null) serverUpdates.cancel();
         updateMessage = "下载已取消"; updateRelease = null; updateReady = false;
         updatePercent = -1; updatePhase = "";
+        refreshUpdatePanel();
+    }
+
+    void onUpdateDownloadSnapshot(UpdateDownloadService.Snapshot snapshot) {
+        if (destroyed) return;
+        if (snapshot == null) {
+            if ("downloading".equals(updatePhase)) {
+                updateMessage = "下载已取消";
+                updatePercent = -1;
+                updateReady = false;
+                updatePhase = "";
+                refreshUpdatePanel();
+            }
+            return;
+        }
+        updateServer = snapshot.server;
+        updateMessage = snapshot.message;
+        updateRelease = snapshot.release;
+        updatePercent = snapshot.percent;
+        updateReady = snapshot.ready;
+        updatePhase = snapshot.active ? "downloading" : "";
         refreshUpdatePanel();
     }
 
@@ -1647,16 +1685,17 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     private void confirmRemove(String address) {
-        new AlertDialog.Builder(this).setTitle("移除服务器？")
+        showDestructiveDialog(new AlertDialog.Builder(this).setTitle("移除服务器？")
                 .setMessage("将从服务器列表移除此地址及本机保存的账号入口。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("移除", (d, w) -> {
                     if (address.equals(server())) resetServerUpdate();
                     controller.removeServer(address);
-                }).show();
+                }));
     }
 
     private void resetServerUpdate() {
+        UpdateDownloadService.cancel(this);
         if (serverUpdates != null) serverUpdates.cancel();
         updateRelease = null;
         updateServer = "";
@@ -1737,17 +1776,17 @@ public final class MainActivity extends Activity implements ChatController.Liste
     }
 
     private void confirmRemoveContact(String peer) {
-        new AlertDialog.Builder(this).setTitle("删除联系人？")
+        showDestructiveDialog(new AlertDialog.Builder(this).setTitle("删除联系人？")
                 .setMessage("解除与 " + peer + " 的联系人关系，双方聊天记录仍会保留。再次发送消息需对方重新同意。")
                 .setNegativeButton("取消", null)
-                .setPositiveButton("删除", (d, w) -> controller.removeContact(peer)).show();
+                .setPositiveButton("删除", (d, w) -> controller.removeContact(peer)));
     }
 
     private void confirmClearConversation(String peer) {
-        new AlertDialog.Builder(this).setTitle("清除会话？")
+        showDestructiveDialog(new AlertDialog.Builder(this).setTitle("清除会话？")
                 .setMessage("将 " + peer + " 从会话列表移除。聊天记录仍保留，新消息到来或重新打开时会显示。")
                 .setNegativeButton("取消", null)
-                .setPositiveButton("清除", (d, w) -> controller.clearConversation(peer)).show();
+                .setPositiveButton("清除", (d, w) -> controller.clearConversation(peer)));
     }
 
     @Override public void onState(JSONObject snapshot, String error) {
@@ -1792,7 +1831,8 @@ public final class MainActivity extends Activity implements ChatController.Liste
         String oldSafetyChange = oldChanges == null ? "" : String.valueOf(oldChanges.opt(safetyPeer));
         state = snapshot == null ? new JSONObject() : snapshot;
         if (fileBusy && fileUiContext != controller.locationContext()) onFileState("", false);
-        if (!previousServer.equals(server())) {
+        if (!previousServer.isEmpty() && !previousServer.equals(server())) {
+            UpdateDownloadService.cancel(this);
             if (serverUpdates != null) serverUpdates.cancel();
             updateRelease = null; updateMessage = ""; updateServer = ""; updatePercent = -1; updateReady = false; updatePhase = "";
         }
@@ -1934,6 +1974,15 @@ public final class MainActivity extends Activity implements ChatController.Liste
             dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
     }
 
+    private void showDestructiveDialog(AlertDialog.Builder builder) {
+        AlertDialog dialog = builder.show();
+        android.widget.Button action = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        if (action != null) {
+            action.setTextColor(Color.WHITE);
+            action.setBackgroundResource(R.drawable.dialog_destructive_button);
+        }
+    }
+
     private LinearLayout column() {
         LinearLayout value = new LinearLayout(this);
         value.setOrientation(LinearLayout.VERTICAL);
@@ -1983,8 +2032,12 @@ public final class MainActivity extends Activity implements ChatController.Liste
     private TextView button(String value, int size, int color, View.OnClickListener click) {
         TextView label = text(value, size, false, color);
         label.setGravity(Gravity.CENTER);
-        label.setPadding(dp(9), dp(7), dp(9), dp(7));
-        label.setBackground(interactiveBackground(Color.TRANSPARENT, 11, Color.TRANSPARENT));
+        label.setPadding(dp(11), dp(7), dp(11), dp(7));
+        label.setMinimumWidth(dp(48));
+        label.setMinimumHeight(dp(48));
+        int fill = color == GREEN ? Color.rgb(232, 247, 237) : color == RED ? Color.rgb(255, 238, 236)
+                : color == MUTED ? BG : Color.WHITE;
+        label.setBackground(new InsetDrawable(interactiveBackground(fill, 11, BORDER), dp(2)));
         label.setOnClickListener(click);
         return label;
     }

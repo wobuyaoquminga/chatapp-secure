@@ -26,13 +26,14 @@ final class HistorySearch {
         for (int i = history.size() - 1; i >= 0; i--) {
             if (cancelled.getAsBoolean()) return new ArrayList<>();
             JSONObject item = history.get(i);
-            if (!item.has("body") || !preview(item).toLowerCase(Locale.ROOT).contains(needle)) continue;
+            if (!item.has("body")) continue;
             if (first != null || last != null) {
                 LocalDate day;
                 try { day = Instant.parse(item.optString("createdAt")).atZone(zone).toLocalDate(); }
                 catch (Exception invalid) { continue; }
                 if (first != null && day.isBefore(first) || last != null && day.isAfter(last)) continue;
             }
+            if (!needle.isEmpty() && !preview(item).toLowerCase(Locale.ROOT).contains(needle)) continue;
             matches.add(i);
         }
         return matches;
@@ -47,7 +48,7 @@ final class HistorySearch {
         if (location == null) return body;
         if (location.kind.equals("stop")) return "实时位置 · 已停止";
         return (location.kind.equals("pin") ? "当前位置" : "实时位置") + String.format(Locale.ROOT,
-                " · 纬度 %.6f · 经度 %.6f · 精度约 %.0f 米", location.latitude, location.longitude, location.accuracy);
+                " · %s · 精度约 %.0f 米", location.address.isEmpty() ? "暂无详细地址" : location.address, location.accuracy);
     }
     private static LocalDate date(String text) {
         if (text.trim().isEmpty()) return null;

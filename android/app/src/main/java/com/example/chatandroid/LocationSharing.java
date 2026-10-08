@@ -18,16 +18,18 @@ public final class LocationSharing implements AutoCloseable {
     private final ChatController controller;
     private final Listener listener;
     private final LocationManager manager;
+    private final AddressResolver addresses;
     private final Handler main = new Handler(Looper.getMainLooper());
     private LocationListener updates;
     private String peer = "";
     private boolean live, closed;
-    private long started, lastFix, requestContext;
+    private long started, lastFix, requestContext, requestId;
     private final Runnable timeout = () -> finish("定位超时，请检查定位服务后重试");
     private final Runnable expiry = () -> finish("实时位置分享已到期");
     public LocationSharing(Context context, ChatController controller, Listener listener) {
         this.context = context.getApplicationContext(); this.controller = controller; this.listener = listener;
         manager = (LocationManager) this.context.getSystemService(Context.LOCATION_SERVICE);
+        addresses = new AddressResolver(this.context);
         controller.setLocationStoppedListener(() -> {
             if (live || updates != null) { release(); listener.onLocationState(false, "", "位置分享已停止"); }
         });
@@ -63,14 +65,24 @@ public final class LocationSharing implements AutoCloseable {
                 if (live && lastFix > 0 && now - lastFix < 10000) return;
                 main.removeCallbacks(timeout); lastFix = now;
                 if (live) {
-                    controller.sendLiveLocation(position.getLatitude(),position.getLongitude(),position.getAccuracy());
-                    listener.onLocationState(true,peer,"正在分享实时位置 · 误差约 " + Math.round(position.getAccuracy()) + " 米");
+                    long expectedRequest=requestId, expectedContext=requestContext;
+                    String recipient=peer;
+                    addresses.resolve(position.getLatitude(),position.getLongitude(),true,address -> {
+                        if (closed || !live || requestId!=expectedRequest || !recipient.equals(peer) || controller.locationContext()!=expectedContext) return;
+                        controller.sendLiveLocation(position.getLatitude(),position.getLongitude(),position.getAccuracy(),address);
+                        listener.onLocationState(true,peer,"正在分享实时位置 · 误差约 " + Math.round(position.getAccuracy()) + " 米");
+                    });
                 } else {
                     String recipient = peer;
                     long expectedContext = requestContext;
                     release();
-                    controller.sendPin(recipient,position.getLatitude(),position.getLongitude(),position.getAccuracy(),expectedContext);
-                    listener.onLocationState(false,"","位置已发送 · 误差约 " + Math.round(position.getAccuracy()) + " 米");
+                    long expectedRequest=requestId;
+                    listener.onLocationState(false,"","正在解析地址并发送位置…");
+                    addresses.resolve(position.getLatitude(),position.getLongitude(),false,address -> {
+                        if (closed || requestId!=expectedRequest || controller.locationContext()!=expectedContext) return;
+                        controller.sendPin(recipient,position.getLatitude(),position.getLongitude(),position.getAccuracy(),expectedContext,address);
+                        listener.onLocationState(false,"","位置已发送 · 误差约 " + Math.round(position.getAccuracy()) + " 米");
+                    });
                 }
             }
             @Override public void onProviderDisabled(String provider) {
@@ -96,11 +108,12 @@ public final class LocationSharing implements AutoCloseable {
         listener.onLocationState(continuous,target,continuous ? "正在获取位置，分享最长一小时" : "正在获取当前位置");
     }
     private void release() {
+        requestId++;
         if (updates != null && manager != null) { try { manager.removeUpdates(updates); } catch (RuntimeException ignored) { } }
         updates = null; live = false; peer = "";
         main.removeCallbacks(timeout); main.removeCallbacks(expiry);
     }
     private void finish(String notice) { release(); controller.stopLive(); listener.onLocationState(false,"",notice); }
     public void stopLive() { release(); controller.stopLive(); }
-    @Override public void close() { if (closed) return; stopLive(); closed = true; controller.setLocationStoppedListener(null); }
+    @Override public void close() { if (closed) return; stopLive(); closed = true; addresses.close(); controller.setLocationStoppedListener(null); }
 }

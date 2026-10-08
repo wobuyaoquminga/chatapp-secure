@@ -77,6 +77,14 @@ test('media permission requires matching foreground document, server, call and m
   now+=20001;assert.equal(lease.allows(request),false);
 });
 
+test('camera enumeration trusts only the app main frame',()=>{
+  const entryUrl='file:///c:/chat/ui/index.html';
+  assert.equal(MediaLease.trustedFrame({entryUrl,requestingUrl:'file:///C:/chat/ui/index.html',isMainFrame:true}),true);
+  assert.equal(MediaLease.trustedFrame({entryUrl,requestingUrl:'https://other.example',isMainFrame:true}),false);
+  assert.equal(MediaLease.trustedFrame({entryUrl,requestingUrl:entryUrl,isMainFrame:false}),false);
+  assert.equal(MediaLease.trustedFrame({entryUrl,requestingUrl:undefined,isMainFrame:true}),false);
+});
+
 // Deterministic clock so pacing can be asserted without sleeping.
 function fakeTimers(){
   let now=0,id=0;const jobs=new Map();
@@ -91,12 +99,13 @@ function fakeTimers(){
 }
 
 function uiFixture(options={}) {
-  const elements=new Map(),sent=[],pcs=[],notices=[];
+  const elements=new Map(),sent=[],pcs=[],notices=[],mediaRequests=[],saved=new Map(Object.entries(options.saved||{}));
   const timers=options.timers||{setTimeout,clearTimeout,setInterval,clearInterval};
   const element=id=>{
     if(!elements.has(id)){
       const classes=new Set(),listeners={};
-      elements.set(id,{id,hidden:false,disabled:false,textContent:'',srcObject:null,readyState:0,videoWidth:0,style:{},offsetWidth:280,offsetHeight:235,
+      elements.set(id,{id,hidden:false,disabled:false,textContent:'',srcObject:null,readyState:0,videoWidth:0,style:{},offsetWidth:280,offsetHeight:235,options:[],value:'',
+        replaceChildren(){this.options=[];},append(option){this.options.push(option);},
         classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains:name=>classes.has(name)},
         setAttribute(){},addEventListener(name,handler){listeners[name]=handler;},dispatch(name,event){listeners[name]?.({...event,currentTarget:this});},
         setPointerCapture(){},getBoundingClientRect:()=>({left:20,top:20})});
@@ -120,12 +129,30 @@ function uiFixture(options={}) {
     addTrack(track){this.tracks.push(track);}
     getVideoTracks(){return this.tracks.filter(track=>track.kind==='video');}
   }
-  const sandbox={document:{getElementById:element},window:{addEventListener(){}},navigator:{mediaDevices:{getUserMedia:async()=>{if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:FakeStream,crypto,...timers,innerWidth:1000,innerHeight:800};
+  const sandbox={document:{getElementById:element,createElement:()=>({value:'',textContent:''})},window:{addEventListener(){}},localStorage:{getItem:key=>saved.get(key)||null,setItem:(key,value)=>saved.set(key,value),removeItem:key=>saved.delete(key)},navigator:{mediaDevices:{enumerateDevices:async()=>options.devices||[],getUserMedia:async constraints=>{mediaRequests.push(constraints);if(options.mediaError)throw options.mediaError;return stream;}}},RTCPeerConnection:FakePeer,MediaStream:FakeStream,crypto,...timers,innerWidth:1000,innerHeight:800};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../ui/calls.js'),'utf8'),sandbox);
   const command=async(action,payload)=>{if(action==='callIce')return [{urls:'stun:test'}];if(action==='sendCall')sent.push(payload);return true;};
   const calls=sandbox.window.ChatCalls.create({command,notice:message=>notices.push(message),getState:()=>({online:true,username:'alice',contactStates:[{username:'bob',status:'accepted'}]}),getPeer:()=> 'bob'});
-  return {element,calls,sent,pcs,notices};
+  return {element,calls,sent,pcs,notices,mediaRequests,saved};
 }
+
+test('video calls prefer the physical webcam and save a manual camera choice across refresh',async()=>{
+  const devices=[{kind:'videoinput',label:'OPPO A5 Pro（前置）',deviceId:'phone'},{kind:'videoinput',label:'USB2.0 HD UVC WebCam (322e:2233)',deviceId:'webcam'}];
+  const automatic=uiFixture({devices});
+  await automatic.element('startVideoCall').onclick();
+  assert.equal(automatic.mediaRequests[0].video.deviceId.exact,'webcam');
+  automatic.calls.close();
+  const selected=uiFixture({devices});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(selected.element('cameraSelect').options.length,3,'camera list is available before signing in');
+  selected.element('cameraSelect').value='phone';selected.element('cameraSelect').onchange();
+  const reopened=uiFixture({devices,saved:Object.fromEntries(selected.saved)});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(reopened.element('cameraSelect').value,'phone');
+  await reopened.element('startVideoCall').onclick();
+  assert.equal(reopened.mediaRequests[0].video.deviceId.exact,'phone');
+  reopened.calls.close();
+});
 
 test('WebRTC queues remote ICE until SDP and sends local ICE after offer or answer',async()=>{
   const incoming=uiFixture(),id=crypto.randomUUID();

@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -15,7 +17,7 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <application android:label="Chat" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:allowBackup="false"
-        android:fullBackupContent="false" android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:fullBackupContent="false" android:theme="@style/ChatTheme"
         android:networkSecurityConfig="@xml/network_security_config" android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop" android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|fontScale|density|uiMode|locale|layoutDirection">
@@ -26,6 +28,8 @@
         </activity>
         <service android:name=".CallKeepAliveService" android:exported="false"
             android:stopWithTask="false" android:foregroundServiceType="microphone|camera" />
+        <service android:name=".UpdateDownloadService" android:exported="false"
+            android:stopWithTask="false" android:foregroundServiceType="dataSync" />
         <provider android:name=".UpdateInstallProvider" android:authorities="${applicationId}.updates"
             android:exported="false" android:grantUriPermissions="true" />
     </application>

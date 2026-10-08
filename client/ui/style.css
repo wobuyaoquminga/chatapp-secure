@@ -13,6 +13,7 @@
 .callVideos.showRemote video { cursor:pointer; }
 .callVideos.showRemote video{touch-action:none;user-select:none}
 .callPanel.isMinimized .callCard{touch-action:none}
+.cameraSettings select{width:100%;padding:12px;border:1px solid #d6e3db;border-radius:10px;background:#fbfdfb;color:#213c34;font:inherit}.cameraSettings label{margin:12px 0 8px}.cameraSettings .muted{font-size:12px}
 .callVideos.showRemote.selfPrimary #localVideo{inset:0;width:100%;height:100%;max-height:none;border:0;border-radius:0;object-fit:cover}
 .callVideos.showRemote.selfPrimary #remoteVideo{inset:auto 12px 12px auto;width:27%;height:22%;max-height:150px;border:2px solid #fff;border-radius:10px;z-index:1;object-fit:cover;background:#25392e}
 .callPanel.isMinimized .callVideos.showRemote.selfPrimary #localVideo{inset:0;width:100%;height:100%;border:0;border-radius:0}
@@ -149,4 +150,43 @@ input:focus,textarea:focus{border-color:#6fa987;box-shadow:0 0 0 3px #327a5522}
 #notice:not(:empty){border-top:1px solid #cfe5d3}
 @media(max-width:700px){.sidebar{width:235px}.conversationHeader{display:flex;padding:14px 16px}.headerActions{margin:0;white-space:nowrap}.headerActions button{font-size:13px}.composer{padding:12px 12px 4px}.deliveryNote{margin:4px 12px 12px}}
 @media(max-width:560px){.sidebar{width:165px}.sidebarTop{padding:13px 10px 5px}.profile{padding:8px 10px}.listSearch{padding:8px}.peerList{padding:2px 4px}.peerPick{padding:9px 6px;gap:6px}.avatar{width:29px;height:29px;border-radius:9px;font-size:13px}.contactForm{padding:8px}.conversationHeader{padding:11px 9px}.conversationIdentity h2{font-size:14px}.conversationDetails{gap:3px}.conversationDetails span{font-size:10px}.headerActions .secondary{padding:7px;font-size:11px}.headerActions .iconButton{min-width:31px;height:31px;font-size:20px}#messages{padding:12px}.composer{gap:5px}.composer button{min-width:42px;padding:0 7px}.composer #toggleCallActions{min-width:35px}}
-@media(prefers-reduced-motion:reduce){button{transition:none}button:active:not(:disabled){transform:none}}
+/* Every action has a visible rounded rectangle; color names its consequence. */
+button{min-height:48px;border-radius:10px}
+.secondary{border:1px solid #bfd5c4;background:#edf5ef;color:#245e3e}
+.secondary:hover{background:#deece2}
+.destructive,.accountForget{border:1px solid #b64f46;background:#a8443c;color:#fff}
+.destructive:hover,.accountForget:hover{background:#91382f}
+.textButton{border:1px solid #bfd5c4;background:#edf5ef;border-radius:10px;padding:9px 12px}
+.textButton:hover{background:#e9f2eb;color:#1f6240}
+.iconButton{min-width:48px;min-height:48px;border-radius:10px}
+.callWindowButton{min-width:48px;min-height:48px;border-radius:12px}
+.composer button,.composer #toggleCallActions{height:48px}
+.moreMenu button{min-height:48px;border-radius:8px}
+.moreMenu .destructive{color:#9e3932;background:#fff3f0}
+.moreMenu .destructive:hover{background:#fbe5e1}
+.callControls #hangupCall{background:#a8443c}
+.callControls #hangupCall:hover{background:#91382f}
+.callPanel.isMinimized .callWindowButton,.callPanel.isMinimized .callControls button{min-height:36px}
+.locationCard p{font-size:15px;font-weight:600;line-height:1.5;margin-top:10px}
+.retryMessage{border-color:#bfd5c4;background:#edf5ef;color:#245e3e}
+.retryMessage:hover{background:#deece2}
+#notice{opacity:0;translate:0 6px;transition:opacity .18s ease,translate .18s ease}
+#notice:not(:empty){opacity:1;translate:0 0}
+.confirmDialog{width:min(390px,calc(100vw - 32px));border:1px solid #dfe7df;border-radius:16px;padding:24px;background:#fff;color:#263b31;box-shadow:0 22px 70px #0004}
+.confirmDialog::backdrop{background:#11261d99}
+.confirmDialog h2{margin:0 0 12px}.confirmDialog p{line-height:1.6;margin:0 0 24px;overflow-wrap:anywhere}
+.confirmDialog .actions{justify-content:flex-end}.confirmDialog .actions button{min-width:110px}
+/* Chromium's discrete display transition preserves the brief exit before hidden. */
+.moreMenu,.callActions,.featurePanel,#safetyPanel,.entry,.settings,.mediaPanel,.callPanel,.confirmDialog{
+  opacity:1;transition:opacity .18s ease,display .18s allow-discrete,overlay .18s allow-discrete;transition-behavior:allow-discrete
+}
+.moreMenu[hidden],.callActions[hidden],.featurePanel[hidden],#safetyPanel[hidden],.entry[hidden],.settings[hidden],.mediaPanel[hidden],.callPanel[hidden],.confirmDialog:not([open]){opacity:0}
+.moreMenu,.callActions,.featurePanel,#safetyPanel{transform:translateY(0);transition:opacity .18s ease,transform .18s ease,display .18s allow-discrete;transition-behavior:allow-discrete}
+.moreMenu[hidden],.callActions[hidden],.featurePanel[hidden],#safetyPanel[hidden]{transform:translateY(-6px)}
+.mediaCard,.callPanel:not(.isMinimized) .callCard{animation:panelEnter .18s ease-out}
+@keyframes panelEnter{from{opacity:.7;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}
+@starting-style{
+  .moreMenu:not([hidden]),.callActions:not([hidden]),.featurePanel:not([hidden]),#safetyPanel:not([hidden]),.entry:not([hidden]),.settings:not([hidden]),.mediaPanel:not([hidden]),.callPanel:not([hidden]),.confirmDialog[open]{opacity:0}
+  .moreMenu:not([hidden]),.callActions:not([hidden]),.featurePanel:not([hidden]),#safetyPanel:not([hidden]){transform:translateY(-6px)}
+}
+@media(prefers-reduced-motion:reduce){button{transition:none}button:active:not(:disabled){transform:none}.moreMenu,.callActions,.featurePanel,#safetyPanel,.entry,.settings,.mediaPanel,.callPanel,.confirmDialog,#notice{animation:none;transition:none}.mediaCard,.callPanel:not(.isMinimized) .callCard{animation:none}}

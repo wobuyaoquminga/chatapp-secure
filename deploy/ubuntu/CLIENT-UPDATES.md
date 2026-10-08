@@ -4,12 +4,12 @@ Chat server 从 0.2.5 起提供安装包查询与下载；当前发布组合使�
 
 ## 管理员发布
 
-使用同一版本成品中的 `Chat-Ubuntu-Deploy.tar.gz`、`Chat-Client-Updates.tar.gz` 和 `SHA256.txt`。先按 [升级步骤](UPGRADE.md)升级服务器。客户端包约数百 MB，部署包只含服务器，二者不能替代。
+使用同一版本成品中的 `Chat-Ubuntu-Deploy.tar.gz`、`Chat-Client-Updates.tar.gz` 和 `SHA256.txt`。服务器低于 0.2.7 时先按 [升级步骤](UPGRADE.md)升级；已是 0.2.7 时直接发布客户端包。客户端包约数百 MB，部署包只含服务器，二者不能替代。
 
 以下目录仅为示例。在 PowerShell 上传：
 
 ```powershell
-$bundle = 'C:\path\to\Chat-v0.6.5'
+$bundle = 'C:\path\to\Chat-v0.6.9'
 scp "$bundle\Chat-Client-Updates.tar.gz" "$bundle\SHA256.txt" ecs-user@203.0.113.10:/home/ecs-user/
 ```
 

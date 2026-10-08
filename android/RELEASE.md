@@ -1,6 +1,6 @@
 # Android 安装与更新
 
-本版 Android 0.5.5（versionCode 21）属于 Chat v0.6.6 发布组合。先将服务器升级到 0.2.7，再发布客户端更新包；0.2.6 的文件上传限制配置继续保留。客户端续认证后会刷新账号期限。文件另存取消、已保存文件保留和孤立上传清理的修复仍需真机交互验收，见[验证范围](VALIDATION.md)。
+本版 Android 0.5.8（versionCode 24）属于 Chat v0.6.9 发布组合。服务器已是 0.2.7 时仅需发布客户端更新包；保留账号和聊天数据。带地址的位置消息需要双方升级客户端。界面动画、实际街道解析及触摸表现仍需设备验收，见[验证范围](VALIDATION.md)。
 
 ## 从当前服务器更新
 
@@ -18,13 +18,19 @@ Chat 提供正式签名版和旧调试版兼容更新包。两者的安装包名
 
 从可信的当前服务器或项目官方发布页下载对应包。设置中的服务器更新入口会检查并下载安装包，安装仍需用户点击并在系统界面确认；GitHub 入口用于打开发布页面。更新前阅读兼容性说明，先升级服务器，再更新客户端。
 
+## 下载进度与后台运行
+
+Android 0.5.6 起，设置页和更新通知显示下载速度、已下载量、总大小及百分比。用户点击下载后启动独立的 `dataSync` 前台服务，下载期间使用有时限的 CPU 唤醒锁；熄屏、切换应用或离开设置页不会主动取消下载，重新进入应用可看到已有进度。通知支持取消，完成后点击通知返回设置再手动安装，不会在后台弹出安装界面。
+
+下载失败、主动取消、切换服务器或服务超时会结束任务并释放资源。一次下载及校验总共最多三十分钟，超时后可重新下载。系统强行停止应用、重启手机、禁止后台网络或厂商省电限制可能中断下载，此时回到应用重新检查并下载。若希望看到通知栏进度，请允许 Chat 发送通知。后台能力遵循 [Android 前台服务](https://developer.android.com/develop/background-work/services/fgs/service-types)和[系统省电规则](https://developer.android.com/training/monitoring-device-state/doze-standby)，不申请永久电池优化豁免。
+
 ## USB 安装脚本
 
 在源码的 `android/` 目录执行安装脚本。设置 `ANDROID_HOME` 或 `ANDROID_SDK_ROOT`，确保 SDK 中安装 platform-tools 与 Build Tools 35.0.0。脚本要求只连接一个已授权的设备，并在安装前检查 APK 包名、版本和证书。已安装同包名时拒绝证书不匹配和降级；不会自动卸载或清除应用数据。项目正式版证书 SHA-256 见 `RELEASE-CERTIFICATE.txt` 与发布包的 `ANDROID-SIGNING.json`，这些文件只包含公开指纹。
 
 ```powershell
 # 更新旧调试版；指定版本时从对应成品目录选择，不使用旧构建结果。
-.\install-usb.ps1 -Version 0.6.6 -Variant Debug
+.\install-usb.ps1 -Version 0.6.9 -Variant Debug
 
 # 正式版首次安装或同渠道更新。
 .\install-usb.ps1 -ApkPath 'C:\path\to\Chat-Android-arm64-v8a-release.apk' -Variant Release

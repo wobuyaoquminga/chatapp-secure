@@ -1,13 +1,13 @@
 # 升级到 Chat server 0.2.7
 
-Chat v0.6.6 使用服务器 0.2.7。即使已安装服务器 0.2.6，本轮也须升级服务器，再按文末发布客户端安装包。
+Chat v0.6.9 使用服务器 0.2.7。已安装 0.2.7 时无需重新安装或重启服务器，直接按文末发布客户端安装包；服务器为 0.2.6 或更早版本时，先按下述步骤升级。
 
 服务器 0.2.7 修复 WebSocket 续认证后账号活跃时间未更新的问题；同一 ID、同一密文哈希的附件重传遇到服务器磁盘密文丢失或损坏时会重新保存。本轮没有新增数据库迁移或聊天协议变更；从更早版本升级仍会执行尚未应用的迁移。已有账号、联系人、未送达密文及安装包下载功能保留。已为服务器 0.2.6 配置的 `/api/files/` 11 MiB Nginx 请求限制应继续保留。
 
-如使用 v0.6.6 发布包，请从同一发布版本取得 `Chat-Ubuntu-Deploy.tar.gz` 与 `SHA256.txt`；也可按 [Ubuntu 部署说明](README.md)从源码构建。不要使用旧版 0.2.1 部署包。以下以 Windows PowerShell 和示例服务器地址演示上传；将本地目录、SSH 私钥和服务器 IP 换成自己的值：
+如使用 v0.6.9 发布包，请从同一发布版本取得 `Chat-Ubuntu-Deploy.tar.gz` 与 `SHA256.txt`；也可按 [Ubuntu 部署说明](README.md)从源码构建。不要使用旧版 0.2.1 部署包。以下以 Windows PowerShell 和示例服务器地址演示上传；将本地目录、SSH 私钥和服务器 IP 换成自己的值：
 
 ```powershell
-$bundle = 'C:\path\to\Chat-v0.6.6'
+$bundle = 'C:\path\to\Chat-v0.6.9'
 scp -i "$env:USERPROFILE\.ssh\id_ed25519" "$bundle\Chat-Ubuntu-Deploy.tar.gz" "$bundle\SHA256.txt" ecs-user@203.0.113.10:/home/ecs-user/
 ```
 

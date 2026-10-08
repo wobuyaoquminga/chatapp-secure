@@ -11,6 +11,7 @@ const path=require('node:path');
 const {pathToFileURL}=require('node:url');
 const {Controller}=require('./controller.cjs');
 const {NativeLocation}=require('./native-location.cjs');
+const {ReverseGeocoder,validCoordinates}=require('./reverse-geocoding.cjs');
 const {MediaLease}=require('./media-permission.cjs');
 const Updates=require('./updates.cjs');
 const Files=require('./file-transfer.cjs');
@@ -46,7 +47,11 @@ const testAppData=profile.startsWith('qa-migrate-')&&process.argv.includes('--te
   ?process.env.CHAT_TEST_APPDATA:null;
 app.setPath('userData',userDataRoot(testAppData||app.getPath('appData')));
 if(!app.requestSingleInstanceLock()){app.quit();}else{
-  let window,controller,geoUntil=0,geoPeer='',geoGeneration=-1;
+  let window,controller,geoUntil=0,geoPeer='',geoGeneration=-1,geoServer='',geoUser='',geoLease=0,geoLive=false;
+  let geocodingKey='';
+  try{const config=JSON.parse(fs.readFileSync(path.join(app.getPath('userData'),'geocoding.json'),'utf8'));if(config?.provider==='amap'&&typeof config.webServiceKey==='string')geocodingKey=config.webServiceKey;}catch{}
+  const reverseGeocoder=new ReverseGeocoder({amapKey:geocodingKey});
+  const revokeGeo=(clearCache=false)=>{geoUntil=0;geoPeer='';geoLive=false;geoLease++;nativeLocation.cancel();if(clearCache)reverseGeocoder.reset();else reverseGeocoder.cancel();};
   let updateCheck=null,updateDownload=null,completedUpdate=null;
   const fileTasks=new Set();let fileBusy=false,fileOwner=null,previewTask=null,previewSequence=0;
   const cancelFiles=()=>{
@@ -253,6 +258,14 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
       url.searchParams.set('src','Chat');
       await shell.openExternal(url.href);
     });
+    ipcMain.handle('chat:reverse-location',async(event,latitude,longitude,peer)=>{
+      if(!trusted(event))throw Error('IPC sender rejected');
+      if(!validCoordinates(latitude,longitude))throw Error('位置坐标无效');
+      const lease=geoLease,generation=controller.generation,server=controller.server,user=controller.user;
+      const authorized=()=>lease===geoLease&&Date.now()<geoUntil&&peer===geoPeer&&generation===geoGeneration&&controller.generation===generation&&controller.server===server&&controller.server===geoServer&&controller.user===user&&controller.user===geoUser&&controller.online&&window&&!window.isDestroyed()&&window.isFocused()&&controller.contactState[peer]?.status==='accepted'&&!controller.engine?.state.identityChanges?.[peer]&&!controller.engine?.state.deletedPeers?.[peer];
+      if(!authorized())throw Error('位置授权已失效');
+      return reverseGeocoder.resolve(latitude,longitude,{live:geoLive,authorized});
+    });
     ipcMain.handle('chat:open-updates',async event=>{
       if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
       await shell.openExternal('https://github.com/wobuyaoquminga/chatapp-secure/releases/latest');
@@ -260,9 +273,12 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
     const geoAllowed=(contents,permission,details)=>['geolocation','geolocation-approximate'].includes(permission)&&contents===window.webContents&&Date.now()<geoUntil&&window.isFocused()&&details?.isMainFrame===true&&details.requestingUrl?.toLowerCase()===entryUrl;
     const mediaAllowed=(contents,permission,details)=>permission==='media'&&contents===window.webContents&&window.isFocused()&&mediaLease.allows({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame,mediaTypes:details?.mediaTypes||(details?.mediaType?[details.mediaType]:null),server:controller.server,generation:controller.generation,call:controller.call});
     session.defaultSession.setPermissionRequestHandler((contents,permission,callback,details)=>callback(geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details)));
-    session.defaultSession.setPermissionCheckHandler((contents,permission,_origin,details)=>geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details));
-    window.on('blur',()=>{controller.setForeground(false);geoUntil=0;mediaLease.revoke();nativeLocation.cancel();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations()).catch(()=>{});});
-    let closing=false;window.on('close',event=>{cancelUpdate();cancelFiles();geoUntil=0;mediaLease.revoke();nativeLocation.cancel();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).catch(()=>{}).finally(()=>window.destroy());});
+    // Enumeration needs a video permission check to reveal device labels and IDs. Capture still
+    // goes through the request handler above, which requires an approved foreground call lease.
+    session.defaultSession.setPermissionCheckHandler((contents,permission,_origin,details)=>geoAllowed(contents,permission,details)||mediaAllowed(contents,permission,details)||
+      (permission==='media'&&details?.mediaType==='video'&&contents===window.webContents&&MediaLease.trustedFrame({entryUrl,requestingUrl:details?.requestingUrl,isMainFrame:details?.isMainFrame})));
+    window.on('blur',()=>{controller.setForeground(false);revokeGeo();mediaLease.revoke();window.webContents.send('chat:location-stop');controller.serial(()=>controller.stopLocations()).catch(()=>{});});
+    let closing=false;window.on('close',event=>{cancelUpdate();cancelFiles();revokeGeo();mediaLease.revoke();if(closing)return;event.preventDefault();closing=true;window.webContents.send('chat:location-stop');Promise.race([controller.serial(()=>controller.stopLocations()),new Promise(resolve=>setTimeout(resolve,2000))]).catch(()=>{}).finally(()=>window.destroy());});
     ipcMain.handle('chat:command',async(event,{action,payload})=>{
       if(event.sender!==window.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame?.url?.toLowerCase()!==entryUrl)throw new Error('IPC sender rejected');
       if((action==='sendLocation'||action==='send'&&payload?.body?.startsWith(require('./ui/features.js').PREFIX))&&!window.isFocused()&&require('./ui/features.js').parse(payload?.body)?.kind!=='stop')return {ok:false,error:'请在应用前台发送位置'};
@@ -272,10 +288,10 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
         try{return {ok:true,value:await nativeLocation.query(authorized)};}catch(e){return {ok:false,error:e.message};}
       }
       if(action==='locationPermission'){
-        if(!controller.online||!window.isFocused()||controller.contactState[payload?.peer]?.status!=='accepted')return {ok:false,error:'请在在线且已接受的聊天中操作'};
-        geoPeer=payload.peer;geoGeneration=controller.generation;geoUntil=Date.now()+(payload?.live?3600000:30000);return {ok:true,value:true};
+        if(!controller.online||!window.isFocused()||controller.contactState[payload?.peer]?.status!=='accepted'||controller.engine?.state.identityChanges?.[payload?.peer]||controller.engine?.state.deletedPeers?.[payload?.peer])return {ok:false,error:'请在在线且已接受的聊天中操作'};
+        revokeGeo();geoPeer=payload.peer;geoGeneration=controller.generation;geoServer=controller.server;geoUser=controller.user;geoLive=!!payload?.live;geoUntil=Date.now()+(geoLive?3600000:30000);return {ok:true,value:true};
       }
-      if(action==='revokeLocationPermission'){geoUntil=0;nativeLocation.cancel();return {ok:true,value:true};}
+      if(action==='revokeLocationPermission'){revokeGeo();return {ok:true,value:true};}
       if(action==='callMediaPermission'){
         try{
           if(!window.isFocused()||!controller.online||!controller.call?.userApproved||controller.call.peer!==payload?.peer||controller.call.callId!==payload?.callId||controller.call.mode!==payload?.mode)throw new Error('通话媒体授权已失效');
@@ -289,11 +305,11 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
       if(['saveServer','selectServer','forgetServer'].includes(action))cancelUpdate();
       if(['logout','login','saveServer','selectServer','forgetServer','forgetAccount'].includes(action))cancelFiles();
       return controller.serial(async()=>{
-        try{if(['logout','login','saveServer','selectServer','forgetServer'].includes(action)){geoUntil=0;mediaLease.revoke();nativeLocation.cancel();await controller.stopLocations();}return {ok:true,value:await controller[action](payload)}}catch(e){return {ok:false,error:e.message}}
+        try{if(['logout','login','saveServer','selectServer','forgetServer','forgetAccount'].includes(action)){revokeGeo(true);mediaLease.revoke();await controller.stopLocations();}return {ok:true,value:await controller[action](payload)}}catch(e){return {ok:false,error:e.message}}
       });
     });
     window.loadFile(entry);window.once('ready-to-show',()=>{if(!process.argv.includes('--test-hidden'))window.show();});
   }).catch(error=>{dialog.showErrorBox('无法打开 Chat',error.message);app.quit();});
   app.on('window-all-closed',()=>app.quit());
-  app.on('before-quit',()=>{cancelFiles();mediaLease.revoke();nativeLocation.cancel();controller?.logout();});
+  app.on('before-quit',()=>{cancelFiles();mediaLease.revoke();revokeGeo(true);controller?.logout();});
 }

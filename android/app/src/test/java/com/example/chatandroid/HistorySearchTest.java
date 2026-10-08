@@ -31,6 +31,16 @@ public class HistorySearchTest {
                 record("a", "me", "x", "bad"));
         assertEquals(List.of(2, 1), HistorySearch.find(records, "", "2026-09-26", "2026-09-26", ZoneId.of("Asia/Shanghai")));
     }
+    @Test public void emptyQuerySkipsReadingBodyAndExcludedDatesSkipPreview() throws Exception {
+        JSONObject unreadableBody = new JSONObject() {
+            @Override public String optString(String name) {
+                if (name.equals("body")) throw new AssertionError("Unnecessary body parsing");
+                return super.optString(name);
+            }
+        }.put("body", "x").put("createdAt", "2026-09-26T00:00:00Z");
+        assertEquals(List.of(0), HistorySearch.find(List.of(unreadableBody), "", "", "", ZoneId.of("UTC")));
+        assertTrue(HistorySearch.find(List.of(unreadableBody), "needle", "2026-09-27", "", ZoneId.of("UTC")).isEmpty());
+    }
     @Test public void invalidAndReversedDatesGiveReadableErrors() throws Exception {
         for (String[] bounds : new String[][]{{"2026-02-30", ""}, {"2026-09-27", "2026-09-26"}}) {
             try { HistorySearch.find(List.of(), "", bounds[0], bounds[1], ZoneId.of("UTC")); fail("expected validation"); }

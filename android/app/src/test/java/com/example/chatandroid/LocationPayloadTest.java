@@ -13,6 +13,8 @@ public class LocationPayloadTest {
         assertTrue(item.recordedAt.endsWith("Z")); assertTrue(item.mapsUrl().startsWith("https://www.openstreetmap.org/"));
         assertEquals("geo:31.2,121.5?q=31.2,121.5", item.geoUri());
         assertEquals("androidamap://viewMap?sourceApplication=Chat&poiname=Chat&lat=31.2&lon=121.5&dev=1", item.amapUri());
+        assertEquals("",item.address);
+        assertEquals("南京东路 1 号附近",LocationPayload.parse(LocationPayload.encode("pin",session,0,31.2,121.5,40,now,now+3600000,"南京东路 1 号附近"),now).address);
     }
     @Test public void expiredIsHistoricalButNeverActive() throws Exception {
         String text = body("live",0,now+1000);
@@ -40,6 +42,9 @@ public class LocationPayloadTest {
         assertNull(LocationPayload.parse(LocationPayload.PREFIX+bad,now));
         assertNull(LocationPayload.parse(LocationPayload.PREFIX+new JSONObject(valid.substring(LocationPayload.PREFIX.length())).put("extra",true),now));
         assertNull(LocationPayload.parse(valid,now-300001));
+        for (String address : new String[]{"","  ","路\n口","x".repeat(257)})
+            assertNull(LocationPayload.parse(LocationPayload.PREFIX+new JSONObject(valid.substring(LocationPayload.PREFIX.length())).put("address",address),now));
+        assertNull(LocationPayload.parse(LocationPayload.PREFIX+new JSONObject(body("stop",1,now).substring(LocationPayload.PREFIX.length())).put("address","路口"),now));
     }
     @Test public void sequenceCannotExtendSessionExpiry() throws Exception {
         LocationPayload.Tracker tracker = new LocationPayload.Tracker();
@@ -50,6 +55,9 @@ public class LocationPayloadTest {
         org.json.JSONArray vectors = new org.json.JSONArray();
         String valid = body("pin",0,now+3600000);
         vectors.put(valid);
+        vectors.put(LocationPayload.encode("pin",session,0,31.2,121.5,40,now,now+3600000,"南京东路附近"));
+        vectors.put(LocationPayload.PREFIX+new JSONObject(valid.substring(LocationPayload.PREFIX.length())).put("address","路\n口"));
+        vectors.put(LocationPayload.PREFIX+new JSONObject(valid.substring(LocationPayload.PREFIX.length())).put("address","x".repeat(257)));
         vectors.put(valid.replace(session,"00000000-0000-0000-0000-000000000000"));
         vectors.put(valid.replace(session,session.substring(0,14)+"9"+session.substring(15)));
         JSONObject source = new JSONObject(valid.substring(LocationPayload.PREFIX.length()));

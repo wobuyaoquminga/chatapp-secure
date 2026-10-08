@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="ChatTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:alertDialogTheme">@style/ChatDialogTheme</item>
+        <item name="android:dialogTheme">@style/ChatDialogTheme</item>
+    </style>
+
+    <style name="ChatDialogTheme" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowAnimationStyle">@style/ChatDialogAnimation</item>
+        <item name="android:buttonBarPositiveButtonStyle">@style/ChatDialogPrimaryButton</item>
+        <item name="android:buttonBarNegativeButtonStyle">@style/ChatDialogSecondaryButton</item>
+        <item name="android:buttonBarNeutralButtonStyle">@style/ChatDialogSecondaryButton</item>
+    </style>
+
+    <style name="ChatDialogAnimation">
+        <item name="android:windowEnterAnimation">@anim/dialog_enter</item>
+        <item name="android:windowExitAnimation">@anim/dialog_exit</item>
+    </style>
+
+    <style name="ChatCallAnimation">
+        <item name="android:windowEnterAnimation">@anim/call_enter</item>
+        <item name="android:windowExitAnimation">@anim/call_exit</item>
+    </style>
+
+    <style name="ChatDialogButton" parent="@android:style/Widget.Material.Button.Borderless">
+        <item name="android:minWidth">48dp</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:paddingLeft">12dp</item>
+        <item name="android:paddingRight">12dp</item>
+        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <style name="ChatDialogPrimaryButton" parent="@style/ChatDialogButton">
+        <item name="android:background">@drawable/dialog_primary_button</item>
+        <item name="android:textColor">#FFFFFF</item>
+    </style>
+
+    <style name="ChatDialogSecondaryButton" parent="@style/ChatDialogButton">
+        <item name="android:background">@drawable/dialog_secondary_button</item>
+        <item name="android:textColor">#1D272A</item>
+    </style>
+</resources>
